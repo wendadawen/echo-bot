@@ -19,14 +19,14 @@ def main():
         print("ERROR 当前 AstrBot 版本缺少 event_message_type 过滤器")
         return 1
 
-    module = importlib.import_module("astrbot_plugin_qunyou.main")
-    if not hasattr(module, "Qunyou"):
-        print("ERROR main.py 未定义 Qunyou")
+    module = importlib.import_module("astrbot_plugin_echo.main")
+    if not hasattr(module, "Echo"):
+        print("ERROR main.py 未定义 Echo")
         return 1
-    if not issubclass(module.Qunyou, Star):
-        print("ERROR Qunyou 未继承 Star")
+    if not issubclass(module.Echo, Star):
+        print("ERROR Echo 未继承 Star")
         return 1
-    print("插件可加载：Qunyou 继承 Star，过滤器与钩子可用")
+    print("插件可加载：Echo 继承 Star，过滤器与钩子可用")
     return 0
 
 

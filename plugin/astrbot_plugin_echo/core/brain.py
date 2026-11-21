@@ -5,7 +5,7 @@ import re
 import time
 
 PERSONA = (
-    "你是群里一个叫「小群」的中文群友。说话自然、简短、口语化，不用敬语，"
+    "你是群里一个叫「回声」的中文群友。说话自然、简短、口语化，不用敬语，"
     "不要自称 AI 或助手，不要长篇大论，最多两三句。"
 )
 
@@ -35,7 +35,7 @@ class Brain:
         text = msg.text.strip()
         direct = self._command(msg, text)
         if direct is not None:
-            self.store.add_message(msg.group_id, "bot", "小群", "bot", direct)
+            self.store.add_message(msg.group_id, "bot", "回声", "bot", direct)
             return {"replied": True, "text": direct, "reason": "command"}
         if not text:
             return {"replied": False, "text": "", "reason": "empty"}
@@ -53,7 +53,7 @@ class Brain:
             reply = self.model.reply(system, history, text)
         except Exception as exc:
             reply = "（模型没连上：{}）".format(exc)
-        self.store.add_message(msg.group_id, "bot", "小群", "bot", reply)
+        self.store.add_message(msg.group_id, "bot", "回声", "bot", reply)
         return {
             "replied": True,
             "text": reply,

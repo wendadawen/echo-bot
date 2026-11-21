@@ -1,4 +1,4 @@
-"""群友（astrbot_plugin_qunyou）
+"""回声（astrbot_plugin_echo）
 
 AstrBot 插件入口：只负责把平台事件转成统一消息、把核心逻辑的结果发回去。
 核心逻辑在 core/ 中，不 import 任何框架模块，因此可以独立测试。
@@ -17,7 +17,7 @@ from .core.messages import Message
 from .core.models import build_model
 from .core.store import Store
 
-PLUGIN_NAME = "astrbot_plugin_qunyou"
+PLUGIN_NAME = "astrbot_plugin_echo"
 
 
 def _data_dir() -> Path:
@@ -28,13 +28,13 @@ def _data_dir() -> Path:
         return Path(StarTools.get_data_dir(PLUGIN_NAME))
 
 
-class Qunyou(Star):
+class Echo(Star):
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
         self.config = config or {}
         directory = _data_dir()
         directory.mkdir(parents=True, exist_ok=True)
-        self.store = Store(str(directory / "qunyou.sqlite3"))
+        self.store = Store(str(directory / "echo.sqlite3"))
         self.model = build_model(self.config)
         self.brain = Brain(
             self.store,
@@ -85,7 +85,7 @@ class Qunyou(Star):
         for part in event.get_messages():
             if isinstance(part, At) and str(part.qq) == self_id:
                 return True
-        return text.startswith(("@小群", "@群友", "＠小群"))
+        return text.startswith(("@回声", "＠回声"))
 
     def _ensure_reminder_task(self):
         if not self.reminders_enabled:
@@ -97,7 +97,7 @@ class Qunyou(Star):
         except RuntimeError:
             return
         self._reminder_task = loop.create_task(
-            self._reminder_loop(), name="qunyou-reminders"
+            self._reminder_loop(), name="echo-reminders"
         )
 
     async def _reminder_loop(self):
@@ -108,7 +108,7 @@ class Qunyou(Star):
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.error("群友提醒任务异常：%s", exc)
+                logger.error("回声提醒任务异常：%s", exc)
             await asyncio.sleep(2)
 
     async def _send_reminder(self, item):

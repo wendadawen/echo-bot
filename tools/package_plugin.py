@@ -5,7 +5,7 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-PLUGIN = ROOT / "plugin" / "astrbot_plugin_qunyou"
+PLUGIN = ROOT / "plugin" / "astrbot_plugin_echo"
 DIST = ROOT / "dist"
 
 
@@ -14,7 +14,7 @@ def main():
     match = re.search(r"^version:\s*(\S+)", metadata, re.M)
     version = match.group(1) if match else "dev"
     DIST.mkdir(exist_ok=True)
-    target = DIST / "astrbot_plugin_qunyou-{}.zip".format(version)
+    target = DIST / "astrbot_plugin_echo-{}.zip".format(version)
     count = 0
     with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as archive:
         for path in sorted(PLUGIN.rglob("*")):

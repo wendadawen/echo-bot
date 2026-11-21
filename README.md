@@ -1,4 +1,4 @@
-# 群友 · AstrBot 群聊插件
+# 回声 · AstrBot 群聊插件
 
 一个轻量的中文群聊机器人插件：按群隔离地记住外号与梗，`@` 必回、平时按概率接话，还能定时提醒。模型可接任意 OpenAI 兼容接口，不填凭据时用本地模拟回复，零配置即可试用。
 
@@ -13,7 +13,7 @@
 ## 安装
 
 1. 准备 AstrBot `>=4.29.4,<5`（Python 3.12+）。
-2. 把 `plugin/astrbot_plugin_qunyou/` 整个目录复制到 AstrBot 的 `data/plugins/`。
+2. 把 `plugin/astrbot_plugin_echo/` 整个目录复制到 AstrBot 的 `data/plugins/`。
 3. 在 WebUI 的「插件」页重载插件，然后在配置面板填写：
 
 | 配置项 | 说明 | 默认 |
@@ -61,7 +61,7 @@ python tools/simulate.py
 
 ```
 .github/workflows/           CI 与发布流水线
-plugin/astrbot_plugin_qunyou/  可直接放进 data/plugins/ 的插件
+plugin/astrbot_plugin_echo/  可直接放进 data/plugins/ 的插件
   main.py                     平台适配：事件转换、回复、提醒发送
   metadata.yaml / _conf_schema.json
   core/                       零依赖核心逻辑，不 import 框架

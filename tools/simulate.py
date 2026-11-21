@@ -6,10 +6,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugin"))
 
-from astrbot_plugin_qunyou.core.brain import Brain  # noqa: E402
-from astrbot_plugin_qunyou.core.messages import Message  # noqa: E402
-from astrbot_plugin_qunyou.core.models import MockModel  # noqa: E402
-from astrbot_plugin_qunyou.core.store import Store  # noqa: E402
+from astrbot_plugin_echo.core.brain import Brain  # noqa: E402
+from astrbot_plugin_echo.core.messages import Message  # noqa: E402
+from astrbot_plugin_echo.core.models import MockModel  # noqa: E402
+from astrbot_plugin_echo.core.store import Store  # noqa: E402
 
 
 def main():

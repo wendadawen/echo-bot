@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-PLUGIN = ROOT / "plugin" / "astrbot_plugin_qunyou"
+PLUGIN = ROOT / "plugin" / "astrbot_plugin_echo"
 
 REQUIRED = [
     "main.py",

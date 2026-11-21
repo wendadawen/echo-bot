@@ -50,6 +50,6 @@ jobs:
       - name: 上传构建产物
         uses: actions/upload-artifact@v4
         with:
-          name: astrbot_plugin_qunyou
+          name: astrbot_plugin_echo
           path: dist/*.zip
           if-no-files-found: error
