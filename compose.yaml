@@ -1,0 +1,15 @@
+services:
+  astrbot:
+    image: ${ASTRBOT_IMAGE:-soulter/astrbot:v4.29.4}
+    container_name: echo-astrbot
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      - TZ=Asia/Shanghai
+    ports:
+      - "6185:6185" # 管理面板
+      - "6199:6199" # OneBot v11，接 NapCat 时用
+    volumes:
+      - ./data:/AstrBot/data
+      - ./plugin/astrbot_plugin_echo:/AstrBot/data/plugins/astrbot_plugin_echo

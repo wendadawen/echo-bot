@@ -30,6 +30,10 @@ jobs:
         run: python -m unittest discover -s tests -p "test_*.py" -v
       - name: 离线模拟器冒烟
         run: python tools/simulate.py
+      - name: 校验整机编排
+        run: |
+          docker compose config -q
+          bash -n scripts/up.sh
 
   build-plugin:
     name: 安装 AstrBot 并构建插件
