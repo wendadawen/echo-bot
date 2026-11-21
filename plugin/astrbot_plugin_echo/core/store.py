@@ -1,4 +1,4 @@
-"""持久化：群消息、按群记忆、定时提醒。只用 Python 标准库。"""
+"""持久化：消息历史、定时提醒。只用 Python 标准库。"""
 
 import sqlite3
 import threading
@@ -21,13 +21,6 @@ class Store:
                     role TEXT NOT NULL,
                     text TEXT NOT NULL,
                     ts REAL NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS facts (
-                    group_id TEXT NOT NULL,
-                    key TEXT NOT NULL,
-                    value TEXT NOT NULL,
-                    ts REAL NOT NULL,
-                    PRIMARY KEY (group_id, key)
                 );
                 CREATE TABLE IF NOT EXISTS reminders (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -61,28 +54,6 @@ class Store:
                 (group_id, n),
             ).fetchall()
         return [dict(r) for r in reversed(rows)]
-
-    def set_fact(self, group_id, key, value):
-        with self._lock:
-            self._db.execute(
-                "INSERT INTO facts(group_id, key, value, ts) VALUES (?, ?, ?, ?) "
-                "ON CONFLICT(group_id, key) DO UPDATE SET value=excluded.value, ts=excluded.ts",
-                (group_id, key.strip(), value.strip(), time.time()),
-            )
-            self._db.commit()
-
-    def facts(self, group_id):
-        with self._lock:
-            rows = self._db.execute(
-                "SELECT key, value FROM facts WHERE group_id = ? ORDER BY ts", (group_id,)
-            ).fetchall()
-        return [dict(r) for r in rows]
-
-    def facts_text(self, group_id):
-        items = self.facts(group_id)
-        if not items:
-            return "（暂无）"
-        return "\n".join("- {}：{}".format(it["key"], it["value"]) for it in items)
 
     def add_reminder(self, group_id, user_id, user_name, text, due_at, umo=""):
         with self._lock:

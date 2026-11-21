@@ -1,4 +1,4 @@
-"""大脑：决定要不要接话、记什么、何时提醒。完全不依赖 AstrBot。"""
+"""大脑：决定要不要接话、何时提醒。完全不依赖 AstrBot。"""
 
 import random
 import re
@@ -10,9 +10,7 @@ PERSONA = (
 )
 
 HELP = (
-    "我会按群记梗和外号，也能定时提醒。命令：\n"
-    "/记 键=值 —— 记一条本群记忆\n"
-    "/记忆 —— 列出本群记忆\n"
+    "我能在群里接话，也能定时提醒。命令：\n"
     "/提醒 5分钟 事情 —— 到点在群里 @ 你\n"
     "/待办 —— 看本群还没到点的提醒\n"
     "@ 我一定回，平时我偶尔接话。"
@@ -44,13 +42,8 @@ class Brain:
         if not should_reply:
             return {"replied": False, "text": "", "reason": "skipped"}
 
-        system = (
-            self.persona
-            + "\n\n本群共同的记忆（只在这个群有效）：\n"
-            + self.store.facts_text(msg.group_id)
-        )
         try:
-            reply = self.model.reply(system, history, text)
+            reply = self.model.reply(self.persona, history, text)
         except Exception as exc:
             reply = "（模型没连上：{}）".format(exc)
         self.store.add_message(msg.group_id, "bot", "回声", "bot", reply)
@@ -70,8 +63,6 @@ class Brain:
     def _command(self, msg, text):
         if text in ("/帮助", "/help"):
             return HELP
-        if text in ("/记忆", "/记忆列表"):
-            return "本群记忆：\n" + self.store.facts_text(msg.group_id)
         if text == "/待办":
             items = self.store.pending_reminders(msg.group_id)
             if not items:
@@ -79,16 +70,6 @@ class Brain:
             return "本群待办：\n" + "\n".join(
                 "- {}：{}".format(it["user_name"], it["text"]) for it in items
             )
-        if text.startswith("/记"):
-            body = re.sub(r"^(一下|住|忆)", "", text[2:].strip()).strip()
-            if re.search(r"[=：:]", body):
-                key, value = re.split(r"[=：:]", body, maxsplit=1)
-            else:
-                key, value = "群内便签", body
-            if not value.strip():
-                return "要记什么？格式：/记 外号=阿伟"
-            self.store.set_fact(msg.group_id, key.strip(), value.strip())
-            return "记住了：{} = {}".format(key.strip(), value.strip())
         if text.startswith("/提醒"):
             m = re.match(r"^/提醒\s*(\d+)\s*(分钟|分|秒|小时)?\s*(.+)$", text)
             if not m:
@@ -106,8 +87,4 @@ class Brain:
                 msg.umo,
             )
             return "好，{}{}后我 @ 你：{}".format(amount, unit, note)
-        m = re.match(r"^(记一下|记住|记着)\s*(.+?)\s*(是|叫|=|：|:)\s*(.+)$", text)
-        if m:
-            self.store.set_fact(msg.group_id, m.group(2).strip(), m.group(4).strip())
-            return "记住了：{} = {}".format(m.group(2).strip(), m.group(4).strip())
         return None

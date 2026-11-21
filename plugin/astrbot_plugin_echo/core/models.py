@@ -5,7 +5,6 @@
 
 import json
 import os
-import re
 import urllib.request
 
 
@@ -23,21 +22,14 @@ class MockModel(BaseModel):
 
     def reply(self, system, history, user_text):
         text = user_text.strip()
-        memory = "；".join(line[2:] for line in system.splitlines() if line.startswith("- "))
         if any(k in text for k in ("你好", "在吗", "哈喽", "早", "hi")):
             return "在呢，怎么啦？"
         if "?" in text or "？" in text or any(
             k in text for k in ("怎么", "为什么", "是不是", "能不能", "如何")
         ):
-            if memory:
-                return "我记得群里说过 {}，这事我倾向先按那个来，你觉得呢？".format(memory)
             return "这个我得想想……你先说说前因后果？"
         if any(k in text for k in ("哈哈", "笑死", "绝了", "牛", "离谱")):
-            return "哈哈哈确实，这梗我能记一整年。"
-        if re.search(r"外号|叫.*什么|记一下|记住", text):
-            return "记下啦，以后我就这么叫。"
-        if memory:
-            return "接一句：{} 这事儿还挺有意思的。".format(memory)
+            return "哈哈哈确实。"
         return "嗯嗯，我在听。你们继续聊，有需要喊我一声。"
 
 

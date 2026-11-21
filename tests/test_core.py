@@ -23,18 +23,6 @@ def msg(text, mentioned=True, group="g1", umo="demo:group-1"):
 
 
 class TestBrain(unittest.TestCase):
-    def test_group_memory_isolated(self):
-        store, brain = make_brain()
-        brain.handle(msg("/记 阿伟=摸鱼冠军"))
-        self.assertIn("阿伟", store.facts_text("g1"))
-        self.assertEqual("（暂无）", store.facts_text("g2"))
-
-    def test_natural_memory_command(self):
-        store, brain = make_brain()
-        result = brain.handle(msg("记住 暗号是吃火锅"))
-        self.assertEqual("command", result["reason"])
-        self.assertIn("吃火锅", store.facts_text("g1"))
-
     def test_mention_forces_reply_and_probability(self):
         store, brain = make_brain(0.0)
         self.assertFalse(brain.handle(msg("今天好累", mentioned=False))["replied"])
@@ -51,6 +39,12 @@ class TestBrain(unittest.TestCase):
         self.assertEqual("user", rows[0]["role"])
         self.assertEqual("bot", rows[1]["role"])
 
+    def test_history_is_isolated_by_group(self):
+        store, brain = make_brain()
+        brain.handle(msg("你好"))
+        self.assertEqual(2, len(store.recent("g1")))
+        self.assertEqual([], store.recent("g2"))
+
     def test_reminder_fires_once_and_keeps_session(self):
         store, brain = make_brain()
         store.add_reminder("g1", "1001", "阿伟", "交周报", time.time() - 1, "demo:group-1")
@@ -60,16 +54,17 @@ class TestBrain(unittest.TestCase):
         self.assertEqual("交周报", first[0]["text"])
         self.assertEqual([], brain.tick())
 
-    def test_mock_model_uses_group_memory(self):
-        store, brain = make_brain()
-        brain.handle(msg("/记 暗号=吃火锅"))
-        r = brain.handle(msg("这个怎么办？"))
-        self.assertIn("吃火锅", r["text"])
-
     def test_help_and_pending_commands(self):
         store, brain = make_brain()
         self.assertIn("/提醒", brain.handle(msg("/帮助"))["text"])
         self.assertIn("暂时没有", brain.handle(msg("/待办"))["text"])
+
+    def test_memory_commands_are_gone(self):
+        store, brain = make_brain()
+        for text in ("/记 阿伟=摸鱼冠军", "/记忆", "记住 暗号是吃火锅"):
+            result = brain.handle(msg(text))
+            self.assertEqual("mention", result["reason"])
+            self.assertNotIn("记住了", result["text"])
 
 
 class TestModels(unittest.TestCase):
@@ -83,7 +78,7 @@ class TestModels(unittest.TestCase):
 
     def test_mock_model_is_deterministic(self):
         m = MockModel()
-        self.assertEqual("在呢，怎么啦？", m.reply("本群共同的记忆：\n（暂无）", [], "在吗"))
+        self.assertEqual("在呢，怎么啦？", m.reply("人设", [], "在吗"))
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 name: astrbot_plugin_echo
 display_name: 回声
-short_desc: 按群记梗、定时提醒、偶尔接话的中文群聊机器人。
-desc: 回声是一个轻量的 AstrBot 中文群聊插件。按群隔离地记住外号与梗，支持 @ 唤醒、概率接话和定时提醒；模型可接任意 OpenAI 兼容接口，不填凭据时使用本地模拟回复。
+short_desc: 定时提醒、偶尔接话的中文群聊机器人。
+desc: 回声是一个轻量的 AstrBot 中文群聊插件。支持 @ 唤醒、概率接话和定时提醒；模型可接任意 OpenAI 兼容接口，不填凭据时使用本地模拟回复。
 version: v0.1.0
 author: wendadawen
 repo: https://github.com/wendadawen/echo-bot
