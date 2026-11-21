@@ -1,15 +1,22 @@
+# 一套编排起 AstrBot + 回声插件。所有值都有默认，不建 .env 也能直接跑。
 services:
   astrbot:
     image: ${ASTRBOT_IMAGE:-soulter/astrbot:v4.29.4}
-    container_name: echo-astrbot
+    container_name: ${CONTAINER_NAME:-echo-astrbot}
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
     environment:
-      - TZ=Asia/Shanghai
+      TZ: ${TZ:-Asia/Shanghai}
     ports:
-      - "6185:6185" # 管理面板
-      - "6199:6199" # OneBot v11，接 NapCat 时用
+      - "${PANEL_PORT:-6185}:6185" # 管理面板
+      - "${ONEBOT_PORT:-6199}:6199" # OneBot v11，接 NapCat 时用
     volumes:
       - ./data:/AstrBot/data
       - ./plugin/astrbot_plugin_echo:/AstrBot/data/plugins/astrbot_plugin_echo
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:6185/', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s

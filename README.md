@@ -6,11 +6,13 @@
 
 ## 装起来
 
-需要 Docker。clone 之后：
+需要 Docker（Docker Desktop 或 Colima 都行）和 Compose V2。clone 之后：
 
 ```bash
 ./scripts/up.sh
 ```
+
+脚本会等面板真正就绪才返回。换台机器、换个目录，还是这一条命令。想改端口、容器名或镜像地址，把 `.env.example` 复制成 `.env` 再改；不建 `.env` 用默认值就能跑。
 
 打开 http://127.0.0.1:6185，初始用户名一般是 `astrbot`，密码在启动日志里（`docker compose logs --tail 100 astrbot`）。进面板启用「回声」，填几个配置：
 
@@ -20,9 +22,9 @@
 - `persona`：人设，默认叫「回声」
 - `reminder_enabled`：定时提醒开关
 
-插件代码直接从 `plugin/` 挂进容器，改完 `docker compose restart` 就生效。配置和聊天记录都在 `data/`，不会被提交。停掉用 `docker compose down`。
+插件代码直接从 `plugin/` 挂进容器，改完 `docker compose restart` 就生效。配置和聊天记录都在 `data/`，不会被提交。停掉用 `./scripts/down.sh`。
 
-Docker Hub 拉不动的话换个镜像：`ASTRBOT_IMAGE=m.daocloud.io/docker.io/soulter/astrbot:v4.29.4 ./scripts/up.sh`
+Docker Hub 拉不动的话，在 `.env` 里把 `ASTRBOT_IMAGE` 换成镜像加速地址。
 
 接 QQ 群还得在面板配 `aiocqhttp`，另一端用 NapCat + Linux QQ 扫码登录一个小号，反向 WebSocket 连回 6199。这一步要一台 Linux amd64 的机器；macOS 本机跑得了框架，跑不了 Linux QQ。小号拉进群，@ 它发 `/帮助`，就该有反应了。
 
