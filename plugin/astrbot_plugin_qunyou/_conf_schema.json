@@ -1,0 +1,38 @@
+{
+  "reply_chance": {
+    "description": "普通群消息主动接话概率（%）",
+    "type": "int",
+    "default": 20,
+    "hint": "0 表示只有 @ 或命令才回复，100 表示每条都回。真正 @ 和命令不受此值影响。"
+  },
+  "persona": {
+    "description": "机器人人设",
+    "type": "string",
+    "default": "你是群里一个叫「小群」的中文群友。说话自然、简短、口语化，不用敬语，不要自称 AI 或助手，不要长篇大论，最多两三句。",
+    "hint": "会作为系统提示词，与「本群记忆」一起发给模型。"
+  },
+  "api_base": {
+    "description": "模型接口地址（OpenAI 兼容）",
+    "type": "string",
+    "default": "https://api.openai.com/v1",
+    "hint": "可填任意 OpenAI 兼容服务，例如本机 Ollama 的 http://127.0.0.1:11434/v1。"
+  },
+  "api_key": {
+    "description": "模型 API Key",
+    "type": "string",
+    "default": "",
+    "hint": "留空即使用本地模拟回复，便于零配置试用。也可改用环境变量 BOT_API_KEY。"
+  },
+  "model": {
+    "description": "模型 ID",
+    "type": "string",
+    "default": "gpt-4o-mini",
+    "hint": "由所填接口决定可用取值。"
+  },
+  "reminder_enabled": {
+    "description": "启用定时提醒",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后 /提醒 仍可登记，但不会主动发送。"
+  }
+}
