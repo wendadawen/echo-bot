@@ -33,7 +33,7 @@ jobs:
       - name: 校验整机编排
         run: |
           docker compose config -q
-          bash -n scripts/*.sh
+          bash -n scripts/*.sh docker/*.sh
 
   build-plugin:
     name: 安装 AstrBot 并构建插件

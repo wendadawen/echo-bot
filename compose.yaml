@@ -1,16 +1,21 @@
-# 一套编排起 AstrBot + 回声插件。所有值都有默认，不建 .env 也能直接跑。
+# 一个容器跑整套。所有值都有默认，不建 .env 也能直接跑。
 services:
   astrbot:
-    image: ${ASTRBOT_IMAGE:-soulter/astrbot:v4.29.4}
-    container_name: ${CONTAINER_NAME:-echo-astrbot}
+    image: ${BOT_IMAGE:-ghcr.io/wendadawen/echo-bot:latest}
+    container_name: ${CONTAINER_NAME:-echo-bot}
     restart: unless-stopped
-    security_opt:
-      - no-new-privileges:true
     environment:
       TZ: ${TZ:-Asia/Shanghai}
+      ONEBOT_TOKEN: ${ONEBOT_TOKEN:-}
+      NAPCAT_WEBUI_TOKEN: ${NAPCAT_WEBUI_TOKEN:-}
+      BOT_QQ: ${BOT_QQ:-}
+      QQ_DEB_AMD64: ${QQ_DEB_AMD64:-}
+      QQ_DEB_ARM64: ${QQ_DEB_ARM64:-}
+      NAPCAT_ZIP_URL: ${NAPCAT_ZIP_URL:-}
     ports:
-      - "${PANEL_PORT:-6185}:6185" # 管理面板
-      - "${ONEBOT_PORT:-6199}:6199" # OneBot v11，接 NapCat 时用
+      - "${PANEL_PORT:-6185}:6185" # AstrBot 面板
+      - "${ONEBOT_PORT:-6199}:6199" # OneBot v11 反向 WS
+      - "${NAPCAT_PORT:-6099}:6099" # 扫码登录页
     volumes:
       - ./data:/AstrBot/data
       - ./plugin/astrbot_plugin_echo:/AstrBot/data/plugins/astrbot_plugin_echo
@@ -18,5 +23,5 @@ services:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:6185/', timeout=3)"]
       interval: 15s
       timeout: 5s
-      retries: 10
-      start_period: 30s
+      retries: 20
+      start_period: 300s
