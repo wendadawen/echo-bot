@@ -157,6 +157,31 @@ class TestIncidentRegressions(unittest.TestCase):
         brain._summarize("g1", "阿伟：我在学归并排序")
         self.assertEqual("在学归并排序", people.profile("g1", "1001")["traits"])
 
+    def test_subagent_terminal_dispatches(self):
+        class SubModel:
+            def reply(self, system, history, user_text):
+                return '{"action":"subagent","text":"查一下苏州天气"}'
+
+        brain = Brain(Store(":memory:"), SubModel())
+        brain.subagent = SubAgentManager()
+        result = brain.handle_batch(make_batch("这个怎么弄"))
+        self.assertEqual("task", result["reason"])
+        self.assertIn("瞅瞅", result["text"])
+
+    def test_send_face_terminal_uses_bank(self):
+        class FaceModel:
+            def reply(self, system, history, user_text):
+                return '{"action":"send_face","text":"开心"}'
+
+        class FakeBank:
+            def pick(self, group, keyword="", model=None):
+                return "face:475"
+
+        brain = Brain(Store(":memory:"), FaceModel(), emoji_bank=FakeBank())
+        result = brain.handle_batch(make_batch("随便来一个"))
+        self.assertEqual("face", result["reason"])
+        self.assertEqual("475", result["face"])
+
     def test_empty_batch_is_silent(self):
         self.assertEqual("empty", make_brain().handle_batch(make_batch(""))["reason"])
 

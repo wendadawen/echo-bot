@@ -434,6 +434,23 @@ class Brain:
                 self.monitor.record(group, action, ok=True, latency=elapsed)
             return {"replied": False, "text": "", "reason": action,
                     "wait_seconds": reply if action == "wait" else 0}
+        # 终态动作不会走 executor，必须在这里接住。
+        if action == "send_face":
+            picked = (self.emoji_bank.pick(group, reply, None)
+                      if self.emoji_bank else None)
+            if picked and str(picked).startswith("face:"):
+                return {"replied": True, "text": "",
+                        "face": str(picked).split(":", 1)[1], "reason": "face"}
+            if picked:
+                return {"replied": True, "text": "", "image": str(picked),
+                        "reason": "face"}
+            return {"replied": True, "text": "没存着表情", "reason": "face"}
+        if action == "subagent":
+            dispatched = self._dispatch_task(group, reply, getattr(batch, "umo", ""))
+            if dispatched:
+                return dispatched
+            return {"replied": True, "text": "后台正忙", "reason": "subagent_busy",
+                    "elapsed": elapsed}
         if reply.startswith("__FACEID__"):
             return {"replied": True, "text": "",
                     "face": reply[len("__FACEID__"):], "reason": "face"}
