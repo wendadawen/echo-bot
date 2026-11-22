@@ -26,8 +26,6 @@ cd echo-bot
 docker compose logs --tail 100 astrbot
 ```
 
-复用已有 `data/` 时沿用既有凭据。`data/` 保存面板配置、聊天记录与 QQ 登录态，不纳入版本控制。端口、镜像地址与下载源可通过 `.env` 覆盖，参见 `.env.example`。
-
 ## 配置
 
 面板路径：插件 → 回声。
@@ -39,8 +37,6 @@ docker compose logs --tail 100 astrbot
 | `model` | `gpt-4o-mini` | 模型 ID |
 | `reply_chance` | `20` | 非 @ 消息接话概率（%） |
 | `reminder_enabled` | `true` | 定时提醒开关 |
-
-配置 `api_key` 后，`/提醒` 也支持自然语言写法，由模型解析并校验后创建。修改配置后需重载插件或执行 `docker compose restart`。将机器人账号加入群聊，在群内 @ 发送 `/帮助` 验证。插件仅处理群消息。
 
 ## 群内命令
 
