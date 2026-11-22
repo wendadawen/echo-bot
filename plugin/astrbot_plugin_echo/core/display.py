@@ -14,7 +14,7 @@ from .expression import split as expression_split
 
 MARK_PATTERN = re.compile(r"^#+\s*", re.M)
 LIST_PATTERN = re.compile(r"^\s*[-*+]\s+", re.M)
-CODE_BLOCK = re.compile(r"```.*?```", re.S)
+CODE_BLOCK = re.compile(r"```[a-zA-Z0-9_+-]*\s*\n?(.*?)```", re.S)
 LATEX_PATTERNS = (
     re.compile(r"\$\$(.+?)\$\$", re.S),
     re.compile(r"\\\[(.*?)\\\]", re.S),
@@ -27,7 +27,7 @@ LINK_PATTERN = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 def clean(part):
     """去掉 QQ 不认识的 markdown / latex / 代码块，公式保留内容。"""
     text = str(part or "").strip()
-    text = CODE_BLOCK.sub("", text)
+    text = CODE_BLOCK.sub(r"\1", text)
     for pattern in LATEX_PATTERNS:
         text = pattern.sub(r"\1", text)
     text = LINK_PATTERN.sub(r"\1", text)

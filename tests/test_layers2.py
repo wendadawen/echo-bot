@@ -245,7 +245,7 @@ class TestDisplay(unittest.TestCase):
         self.assertEqual("别加花活", display.clean("**别加花活**"))
         self.assertEqual("12°C", display.clean("$12°C$"))
         self.assertEqual("E=mc^2", display.clean("$E=mc^2$"))
-        self.assertEqual("", display.clean("```bash\ncurl x\n```"))
+        self.assertEqual("curl x", display.clean("```bash\ncurl x\n```"))
         self.assertEqual("链接", display.clean("[链接](http://example.com)"))
 
     def test_plan_splits_and_delays(self):

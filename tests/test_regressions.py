@@ -83,6 +83,10 @@ class TestIncidentRegressions(unittest.TestCase):
         out = display.plan("一句。两句。三句。")
         self.assertEqual(1, len(out.parts))
 
+    def test_code_block_keeps_content(self):
+        self.assertEqual("print(1)", display.clean("```python\nprint(1)\n```"))
+        self.assertEqual("curl x", display.clean("```bash\ncurl x\n```"))
+
     def test_decorate_does_not_truncate(self):
         text = "这是一句明显超过二十个字的话，用来确认不会被长度学习截断。"
         self.assertEqual(text, decorate(text, {"max_len": 12}))
