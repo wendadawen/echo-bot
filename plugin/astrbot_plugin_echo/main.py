@@ -22,6 +22,7 @@ from .core.forward import extract as forward_extract
 from .core.forward import looks_like_forward
 from .core.forward import render as forward_render
 from .core.heartbeat import Heartbeat
+from .core.harness import CodexHarness
 from .core.memory import Memory
 from .core.messages import Message
 from .core.models import build_model
@@ -66,6 +67,14 @@ class Echo(Star):
         self.subagent = SubAgentManager()
         self.schedule = Schedule(str(directory / "schedules.sqlite3"))
         self.heartbeat = Heartbeat()
+        self.harness = CodexHarness(
+            home=str(directory / "codex"),
+            workdir_root=str(directory / "harness"),
+            api_base=str(self.config.get("api_base") or ""),
+            api_key=str(self.config.get("api_key") or ""),
+            model=str(self.config.get("model") or ""),
+            timeout=150,
+        )
         self.limiter = MessageLimiter(per_minute=8, per_burst=3)
         self._last_umo = {}
         self._heartbeat_at = 0.0
@@ -87,6 +96,7 @@ class Echo(Star):
             personas=self.personas,
             subagent=self.subagent,
             schedule=self.schedule,
+            harness=self.harness,
         )
         self.reminders_enabled = bool(self.config.get("reminder_enabled", True))
         self._reminder_task = None

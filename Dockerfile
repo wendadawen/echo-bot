@@ -8,10 +8,30 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 # QQ 客户端要一块虚拟屏幕和一批图形/网络库；ffmpeg 用于 B站音视频合并。
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      xvfb xauth supervisor unzip ca-certificates ffmpeg \
+      xvfb xauth supervisor unzip ca-certificates ffmpeg curl \
       libgtk-3-0t64 libasound2t64 libatk-bridge2.0-0t64 libnss3 libgbm1 \
       libxss1 libxkbcommon0 libsecret-1-0 libxtst6 libx11-xcb1 libxrandr2 libcups2t64 \
     && rm -rf /var/lib/apt/lists/*
+
+# Codex CLI（headless harness），锁定版本并按架构校验，包内自带 bwrap。
+ARG CODEX_VERSION=0.171.0
+ARG CODEX_SHA_ARM64=d8c43bee6cf11b01eb18b95f4d7961092bc40228180808859e70dabb7784c1c9
+ARG CODEX_SHA_AMD64=8391d67757496bfd14893eca6cbf0c96994bf2627566ff1f018f70600c9ef6b3
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      arm64) pkg="codex-package-aarch64-unknown-linux-musl.tar.gz"; sha="$CODEX_SHA_ARM64" ;; \
+      amd64) pkg="codex-package-x86_64-unknown-linux-musl.tar.gz"; sha="$CODEX_SHA_AMD64" ;; \
+      *) echo "unsupported architecture: $arch"; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/codex.tgz \
+      "https://github.com/openai/codex/releases/download/rust-v${CODEX_VERSION}/${pkg}"; \
+    echo "$sha  /tmp/codex.tgz" | sha256sum -c -; \
+    mkdir -p /opt/codex; \
+    tar -xzf /tmp/codex.tgz -C /opt/codex; \
+    ln -sf /opt/codex/bin/codex /usr/local/bin/codex; \
+    rm -f /tmp/codex.tgz; \
+    /usr/local/bin/codex --version
 
 # 链接解析插件的源码在首次启动时下载，依赖预装在镜像里。
 RUN pip install --no-cache-dir \

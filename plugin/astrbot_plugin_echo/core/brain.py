@@ -107,7 +107,7 @@ def _repeat_key(group_id, user_id, text):
     return (str(group_id), str(user_id), clean)
 
 
-HELP = "/帮助"
+HELP = "有事直接说。要提醒就说「提醒 明早9点 开会」。"
 
 FORMAT_HINT = "没懂，发 /帮助"
 
@@ -144,7 +144,7 @@ class Brain:
                  memory=None, emoji_bank=None, char_frequency=None,
                  capabilities=None, modes=None, attention=None, persons=None,
                  monitor=None, prompt_store=None, personas=None, subagent=None,
-                 schedule=None):
+                 schedule=None, harness=None):
         self.store = store
         self.model = model
         self.persona = persona or PERSONA
@@ -167,6 +167,7 @@ class Brain:
         self.personas = personas
         self.subagent = subagent
         self.schedule = schedule
+        self.harness = harness
         self._task_targets = {}
         self._repeat_seen = {}
         self.context_builder = ContextBuilder(
@@ -350,6 +351,10 @@ class Brain:
                     return False, "后台没开"
 
                 def runner(prompt):
+                    if self.harness and self.harness.available():
+                        result = self.harness.run(group_id, prompt)
+                        if result:
+                            return result
                     return self.model.reply(self.persona, [], prompt)[:600]
 
                 task_id = self.subagent.submit("chat", payload, runner)
