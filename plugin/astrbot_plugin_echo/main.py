@@ -187,19 +187,38 @@ class Echo(Star):
         return
 
     async def _collect_image(self, group_id, part):
-        url = getattr(part, "url", None) or getattr(part, "file", None)
-        if not url or not str(url).startswith("http"):
+        url = str(getattr(part, "url", "") or "")
+        data = b""
+        if url.startswith("http"):
+            try:
+                data = await asyncio.to_thread(self._download, url)
+            except Exception as exc:
+                logger.info("表情下载失败：%s", exc)
+        if not data:
+            path = str(getattr(part, "path", "") or "")
+            if path:
+                try:
+                    data = await asyncio.to_thread(Path(path).read_bytes)
+                except OSError:
+                    data = b""
+        if not data:
             return
+        self.rhythm.attach_image(group_id, data)
         try:
-            data = await asyncio.to_thread(self._download, str(url))
-            self.rhythm.attach_image(group_id, data)
-            await asyncio.to_thread(self.emoji_bank.collect, group_id, data, self.model)
+            label = await asyncio.to_thread(
+                self.emoji_bank.collect, group_id, data, self.model
+            )
+            if label:
+                logger.info("表情已收：%s", label)
         except Exception as exc:
-            logger.debug("表情收集失败：%s", exc)
+            logger.info("表情收集失败：%s", exc)
 
     @staticmethod
     def _download(url):
-        with urllib.request.urlopen(url, timeout=10) as resp:
+        request = urllib.request.Request(
+            url, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://qq.com/"}
+        )
+        with urllib.request.urlopen(request, timeout=15) as resp:
             return resp.read(2 * 1024 * 1024)
 
     def _mentioned(self, event: AstrMessageEvent, text: str) -> bool:

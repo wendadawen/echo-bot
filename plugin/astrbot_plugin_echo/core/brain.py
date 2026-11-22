@@ -496,7 +496,7 @@ class Brain:
         if not task_id:
             return {}
         self._task_targets[task_id] = (group, umo)
-        return {"replied": True, "text": "行，我看看，一会说", "reason": "task"}
+        return {"replied": True, "text": "我瞅瞅，等会儿", "reason": "task"}
 
     def spontaneous(self, group, umo=""):
         """群安静太久时主动开一句；失败或像客服就保持沉默。"""
