@@ -39,7 +39,6 @@ class Echo(Star):
         self.brain = Brain(
             self.store,
             self.model,
-            chance=int(self.config.get("reply_chance", 0)) / 100.0,
             persona=PERSONA,
         )
         self.reminders_enabled = bool(self.config.get("reminder_enabled", True))
