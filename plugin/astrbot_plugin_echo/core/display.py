@@ -25,9 +25,15 @@ LINK_PATTERN = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 
 
 def clean(part):
-    """去掉 QQ 不认识的 markdown / latex / 代码块，公式保留内容。"""
+    """去掉 QQ 不认识的 markdown / latex 标记；代码块内容原样保留。"""
     text = str(part or "").strip()
-    text = CODE_BLOCK.sub(r"\1", text)
+    blocks = []
+
+    def hold(match):
+        blocks.append(match.group(1))
+        return "\x00{}\x00".format(len(blocks) - 1)
+
+    text = CODE_BLOCK.sub(hold, text)
     for pattern in LATEX_PATTERNS:
         text = pattern.sub(r"\1", text)
     text = LINK_PATTERN.sub(r"\1", text)
@@ -35,6 +41,8 @@ def clean(part):
     text = LIST_PATTERN.sub("", text)
     text = text.replace("**", "").replace("`", "")
     text = re.sub(r"\n{2,}", "\n", text)
+    for index, block in enumerate(blocks):
+        text = text.replace("\x00{}\x00".format(index), block)
     return text.strip()
 
 

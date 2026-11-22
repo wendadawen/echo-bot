@@ -85,7 +85,8 @@ class TestIncidentRegressions(unittest.TestCase):
 
     def test_code_block_keeps_content(self):
         self.assertEqual("print(1)", display.clean("```python\nprint(1)\n```"))
-        self.assertEqual("curl x", display.clean("```bash\ncurl x\n```"))
+        self.assertEqual("s += (-1)**i", display.clean("```python\ns += (-1)**i\n```"))
+        self.assertEqual("别加花活", display.clean("**别加花活**"))
 
     def test_decorate_does_not_truncate(self):
         text = "这是一句明显超过二十个字的话，用来确认不会被长度学习截断。"
