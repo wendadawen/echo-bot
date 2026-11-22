@@ -74,7 +74,7 @@ HARD_REPLIES = (
 HELP = (
     "/帮助  显示本说明\n"
     "/待办  看本群待办\n"
-    "/提醒  后面直接写时间和事情，如「每天22:00 交周报」"
+    "/提醒  时间跟事儿一起发，像「每天22:00 交周报」"
 )
 
 FORMAT_HINT = "没懂，发 /帮助"
@@ -95,8 +95,9 @@ CN_HOUR = {
     "十一": 11, "十二": 12,
 }
 
-# 被点名后进入短对话窗口；刚说过话则安静一会儿。
+# 被点名后进入短对话窗口；窗口内只留很短的防抖，窗口外才安静较久。
 WINDOW_SECONDS = 240
+WINDOW_COOLDOWN_SECONDS = 3
 COOLDOWN_SECONDS = 20
 QUESTION_MARKS = (
     "?", "？", "吗", "呢", "怎么", "为什么", "是不是", "能不能",
@@ -106,13 +107,15 @@ QUESTION_MARKS = (
 
 class Brain:
     def __init__(self, store, model, chance=0.0, persona=PERSONA,
-                 window=WINDOW_SECONDS, cooldown=COOLDOWN_SECONDS):
+                 window=WINDOW_SECONDS, cooldown=COOLDOWN_SECONDS,
+                 window_cooldown=WINDOW_COOLDOWN_SECONDS):
         self.store = store
         self.model = model
         self.chance = chance
         self.persona = persona or PERSONA
         self.window = window
         self.cooldown = cooldown
+        self.window_cooldown = window_cooldown
         self._windows = {}
         self._last_reply = {}
 
@@ -159,9 +162,11 @@ class Brain:
         """按对话节奏决定是否开口；返回原因，None 表示保持沉默。"""
         if msg.mentioned:
             return "mention"
-        if now - self._last_reply.get(msg.group_id, 0) < self.cooldown:
+        in_window = now < self._windows.get(msg.group_id, 0)
+        gap = self.window_cooldown if in_window else self.cooldown
+        if now - self._last_reply.get(msg.group_id, 0) < gap:
             return None
-        if now < self._windows.get(msg.group_id, 0):
+        if in_window:
             return "window"
         if self._worth_replying(text):
             return "question"

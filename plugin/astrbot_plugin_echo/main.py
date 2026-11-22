@@ -64,15 +64,16 @@ class Echo(Star):
         text = (event.get_message_str() or "").strip()
         if not text:
             return
-        # 含链接的消息交给链接解析插件，本插件不抢答、也不阻断后续处理。
-        if "http://" in text or "https://" in text:
+        mentioned = self._mentioned(event, text)
+        # 含链接的消息交给链接解析插件；被 @ 时仍由本插件回应。
+        if ("http://" in text or "https://" in text) and not mentioned:
             return
         message = Message(
             group_id="{}:{}".format(event.get_platform_name(), event.get_group_id() or ""),
             user_id=sender,
             user_name=str(event.get_sender_name() or sender),
             text=text,
-            mentioned=self._mentioned(event, text),
+            mentioned=mentioned,
             umo=str(event.unified_msg_origin or ""),
         )
         # 核心层是同步的纯逻辑；模型网络请求放在线程里，避免阻塞事件循环。

@@ -65,6 +65,7 @@ class TestBrain(unittest.TestCase):
     def test_window_keeps_conversation_going(self):
         store, brain = make_brain(0.0)
         brain.cooldown = 0
+        brain.window_cooldown = 0
         self.assertEqual("mention", brain.handle(msg("在吗"))["reason"])
         self.assertEqual("window", brain.handle(msg("今天好累", mentioned=False))["reason"])
 
