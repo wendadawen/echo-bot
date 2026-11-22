@@ -312,6 +312,11 @@ class Memory:
         """混合检索：FTS5 命中 + 关键词命中 + 时间衰减权重；命中即再激活。"""
         now = time.time() if now is None else now
         words = [w for w in re.findall(r"[\u4e00-\u9fff]{2,}|[a-z0-9]{3,}", query or "")][:6]
+        # 情节也要参与召回；只查记忆点会漏掉整段对话。
+        episodes = [
+            text for text in self.recent_episodes(group_id, limit=10)
+            if not words or any(word in text for word in words)
+        ][-2:]
         fts_ids = set(self._fts_hits(group_id, query, limit))
         with self._lock:
             rows = self._db.execute(
@@ -327,7 +332,7 @@ class Memory:
             fts = 1.0 if row["id"] in fts_ids else 0.0
             scored.append((weight + hit * 0.5 + fts, row["content"], row["id"]))
         scored.sort(key=lambda item: item[0], reverse=True)
-        chosen = scored[:limit]
+        chosen = scored[:max(0, limit - len(episodes))]
         for _, _, rid in chosen:
             with self._lock:
                 self._db.execute(
@@ -335,7 +340,7 @@ class Memory:
                     (now, min(5.0, maintain("reinforce", 1.0) * 0.5 + 0.7), rid),
                 )
                 self._db.commit()
-        return [content for _, content, _ in chosen]
+        return (episodes + [content for _, content, _ in chosen])[:limit]
 
     # ---- 人物画像与关系 ----
     def upsert_person(self, group_id, user_name, category, content, now=None, source="auto"):

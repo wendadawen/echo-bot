@@ -182,6 +182,16 @@ class TestIncidentRegressions(unittest.TestCase):
         self.assertEqual("face", result["reason"])
         self.assertEqual("475", result["face"])
 
+    def test_recall_finds_episode(self):
+        memory = Memory(":memory:")
+        memory.add_episode("g1", "阿伟在学归并排序")
+        self.assertIn("阿伟在学归并排序", memory.recall("g1", "归并排序"))
+
+    def test_recall_finds_person(self):
+        memory = Memory(":memory:")
+        memory.upsert_person("g1", "阿伟", "person", "在学归并排序")
+        self.assertTrue(memory.person("g1", "阿伟"))
+
     def test_empty_batch_is_silent(self):
         self.assertEqual("empty", make_brain().handle_batch(make_batch(""))["reason"])
 
