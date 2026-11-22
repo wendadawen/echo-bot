@@ -118,6 +118,11 @@ class Echo(Star):
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=10)
     async def on_group_message(self, event: AstrMessageEvent):
         """命令即时回；闲聊进防抖缓冲，由后台循环按批决策。"""
+        # 群聊完全由本插件接管，禁止 AstrBot 默认 LLM 再插一脚。
+        try:
+            event.should_call_llm(False)
+        except Exception:
+            pass
         self._ensure_reminder_task()
         self._ensure_chat_task()
         sender = str(event.get_sender_id() or "")
