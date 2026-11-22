@@ -29,6 +29,18 @@ class FakeResponse:
         return False
 
 
+class ScriptedModel:
+    name = "openai"
+
+    def __init__(self, output):
+        self.output = output
+        self.systems = []
+
+    def reply(self, system, history, user_text):
+        self.systems.append(system)
+        return self.output
+
+
 def make_brain(chance=0.0):
     store = Store(":memory:")
     return store, Brain(store, MockModel(), chance)
@@ -103,12 +115,84 @@ class TestBrain(unittest.TestCase):
             def reply(self, system, history, user_text):
                 raise RuntimeError("boom")
 
-        store = Store(":memory:")
-        brain = Brain(store, BrokenModel(), 1.0)
+        brain = Brain(Store(":memory:"), BrokenModel(), 1.0)
         result = brain.handle(msg("你好"))
         self.assertFalse(result["replied"])
         self.assertEqual("model_error", result["reason"])
         self.assertIn("boom", result["error"])
+
+    def test_daily_rule_variants(self):
+        cases = [
+            ("每天22:00 交周报", (22, 0, "交周报")),
+            ("每天晚上10点 交周报", (22, 0, "交周报")),
+            ("每天晚上十点 提醒施超", (22, 0, "提醒施超")),
+            ("每天早上8点半 开会", (8, 30, "开会")),
+            ("每晚十点半 睡觉", (22, 30, "睡觉")),
+            ("每天 22:00 写周报", (22, 0, "写周报")),
+        ]
+        for text, expected in cases:
+            self.assertEqual(expected, Brain._parse_daily(text), text)
+
+    def test_daily_reminder_fires_once_per_day(self):
+        store, brain = make_brain()
+        store.add_reminder("g1", "1001", "阿伟", "交周报", 0, "demo:group-1", "daily:22:00")
+        day_one = time.mktime((2026, 11, 22, 22, 1, 0, 0, 0, -1))
+        self.assertEqual(1, len(brain.tick(day_one)))
+        self.assertEqual([], brain.tick(day_one))
+        self.assertEqual([], brain.tick(time.mktime((2026, 11, 22, 12, 0, 0, 0, 0, -1))))
+        day_two = time.mktime((2026, 11, 23, 22, 2, 0, 0, 0, -1))
+        self.assertEqual(1, len(brain.tick(day_two)))
+        self.assertEqual(1, len(store.pending_reminders("g1")))
+
+    def test_pending_lists_daily_reminder(self):
+        store, brain = make_brain()
+        brain.handle(msg("/提醒 每天22:00 交周报"))
+        result = brain.handle(msg("/待办"))
+        self.assertIn("每天 22:00", result["text"])
+
+    def test_model_fallback_creates_once_reminder(self):
+        model = ScriptedModel('{"kind":"once","minutes":180,"text":"取快递"}')
+        store = Store(":memory:")
+        brain = Brain(store, model, 0.0)
+        result = brain.handle(msg("/提醒 明天下午三点左右提醒我取快递"))
+        self.assertEqual("command", result["reason"])
+        self.assertIn("180分钟后", result["text"])
+        items = store.pending_reminders("g1")
+        self.assertEqual(1, len(items))
+        self.assertEqual("取快递", items[0]["text"])
+        self.assertEqual("", items[0]["repeat"])
+
+    def test_model_fallback_rejects_invalid_output(self):
+        model = ScriptedModel("我不太确定")
+        store = Store(":memory:")
+        brain = Brain(store, model, 0.0)
+        result = brain.handle(msg("/提醒 明天下午三点左右提醒我取快递"))
+        self.assertIn("格式：", result["text"])
+        self.assertEqual([], store.pending_reminders("g1"))
+
+    def test_model_gets_command_constraints(self):
+        model = ScriptedModel("嗯嗯")
+        brain = Brain(Store(":memory:"), model, 1.0)
+        brain.handle(msg("随便聊聊"))
+        self.assertIn("不要编造", model.systems[0])
+
+    def test_model_parse_extracts_json_from_prose(self):
+        model = ScriptedModel('好的，结果是 {"kind":"once","minutes":10,"text":"开会"}')
+        brain = Brain(Store(":memory:"), model, 0.0)
+        self.assertEqual(10, brain._model_parse("十分钟后提醒我开会")["minutes"])
+
+    def test_model_fallback_scheduled(self):
+        output = '{"kind":"scheduled","day_offset":1,"hour":15,"minute":0,"text":"取快递"}'
+        store = Store(":memory:")
+        brain = Brain(store, ScriptedModel(output), 0.0)
+        result = brain.handle(msg("/提醒 明天下午三点左右提醒我取快递"))
+        self.assertEqual("command", result["reason"])
+        self.assertIn("我 @ 你", result["text"])
+        items = store.pending_reminders("g1")
+        self.assertEqual(1, len(items))
+        self.assertEqual("取快递", items[0]["text"])
+        self.assertEqual("", items[0]["repeat"])
+        self.assertGreater(items[0]["due_at"], time.time())
 
 
 class TestModels(unittest.TestCase):

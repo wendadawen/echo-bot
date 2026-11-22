@@ -30,10 +30,18 @@ class Store:
                     text TEXT NOT NULL,
                     due_at REAL NOT NULL,
                     umo TEXT NOT NULL DEFAULT '',
-                    done INTEGER NOT NULL DEFAULT 0
+                    done INTEGER NOT NULL DEFAULT 0,
+                    repeat TEXT NOT NULL DEFAULT '',
+                    last_fired TEXT NOT NULL DEFAULT ''
                 );
                 """
             )
+            # 兼容早期版本的数据库文件
+            columns = {row["name"] for row in self._db.execute("PRAGMA table_info(reminders)")}
+            if "repeat" not in columns:
+                self._db.execute("ALTER TABLE reminders ADD COLUMN repeat TEXT NOT NULL DEFAULT ''")
+            if "last_fired" not in columns:
+                self._db.execute("ALTER TABLE reminders ADD COLUMN last_fired TEXT NOT NULL DEFAULT ''")
             self._db.commit()
 
     def add_message(self, group_id, user_id, user_name, role, text, ts=None):
@@ -55,12 +63,12 @@ class Store:
             ).fetchall()
         return [dict(r) for r in reversed(rows)]
 
-    def add_reminder(self, group_id, user_id, user_name, text, due_at, umo=""):
+    def add_reminder(self, group_id, user_id, user_name, text, due_at, umo="", repeat=""):
         with self._lock:
             cur = self._db.execute(
-                "INSERT INTO reminders(group_id, user_id, user_name, text, due_at, umo) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (group_id, user_id, user_name, text, due_at, umo),
+                "INSERT INTO reminders(group_id, user_id, user_name, text, due_at, umo, repeat) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (group_id, user_id, user_name, text, due_at, umo, repeat),
             )
             self._db.commit()
             return cur.lastrowid
@@ -77,7 +85,8 @@ class Store:
         now = time.time() if now is None else now
         with self._lock:
             rows = self._db.execute(
-                "SELECT * FROM reminders WHERE done = 0 AND due_at <= ? ORDER BY due_at",
+                "SELECT * FROM reminders WHERE done = 0 "
+                "AND ((repeat = '' AND due_at <= ?) OR repeat <> '') ORDER BY due_at",
                 (now,),
             ).fetchall()
         return [dict(r) for r in rows]
@@ -85,4 +94,9 @@ class Store:
     def mark_reminder_done(self, rid):
         with self._lock:
             self._db.execute("UPDATE reminders SET done = 1 WHERE id = ?", (rid,))
+            self._db.commit()
+
+    def mark_reminder_fired(self, rid, day):
+        with self._lock:
+            self._db.execute("UPDATE reminders SET last_fired = ? WHERE id = ?", (day, rid))
             self._db.commit()
