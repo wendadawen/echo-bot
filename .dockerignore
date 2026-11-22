@@ -1,6 +1,14 @@
 .git
+.github
 data
 dist
-__pycache__
-*.pyc
+tests
+.venv
+venv
 .env
+.env.*
+**/__pycache__
+**/*.py[cod]
+**/.DS_Store
+.idea
+.vscode

@@ -90,30 +90,45 @@ class TestBrain(unittest.TestCase):
         self.assertFalse(brain.handle(msg("在吗", mentioned=False))["replied"])
 
     def test_mute_silences_until_unmute(self):
+        from astrbot_plugin_echo.core.modes import ModePolicy
+
         store, brain = make_brain()
-        self.assertIn("不说了", brain.handle(msg("/闭嘴"))["text"])
+        brain.modes = ModePolicy()
+        # 已按要求删除 /闭嘴、/说话 命令
+        self.assertIsNone(brain.command(msg("/闭嘴")))
+        self.assertIsNone(brain.command(msg("/说话")))
+        brain.modes.set("g1", "quiet")
         self.assertFalse(brain.handle(msg("随便聊聊"))["replied"])
         self.assertFalse(brain.handle(msg("在吗", mentioned=False))["replied"])
-        self.assertIn("回来", brain.handle(msg("/说话"))["text"])
+        brain.modes.reset("g1")
         self.assertTrue(brain.handle(msg("在吗"))["replied"])
 
     def test_commands_still_work_while_muted(self):
+        from astrbot_plugin_echo.core.modes import ModePolicy
+
         store, brain = make_brain()
-        brain.handle(msg("/闭嘴"))
+        brain.modes = ModePolicy()
+        brain.modes.set("g1", "quiet")
         result = brain.handle(msg("/帮助"))
         self.assertEqual("command", result["reason"])
         self.assertIn("/提醒", result["text"])
+        self.assertIn("/待办", result["text"])
+        for removed in ("/专注", "/随便", "/闭嘴", "/忘掉"):
+            self.assertNotIn(removed, result["text"])
 
     def test_focus_command_sets_topic_and_resume(self):
         from astrbot_plugin_echo.core.modes import ModePolicy
 
         store, brain = make_brain()
         brain.modes = ModePolicy()
-        self.assertIn("就聊归并排序", brain.handle(msg("/专注 归并排序"))["text"])
+        # 已按要求删除 /专注、/随便 命令，模式由 ModePolicy 内部 API 管理
+        self.assertIsNone(brain.command(msg("/专注 归并排序")))
+        self.assertIsNone(brain.command(msg("/随便")))
+        brain.modes.set("g1", "focus", topic="归并排序")
         self.assertEqual("focus", brain.modes.mode("g1"))
         self.assertTrue(brain.modes.focus_hit("g1", "归并排序怎么拆"))
         self.assertFalse(brain.modes.focus_hit("g1", "今晚吃什么"))
-        self.assertIn("随便聊", brain.handle(msg("/随便"))["text"])
+        brain.modes.reset("g1")
         self.assertEqual("normal", brain.modes.mode("g1"))
 
     def test_mode_command_reports_state(self):
@@ -121,9 +136,10 @@ class TestBrain(unittest.TestCase):
 
         store, brain = make_brain()
         brain.modes = ModePolicy()
-        self.assertIn("正常", brain.handle(msg("/模式"))["text"])
-        brain.handle(msg("/闭嘴"))
-        self.assertIn("闭嘴", brain.handle(msg("/模式"))["text"])
+        self.assertIsNone(brain.command(msg("/模式")))
+        self.assertEqual("normal", brain.modes.mode("g1"))
+        brain.modes.set("g1", "quiet")
+        self.assertEqual("quiet", brain.modes.mode("g1"))
 
     def test_repeated_message_in_batch_is_ignored(self):
         from astrbot_plugin_echo.core.rhythm import Batch, Item

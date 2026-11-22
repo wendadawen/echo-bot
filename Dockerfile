@@ -24,7 +24,7 @@ RUN set -eux; \
       amd64) pkg="codex-package-x86_64-unknown-linux-musl.tar.gz"; sha="$CODEX_SHA_AMD64" ;; \
       *) echo "unsupported architecture: $arch"; exit 1 ;; \
     esac; \
-    curl -fsSL -o /tmp/codex.tgz \
+    curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 300 -o /tmp/codex.tgz \
       "https://github.com/openai/codex/releases/download/rust-v${CODEX_VERSION}/${pkg}"; \
     echo "$sha  /tmp/codex.tgz" | sha256sum -c -; \
     mkdir -p /opt/codex; \
@@ -38,7 +38,7 @@ RUN pip install --no-cache-dir \
       httpx "bilibili-api-python>=17.4.0,<18.0.0" msgspec Pillow aiohttp \
       "gmssl>=3.2.2,<4.0.0" "yt-dlp>=2026.8.19"
 
-# 插件自带一份；compose 会挂仓库源码覆盖它，改代码即时生效。
+# 插件内置在镜像里，启动时由 bootstrap 同步进数据卷（默认不挂载宿主机目录）。
 COPY plugin/astrbot_plugin_echo /opt/echo/plugin/astrbot_plugin_echo
 COPY docker/bootstrap.sh /usr/local/bin/bootstrap.sh
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
@@ -47,6 +47,6 @@ RUN chmod +x /usr/local/bin/bootstrap.sh /usr/local/bin/entrypoint.sh \
     && mkdir -p /AstrBot/data/plugins /opt/qq
 
 VOLUME ["/AstrBot/data"]
-EXPOSE 6185 6199 6099
+EXPOSE 6185 6099
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

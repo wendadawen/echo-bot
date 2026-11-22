@@ -9,6 +9,16 @@ PLUGIN = ROOT / "plugin" / "astrbot_plugin_echo"
 DIST = ROOT / "dist"
 
 
+def _should_skip(rel_path):
+    for part in rel_path.parts:
+        if part.startswith(".") or part == "__pycache__":
+            return True
+    name = rel_path.name.lower()
+    if name.endswith((".pyc", ".pyo", ".pyd", ".sqlite", ".sqlite3", ".db", ".wal", ".shm")):
+        return True
+    return False
+
+
 def main():
     metadata = (PLUGIN / "metadata.yaml").read_text(encoding="utf-8")
     match = re.search(r"^version:\s*(\S+)", metadata, re.M)
@@ -18,11 +28,12 @@ def main():
     count = 0
     with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as archive:
         for path in sorted(PLUGIN.rglob("*")):
-            if not path.is_file():
+            if path.is_symlink() or not path.is_file():
                 continue
-            if "__pycache__" in path.parts or path.suffix == ".pyc":
+            rel = path.relative_to(PLUGIN)
+            if _should_skip(rel):
                 continue
-            archive.write(path, str(Path(PLUGIN.name) / path.relative_to(PLUGIN)))
+            archive.write(path, (Path(PLUGIN.name) / rel).as_posix())
             count += 1
     print("已打包 {} 个文件 -> {}".format(count, target))
     return 0

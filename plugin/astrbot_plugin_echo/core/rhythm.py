@@ -63,8 +63,10 @@ class Batch:
     scene: str = "group"
     images: list = field(default_factory=list)
     approved: bool = False
-    # 同一批消息被 requeue 时沿用同一个 turn_id，主循环据此避免重复处理。
+    # 同一批消息被 requeue 时沿用同一个 turn_id 并标记 persisted，主循环据此避免重复入库。
     turn_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    persisted: bool = False
+    replay_count: int = 0
 
     @property
     def mentioned(self):
@@ -207,6 +209,12 @@ class Rhythm:
         batch.deadline = min(batch.deadline, batch.started + preset["cap"])
         if item.mentioned:
             mention_deadline = item.ts + preset["mention_cap"]
+            if batch.has_image:
+                mention_deadline = max(
+                    mention_deadline,
+                    batch.started + preset.get("image_min", 4.0),
+                )
+                mention_deadline = min(mention_deadline, batch.started + preset["cap"])
             earliest = self._earliest_mention.get(group_id)
             self._earliest_mention[group_id] = (
                 mention_deadline if earliest is None else min(earliest, mention_deadline)
@@ -228,9 +236,12 @@ class Rhythm:
         for batch in ready:
             self._batches.pop(batch.group_id, None)
             raw_images = self._images.pop(batch.group_id, [])
-            batch.images = [
+            fresh_images = [
                 data for stamp, data in raw_images if now - stamp <= IMAGE_TTL
             ]
+            if fresh_images:
+                existing = list(getattr(batch, "images", None) or [])
+                batch.images = (existing + fresh_images)[-4:]
             self._last_batch[batch.group_id] = batch
         return ready
 
@@ -258,6 +269,8 @@ class Rhythm:
             images=list(getattr(batch, "images", [])),
             approved=True,
             turn_id=getattr(batch, "turn_id", ""),
+            persisted=True,
+            replay_count=int(getattr(batch, "replay_count", 0) or 0) + 1,
         )
         self._batches[batch.group_id] = clone
         return clone

@@ -48,8 +48,8 @@ class SubAgentManager:
         with self._lock:
             return [task for task in self._tasks.values() if task.status == "running"]
 
-    def submit(self, kind, prompt, runner):
-        """runner(prompt) -> str；超过并发上限时返回 None，由调用方回一句忙。"""
+    def submit(self, kind, prompt, runner, on_complete=None):
+        """runner(prompt) -> str/dict；超过并发上限时返回 None，由调用方回一句忙。"""
         with self._lock:
             active = sum(1 for t in self._tasks.values() if t.status == "running")
             if active >= self.max_running:
@@ -92,6 +92,7 @@ class SubAgentManager:
                 status = "failed"
                 reason = "error"
                 error = "{}: {}".format(type(exc).__name__, exc)[:200]
+            payload = None
             with self._lock:
                 if task.status == "stopped":
                     return
@@ -102,6 +103,12 @@ class SubAgentManager:
                 task.reason = reason
                 task.status = status
                 task.finished = time.time()
+                payload = task.as_dict()
+            if callable(on_complete) and payload is not None:
+                try:
+                    on_complete(payload)
+                except Exception:
+                    pass
             self._trim()
 
         threading.Thread(target=work, name="echo-subagent", daemon=True).start()
@@ -109,10 +116,16 @@ class SubAgentManager:
 
     def _trim(self):
         with self._lock:
-            finished = [tid for tid in self._order
-                        if self._tasks.get(tid) and self._tasks[tid].status != "running"]
-            for tid in finished[:max(0, len(finished) - self.keep)]:
+            # 只淘汰「已经 poll 取走」且已结束的旧任务，避免积压未取走的结论被提前丢弃。
+            finished_taken = [
+                tid for tid in self._order
+                if tid in self._taken
+                and self._tasks.get(tid)
+                and self._tasks[tid].status != "running"
+            ]
+            for tid in finished_taken[:max(0, len(finished_taken) - self.keep)]:
                 self._tasks.pop(tid, None)
+                self._taken.discard(tid)
             self._order = [tid for tid in self._order if tid in self._tasks]
 
     def poll(self):
@@ -123,6 +136,7 @@ class SubAgentManager:
                 if task.status in ("completed", "failed") and task.id not in self._taken:
                     rows.append(task.as_dict())
                     self._taken.add(task.id)
+        self._trim()
         return rows
 
     def cancel(self, task_id):

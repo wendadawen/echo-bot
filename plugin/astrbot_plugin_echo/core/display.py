@@ -19,7 +19,7 @@ LATEX_PATTERNS = (
     re.compile(r"\$\$(.+?)\$\$", re.S),
     re.compile(r"\\\[(.*?)\\\]", re.S),
     re.compile(r"\\\((.*?)\\\)", re.S),
-    re.compile(r"\$([^$\n]+)\$"),
+    re.compile(r"(?<![\\$\w])\$(?!\s)(?![0-9]+(?:\.[0-9]+)?(?:\s|$))([^$\n]+?)(?<!\s)\$(?!\w)"),
 )
 LINK_PATTERN = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 

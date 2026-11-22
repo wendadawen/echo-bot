@@ -259,9 +259,9 @@ class TestBrainScheduleAndForget(unittest.TestCase):
     def test_forget_clears_messages(self):
         self.brain.handle(message("随便聊聊"))
         self.assertTrue(self.store.recent("g1"))
-        result = self.brain.handle(message("/忘掉"))
-        self.assertIn("清了", result["text"])
-        # 命令自己的回复会入库，这里只要求原来的聊天被清掉。
+        # 已按要求移除 /忘掉 命令；保留底层 Store.clear_messages 隔离能力。
+        self.assertIsNone(self.brain.command(message("/忘掉")))
+        self.assertGreater(self.store.clear_messages("g1"), 0)
         rows = self.store.recent("g1")
         self.assertFalse([row for row in rows if row["role"] == "user"])
 

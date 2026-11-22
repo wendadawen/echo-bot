@@ -31,6 +31,19 @@ def looks_like_forward(component):
     return False
 
 
+def _segment_text(part):
+    if isinstance(part, str):
+        return part
+    if isinstance(part, dict):
+        data = part.get("data")
+        if isinstance(data, dict):
+            txt = _get(data, "text", "content", default="")
+            if txt:
+                return str(txt)
+        return str(_get(part, "text", "content", default="") or "")
+    return str(_get(part, "text", "content", default="") or "")
+
+
 def extract(component):
     """取出转发里的每条消息文本；结构不认识时返回空列表。"""
     name = type(component).__name__.lower()
@@ -48,13 +61,13 @@ def extract(component):
     lines = []
     for node in list(content)[:MAX_ITEMS]:
         sender = _get(node, "sender", "name", "nickname", "user_name", default="")
-        if isinstance(sender, dict):
+        if sender and not isinstance(sender, str):
             sender = _get(sender, "card", "nickname", "name", default="")
         body = _get(node, "content", "message", "text", default="")
         if isinstance(body, (list, tuple)):
-            body = "".join(str(_get(part, "text", "content", default="")) for part in body)
+            body = "".join(_segment_text(part) for part in body)
         elif isinstance(body, dict):
-            body = _get(body, "text", "content", default="")
+            body = _segment_text(body)
         text = str(body or "").strip().replace("\n", " ")
         if text:
             lines.append(format_speaker_message(sender or "群友", text[:80]))

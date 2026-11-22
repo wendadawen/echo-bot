@@ -9,10 +9,12 @@
 import base64
 import hashlib
 import json
+import os
 import random
 import re
 import threading
 import time
+import uuid
 from pathlib import Path
 
 DESCRIBE_PROMPT = "用一句话说清这张图/表情在表达什么，不要解释、不要标点堆砌。"
@@ -71,8 +73,10 @@ def analyze(model, image_bytes):
 
 
 def acceptable(description, image_bytes=None):
-    """内容过滤：明显不该留存/转发的内容直接拦下。"""
-    text = str(description or "")
+    """内容过滤（fail-closed）：空描述或命中敏感词/超限一律拦下。"""
+    text = str(description or "").strip()
+    if not text:
+        return False
     if any(word in text for word in FILTER_WORDS):
         return False
     if image_bytes and len(image_bytes) > 2 * 1024 * 1024:
@@ -97,7 +101,10 @@ def grid_pick(model, candidates, mood="随手"):
     match = re.search(r"\d+", str(raw or ""))
     if not match:
         return random.randrange(len(candidates[:6]))
-    return min(int(match.group(0)) - 1, len(candidates[:6]) - 1)
+    idx = int(match.group(0)) - 1
+    if idx < 0:
+        idx = 0
+    return min(idx, len(candidates[:6]) - 1)
 
 
 class EmojiBank:
@@ -128,16 +135,40 @@ class EmojiBank:
                 self._digest_cache = {}
         self._migrate_and_dedup()
 
+    @staticmethod
+    def _atomic_write(path, text):
+        target = Path(path)
+        tmp = target.parent / ".{}.{}.tmp".format(target.name, uuid.uuid4().hex[:8])
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(str(tmp), str(target))
+
+    def _safe_path(self, path_str):
+        if not path_str:
+            return None
+        try:
+            root = self.root.resolve(strict=False)
+            p = Path(path_str)
+            if p.is_symlink():
+                return None
+            resolved = p.resolve(strict=False)
+            if root not in resolved.parents:
+                return None
+            return p if p.is_file() else None
+        except OSError:
+            return None
+
     def _save(self):
         with self._lock:
-            self.index_path.write_text(
-                json.dumps(self._index, ensure_ascii=False, indent=2), encoding="utf-8"
+            self._atomic_write(
+                self.index_path,
+                json.dumps(self._index, ensure_ascii=False, indent=2),
             )
 
     def _save_cache(self):
         with self._lock:
-            self.cache_path.write_text(
-                json.dumps(self._digest_cache, ensure_ascii=False, indent=2), encoding="utf-8"
+            self._atomic_write(
+                self.cache_path,
+                json.dumps(self._digest_cache, ensure_ascii=False, indent=2),
             )
 
     def _migrate_and_dedup(self):
@@ -269,31 +300,34 @@ class EmojiBank:
             description, label = analyze(model, image_bytes)
             ok = acceptable(description, image_bytes)
         except Exception:
+            description = ""
             ok = False
         finally:
             now = time.time()
             with self._lock:
                 self._inflight.discard(digest)
-                self._digest_cache[digest] = {
-                    "ok": bool(ok),
-                    "tag": label if ok else "",
-                    "description": description[:80] if ok else "",
-                    "ts": now,
-                }
-                if len(self._digest_cache) > 500:
-                    oldest = sorted(
-                        self._digest_cache.items(),
-                        key=lambda kv: float((kv[1] or {}).get("ts") or 0),
-                    )
-                    for old_key, _ in oldest[:len(self._digest_cache) - 500]:
-                        self._digest_cache.pop(old_key, None)
-                self._save_cache()
+                # 仅当视觉模型给出明确描述时才写入指纹缓存；临时识别失败/空描述不缓存，避免永久放行或误封。
+                if str(description or "").strip():
+                    self._digest_cache[digest] = {
+                        "ok": bool(ok),
+                        "tag": label if ok else "",
+                        "description": description[:80] if ok else "",
+                        "ts": now,
+                    }
+                    if len(self._digest_cache) > 500:
+                        oldest = sorted(
+                            self._digest_cache.items(),
+                            key=lambda kv: float((kv[1] or {}).get("ts") or 0),
+                        )
+                        for old_key, _ in oldest[:len(self._digest_cache) - 500]:
+                            self._digest_cache.pop(old_key, None)
+                    self._save_cache()
                 if ok:
                     entries = self._index.setdefault(group_id, [])
                     already = any(
                         item.get("sha256") == digest
                         and item.get("path")
-                        and Path(item["path"]).exists()
+                        and self._safe_path(item["path"]) is not None
                         for item in entries
                     )
                     if not already:
@@ -327,13 +361,12 @@ class EmojiBank:
             return label
 
     def candidates(self, group_id, keyword=""):
-        entries = self._index.get(group_id) or []
+        with self._lock:
+            entries = list(self._index.get(group_id) or [])
         rows = []
         for item in entries:
-            if not item.get("path"):
-                continue
-            path = Path(item["path"])
-            if not path.exists():
+            path = self._safe_path(item.get("path"))
+            if path is None:
                 continue
             score = 0.0
             text = "{} {}".format(item.get("tag", ""), item.get("description", ""))
@@ -343,14 +376,22 @@ class EmojiBank:
                         score += 1.0
             rows.append((score + item.get("ts", 0) / 1e12, path))
         rows.sort(key=lambda pair: pair[0], reverse=True)
-        return [(path, path.read_bytes()) for _, path in rows[:6]
-                if path.stat().st_size <= 2 * 1024 * 1024]
+        out = []
+        for _, path in rows[:6]:
+            try:
+                if path.stat().st_size <= 2 * 1024 * 1024:
+                    out.append((path, path.read_bytes()))
+            except OSError:
+                continue
+        return out
 
     def pick(self, group_id, keyword="", model=None):
         """有模型时做语义网格挑选；没有图片时也可以挑 QQ 内置表情。"""
+        with self._lock:
+            raw_entries = list(self._index.get(group_id) or [])
         entries = [
-            item for item in (self._index.get(group_id) or [])
-            if item.get("face_id") or (item.get("path") and Path(item["path"]).exists())
+            item for item in raw_entries
+            if item.get("face_id") or self._safe_path(item.get("path")) is not None
         ]
         if not entries:
             return None
@@ -364,15 +405,24 @@ class EmojiBank:
             ]
             if matched:
                 entries = matched
-        images = [item for item in entries
-                  if item.get("path") and Path(item["path"]).exists()]
+        images = [item for item in entries if self._safe_path(item.get("path")) is not None]
         if model is not None and len(images) > 1:
-            candidates = [(Path(item["path"]), Path(item["path"]).read_bytes())
-                          for item in images[:6]]
-            index = grid_pick(model, candidates, keyword or "随手")
-            if index is not None and 0 <= index < len(candidates):
-                return candidates[index][0]
+            candidates = []
+            for item in images[:6]:
+                p = self._safe_path(item.get("path"))
+                if p is None:
+                    continue
+                try:
+                    candidates.append((p, p.read_bytes()))
+                except OSError:
+                    continue
+            if len(candidates) > 1:
+                index = grid_pick(model, candidates, keyword or "随手")
+                if index is not None and 0 <= index < len(candidates):
+                    return candidates[index][0]
         pool = images + [item for item in entries if item.get("face_id")]
+        if not pool:
+            return None
         picked = random.choice(pool[-8:])
         if picked.get("face_id"):
             return "face:" + str(picked["face_id"])
@@ -386,20 +436,24 @@ class EmojiBank:
         return description
 
     def cleanup(self, max_age_days=None):
-        cutoff = time.time() - (max_age_days or self.max_age_days) * 86400
+        cutoff = time.time() - (self.max_age_days if max_age_days is None else max_age_days) * 86400
         with self._lock:
             for group_id, entries in list(self._index.items()):
                 kept = []
                 for item in entries:
                     if item.get("ts", 0) < cutoff:
                         if item.get("path"):
-                            Path(item["path"]).unlink(missing_ok=True)
+                            try:
+                                Path(item["path"]).unlink(missing_ok=True)
+                            except OSError:
+                                pass
                     else:
                         kept.append(item)
                 self._index[group_id] = kept
             self._save()
 
     def stats(self, group_id=None):
-        if group_id:
-            return {group_id: len(self._index.get(group_id, []))}
-        return {key: len(value) for key, value in self._index.items()}
+        with self._lock:
+            if group_id:
+                return {group_id: len(self._index.get(group_id, []))}
+            return {key: len(value) for key, value in self._index.items()}

@@ -4,7 +4,11 @@
 但用二元组重合度与新词比例计算，不依赖向量模型。只依赖标准库。
 """
 
+import re
+import threading
 import time
+
+URL_PATTERN = re.compile(r"https?://\S+")
 
 DRIFT_BLOCKS = {
     "off": "",
@@ -46,9 +50,11 @@ def novelty(text, recent_texts):
 
 
 def drift_level(score, *, budget=2, intensity="normal"):
-    """按新词比例与剩余预算给出档位；预算用完只能轻微漂。"""
-    if intensity == "off" or budget <= 0:
-        return "off" if intensity == "off" else "subtle"
+    """按新词比例与剩余预算给出档位；预算用完时仅把活跃漂移降级为轻微，低分仍 off。"""
+    if intensity == "off":
+        return "off"
+    if budget <= 0:
+        return "subtle" if score >= 0.72 else "off"
     if score >= 0.72 and budget >= 2:
         return "active"
     if score >= 0.45:
@@ -72,19 +78,22 @@ class AttentionTracker:
     def __init__(self, window=8, budget_per_hour=3):
         self.window = window
         self.budget_per_hour = budget_per_hour
+        self._lock = threading.RLock()
         self._recent = {}
         self._budget = {}
         self._topic = {}
 
     def observe(self, group_id, text, now=None):
         now = time.time() if now is None else now
-        rows = self._recent.setdefault(str(group_id), [])
-        rows.append(str(text or ""))
-        del rows[:-self.window]
-        topic = self._guess_topic(rows)
-        if topic:
-            self._topic[str(group_id)] = topic
-        self._refill(str(group_id), now)
+        gid = str(group_id)
+        with self._lock:
+            rows = self._recent.setdefault(gid, [])
+            rows.append(str(text or ""))
+            del rows[:-self.window]
+            topic = self._guess_topic(rows)
+            if topic:
+                self._topic[gid] = topic
+            self._refill(gid, now)
 
     def _refill(self, group_id, now):
         hour = int(now // 3600)
@@ -95,34 +104,45 @@ class AttentionTracker:
 
     def budget(self, group_id, now=None):
         now = time.time() if now is None else now
-        self._refill(str(group_id), now)
-        used, _ = self._budget.get(str(group_id), (0, 0))
-        return max(0, self.budget_per_hour - used)
+        gid = str(group_id)
+        with self._lock:
+            self._refill(gid, now)
+            used, _ = self._budget.get(gid, (0, 0))
+            return max(0, self.budget_per_hour - used)
 
     def level(self, group_id, text, intensity="normal", now=None):
         now = time.time() if now is None else now
-        rows = self._recent.get(str(group_id), [])
+        gid = str(group_id)
+        with self._lock:
+            rows = list(self._recent.get(gid, []))
+            rem = self.budget(gid, now)
         score = novelty(text, rows)
-        return drift_level(score, budget=self.budget(group_id, now),
-                           intensity=intensity)
+        return drift_level(score, budget=rem, intensity=intensity)
 
     def consume(self, group_id, now=None):
         now = time.time() if now is None else now
-        self._refill(str(group_id), now)
-        used, hour = self._budget.get(str(group_id), (0, int(now // 3600)))
-        self._budget[str(group_id)] = (used + 1, hour)
+        gid = str(group_id)
+        with self._lock:
+            self._refill(gid, now)
+            used, hour = self._budget.get(gid, (0, int(now // 3600)))
+            self._budget[gid] = (used + 1, hour)
 
     def topic(self, group_id):
-        return self._topic.get(str(group_id), "")
+        with self._lock:
+            return self._topic.get(str(group_id), "")
 
     @staticmethod
     def _guess_topic(rows):
-        """用最近几条里出现次数最多的二元组当话题；同分时取更早出现的。"""
+        """用最近几条里出现次数最多的二元组当话题；去掉 URL 与标点噪音，同分时取更早出现的。"""
         if not rows:
             return ""
         counts, first, order = {}, {}, 0
         for row in rows[-4:]:
-            clean = "".join(ch for ch in str(row or "") if ch.strip())
+            stripped = URL_PATTERN.sub("", str(row or ""))
+            clean = "".join(
+                ch for ch in stripped
+                if "\u4e00" <= ch <= "\u9fff" or ch.isalnum()
+            )
             for index in range(max(0, len(clean) - 1)):
                 gram = clean[index:index + 2]
                 if gram in STOP_GRAMS:

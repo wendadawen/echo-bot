@@ -6,7 +6,10 @@
 """
 
 import json
+import os
+import threading
 import time
+import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -14,6 +17,14 @@ MAX_TEXT = 65536
 
 # 可被覆盖的提示词名；没有文件时回落到调用方传入的默认值。
 PROMPT_NAMES = ("persona", "action", "memory", "parse", "drift", "supplement")
+
+
+def _atomic_write_text(path, text):
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.parent / ".{}.{}.tmp".format(target.name, uuid.uuid4().hex[:8])
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(str(tmp), str(target))
 
 
 @dataclass
@@ -65,54 +76,74 @@ class PromptStore:
     def __init__(self, root):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
 
     def _path(self, name, group_id=None):
-        base = self.root / group_id if group_id else self.root
-        return base / "{}.txt".format(name)
-
-    def get(self, name, group_id=None, default=""):
-        for group in (group_id, None):
-            if group == "":
-                continue
-            path = self._path(name, group)
-            try:
-                text = path.read_text(encoding="utf-8").strip()
-            except (OSError, ValueError):
-                continue
-            if text:
-                return text
-        return default
-
-    def set(self, name, text, group_id=None):
         if name not in PROMPT_NAMES:
             raise ValueError("未知提示词：{}".format(name))
+        root_resolved = self.root.resolve(strict=False)
+        if group_id is None or group_id == "":
+            target = (root_resolved / "{}.txt".format(name)).resolve(strict=False)
+        else:
+            gid = str(group_id).strip()
+            if (
+                not gid
+                or gid in (".", "..")
+                or "/" in gid
+                or "\\" in gid
+                or ".." in gid
+                or "\x00" in gid
+            ):
+                raise ValueError("非法的群标识：{}".format(group_id))
+            target = (root_resolved / gid / "{}.txt".format(name)).resolve(strict=False)
+        if root_resolved not in target.parents:
+            raise ValueError("提示词路径越界")
+        return target
+
+    def get(self, name, group_id=None, default=""):
+        with self._lock:
+            for group in (group_id, None):
+                if group == "":
+                    continue
+                path = self._path(name, group)
+                try:
+                    text = path.read_text(encoding="utf-8").strip()
+                except (OSError, ValueError):
+                    continue
+                if text:
+                    return text
+            return default
+
+    def set(self, name, text, group_id=None):
         text = str(text or "").strip()
         if not text:
             raise ValueError("提示词不能为空")
         if len(text) > MAX_TEXT:
             raise ValueError("提示词过长")
-        path = self._path(name, group_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text + "\n", encoding="utf-8")
-        return path
+        with self._lock:
+            path = self._path(name, group_id)
+            _atomic_write_text(path, text + "\n")
+            return path
 
     def reset(self, name, group_id=None):
-        path = self._path(name, group_id)
-        if path.exists():
-            path.unlink()
-            return True
-        return False
+        with self._lock:
+            path = self._path(name, group_id)
+            if path.exists():
+                path.unlink()
+                return True
+            return False
 
     def describe(self, group_id=None):
         rows = []
-        for name in PROMPT_NAMES:
-            path = self._path(name, group_id)
-            source = "默认"
-            size = 0
-            if path.exists():
-                source = "本群覆盖" if group_id else "全局覆盖"
-                size = path.stat().st_size
-            rows.append({"name": name, "source": source, "bytes": size})
+        with self._lock:
+            for name in PROMPT_NAMES:
+                path = self._path(name, group_id)
+                source = "默认"
+                size = 0
+                if path.exists():
+                    source = "本群覆盖" if group_id else "全局覆盖"
+                    size = path.stat().st_size
+                rows.append({"name": name, "source": source, "bytes": size})
         return rows
 
 
@@ -123,6 +154,7 @@ class PersonaLibrary:
         self.root = Path(root)
         self.builtin = builtin
         self.root.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
 
     def _file(self, persona_id):
         safe = "".join(ch for ch in persona_id if ch.isalnum() or ch in "-_") or "persona"
@@ -132,36 +164,39 @@ class PersonaLibrary:
 
     def list(self):
         rows = []
-        if self.builtin:
-            rows.append(self.builtin)
-        for path in sorted(self.root.glob("*.json")):
-            if path.name == "active.json":
-                continue
-            data = self._read(path)
-            if data:
-                rows.append(data)
+        with self._lock:
+            if self.builtin:
+                rows.append(self.builtin)
+            for path in sorted(self.root.glob("*.json")):
+                if path.name == "active.json":
+                    continue
+                data = self._read(path)
+                if data:
+                    rows.append(data)
         return rows
 
     def get(self, persona_id):
-        if self.builtin and persona_id == self.builtin.id:
-            return self.builtin
-        for path in self.root.glob("*.json"):
-            if path.name == "active.json":
-                continue
-            data = self._read(path)
-            if data and data.id == persona_id:
-                return data
+        with self._lock:
+            if self.builtin and persona_id == self.builtin.id:
+                return self.builtin
+            for path in self.root.glob("*.json"):
+                if path.name == "active.json":
+                    continue
+                data = self._read(path)
+                if data and data.id == persona_id:
+                    return data
         return None
 
     def save(self, persona):
         if not isinstance(persona, Persona):
             raise TypeError("需要 Persona")
-        path = self._file(persona.id)
-        path.write_text(
-            json.dumps(asdict(persona), ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-        return path
+        with self._lock:
+            path = self._file(persona.id)
+            _atomic_write_text(
+                path,
+                json.dumps(asdict(persona), ensure_ascii=False, indent=2) + "\n",
+            )
+            return path
 
     def _read(self, path):
         try:
@@ -203,20 +238,23 @@ class PersonaLibrary:
         return data if isinstance(data, dict) else {}
 
     def activate(self, group_id, persona_id):
-        persona = self.get(persona_id)
-        if persona is None:
-            raise ValueError("没有这个人格：{}".format(persona_id))
-        data = self._active_map()
-        data[str(group_id)] = persona_id
-        self._active_path().write_text(
-            json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-        )
-        return persona
+        with self._lock:
+            persona = self.get(persona_id)
+            if persona is None:
+                raise ValueError("没有这个人格：{}".format(persona_id))
+            data = self._active_map()
+            data[str(group_id)] = persona_id
+            _atomic_write_text(
+                self._active_path(),
+                json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+            )
+            return persona
 
     def active(self, group_id):
-        pid = self._active_map().get(str(group_id))
-        persona = self.get(pid) if pid else None
-        return persona or self.builtin
+        with self._lock:
+            pid = self._active_map().get(str(group_id))
+            persona = self.get(pid) if pid else None
+            return persona or self.builtin
 
     # ---- 导入导出（兼容 MaiBot 协议）----
     def import_json(self, raw):

@@ -13,9 +13,9 @@ def clean_speaker_name(name, limit=40):
 
 
 def format_speaker_message(user_name, text):
-    """把发言人昵称包裹进显式标签并与正文隔离，避免长昵称或签名被误读为发言内容。"""
+    """把发言人昵称包裹进显式标签并与正文隔离，避免长昵称或签名被误读为发言内容，也防正文伪造昵称边界。"""
     safe = clean_speaker_name(user_name)
-    body = str(text or "").strip()
+    body = re.sub(r"(^|\n)\s*\[昵称[：:]", r"\1【昵称：", str(text or "").strip())
     if safe:
         return "[昵称：{}] {}".format(safe, body) if body else "[昵称：{}]".format(safe)
     return body

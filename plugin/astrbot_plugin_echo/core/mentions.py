@@ -12,10 +12,17 @@ RETOLD_MARKERS = (
     "跟我讲你", "跟你讲你", "转述", "评价你", "骂你", "说你坏话",
     "说你不行", "说你不", "吐槽你", "背后说",
 )
-AT_PATTERN = re.compile(r"@([^\s@，,。:：!！?？]{1,20})")
+AT_PATTERN = re.compile(r"[@＠]([^\s@＠，,。:：!！?？]{1,20})")
 QUESTION_TAIL = ("吗", "呢", "么", "?", "？")
-QUESTION_WORDS = ("怎么", "为什么", "为啥", "是不是", "能不能", "要不要",
-                  "有没有", "什么", "啥", "谁", "多少", "多久", "哪")
+QUESTION_WORDS = (
+    "怎么", "为什么", "为啥", "是不是", "能不能", "要不要",
+    "有没有", "什么", "啥", "谁", "多少", "多久",
+    "哪个", "哪里", "哪儿", "哪种",
+)
+_RETOLD_DYNAMIC = re.compile(
+    r"(?:^|[\s，,。！？])(?!(?:话说|别说|再说|别讲|要说|虽说|瞎说|乱说))"
+    r"[\u4e00-\u9fffA-Za-z0-9_]{1,6}(?:在)?(?:说|讲|评价)(?:你|他|她)"
+)
 
 
 class MentionInfo:
@@ -51,8 +58,10 @@ def is_question(text):
     clean = str(text or "").strip()
     if not clean:
         return False
-    if clean.endswith(QUESTION_TAIL):
-        return True
+    for line in clean.splitlines():
+        line = line.strip()
+        if line.endswith(QUESTION_TAIL):
+            return True
     return any(word in clean for word in QUESTION_WORDS)
 
 
@@ -62,8 +71,7 @@ def is_retold(text):
         return False
     if any(marker in clean for marker in RETOLD_MARKERS):
         return True
-    # 「XX 说你…」这种没有列进词表的主语也要能认出来。
-    return bool(re.search(r".{1,8}(说|讲|评价)(你|他|她)", clean))
+    return bool(_RETOLD_DYNAMIC.search(clean))
 
 
 def extract_targets(text, known_names=(), self_names=()):
@@ -71,11 +79,11 @@ def extract_targets(text, known_names=(), self_names=()):
     clean = str(text or "")
     targets = [name.strip() for name in AT_PATTERN.findall(clean) if name.strip()]
     names = list(known_names or []) + list(self_names or [])
-    head = clean.lstrip("，,。. ")
+    heads = [line.lstrip("，,。. ") for line in clean.splitlines() if line.strip()]
     for name in sorted(names, key=len, reverse=True):
         if not name:
             continue
-        if head.startswith(name) or head.startswith("@" + name):
+        if any(h.startswith(name) or h.startswith("@" + name) or h.startswith("＠" + name) for h in heads):
             if name not in targets:
                 targets.append(name)
             break
@@ -89,17 +97,22 @@ def detect(text, *, at=False, self_names=(), quoted="", reply=False):
     names = [name for name in (self_names or []) if name]
     text_at = False
     for name in names:
-        if "@" + name in clean or "@" + name.lower() in lowered:
+        low_name = name.lower()
+        if ("@" + name in clean or "＠" + name in clean
+                or "@" + low_name in lowered or "＠" + low_name in lowered):
             text_at = True
             break
     targets = extract_targets(clean, self_names=names)
     self_called = False
-    head = clean.lstrip("，,。. ")
+    heads = [line.lstrip("，,。. ") for line in clean.splitlines() if line.strip()]
     for name in names:
         if not name:
             continue
-        # 句首直呼，或句中出现名字且带问句，才算在叫自己。
-        if head.startswith(name) or (name in clean and is_question(clean)):
+        # 句首直呼，或同一句里出现名字且带问句，才算在叫自己。
+        if any(h.startswith(name) for h in heads):
+            self_called = True
+            break
+        if any(name in line and is_question(line) for line in clean.splitlines()):
             self_called = True
             break
     return MentionInfo(

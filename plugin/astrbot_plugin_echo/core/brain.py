@@ -1,5 +1,6 @@
 """大脑：决定要不要接话、何时提醒。完全不依赖 AstrBot。"""
 
+import inspect
 import json
 import re
 import threading
@@ -9,6 +10,7 @@ from pathlib import Path
 
 from .actions import ToolLoop, parse_full
 from .context import ContextBuilder
+from .display import clean as display_clean
 from .display import plan as display_plan
 from .expression import (apply_jargon, decorate, learn_expressions, learn_style,
                          load_char_frequency, mine_jargon, typo)
@@ -94,8 +96,7 @@ PERSONA = (
     "这些例子只示范语气，不固定照抄。每次都根据当前对话说有内容、合时宜的话。"
 )
 
-# 只拦最硬的客服腔与身份声明。道歉、道谢、「收到」「看情况」这些正常说话
-# 会用的词不再拦——在正常人群设下，拦它们只会把合理回复换成答非所问的句子。
+# 只拦最硬的客服腔与身份声明。
 FILTER_WORDS = (
     "作为 AI", "作为AI", "作为一个 AI", "作为一个AI", "作为助手", "作为语言模型",
     "我是 AI", "我是AI", "我是助手", "我是语言模型", "只是个程序", "只是模型",
@@ -108,6 +109,9 @@ SUMMARY_INTERVAL = 600
 DEFAULT_HISTORY_LIMIT = 30
 MIN_HISTORY_LIMIT = 1
 MAX_HISTORY_LIMIT = 200
+MAX_GROUP_REMINDERS = 20
+MIN_INTERVAL_MINUTES = 5
+MAX_EXPRESSIONS = 200
 
 
 def _parse_history_limit(value, default=DEFAULT_HISTORY_LIMIT):
@@ -137,10 +141,6 @@ COMMANDS = (
     ("帮助", "命令列表"),
     ("待办", "看本群待办"),
     ("提醒", "时间跟事儿一起发，像「每天22:00 交周报」"),
-    ("专注", "只聊这个话题"),
-    ("随便", "退出专注或静默"),
-    ("闭嘴", "该群不再说话，@ 也不回"),
-    ("忘掉", "清空本群聊天记录"),
 )
 
 HELP = "\n".join("/{}  {}".format(name, desc) for name, desc in COMMANDS)
@@ -150,25 +150,33 @@ TASK_HINTS = ("查询", "查一下", "搜一下", "搜索", "帮我查", "实时
 
 # 危险请求：直接拒绝，不交给模型，也不进 Codex。
 UNSAFE_PATTERNS = (
-    re.compile(r"无限循环|死循环|while\s*(?:true|1)"),
-    re.compile(r"rm\s+-rf\s+[/~]"),
-    re.compile(r"mkfs|dd\s+if="),
-    re.compile(r"fork\s*bomb|:\(\)\s*\{"),
-    re.compile(r"(?:读|拿|看|导出|打印).{0,6}(?:配置|密钥|token|密码|\.env)", re.I),
-    re.compile(r"(?:curl|wget).{0,60}\|\s*(?:sh|bash)", re.I),
-    re.compile(r"\bsudo\s"),
-    re.compile(r"http\.server|\bnc\s+-l|\bsocat\s", re.I),
-    re.compile(r"(?:用|开|启|启动|创建|跑|挂|执行|通过).{0,8}(?:后台线程|后台进程|守护进程|常驻进程|常驻服务|daemon)", re.I),
-    re.compile(r"(?:绕过|避开|避免|突破|取消|无视).{0,6}超时"),
-    re.compile(r"部署.{0,10}(?:ip|公网|服务器|端口|网页|服务|上线)", re.I),
-    re.compile(r"(?:暴露|开放|监听|启动|起个|起一个).{0,8}(?:端口|http\s*服务|web\s*服务|网页服务)", re.I),
-    re.compile(r"\b(?:nohup|setsid)\b|\bscreen\s+-dm|\btmux\s+new", re.I),
-    re.compile(r"(?:忽略|无视|跳过|覆盖).{0,8}(?:(?:以上|之前|上面|全部|所有|系统)?(?:规则|限制|指令|提示|设定))"),
+    re.compile(r"无限循环|死循环|while\s*(?:true|1)", re.I | re.S),
+    re.compile(r"rm\s+-rf\s+[/~]", re.I | re.S),
+    re.compile(r"mkfs|dd\s+if=", re.I | re.S),
+    re.compile(r"fork\s*bomb|:\(\)\s*\{", re.I | re.S),
+    re.compile(r"(?:读|拿|看|导出|打印).{0,6}(?:配置|密钥|token|密码|\.env)", re.I | re.S),
+    re.compile(r"(?:curl|wget).{0,60}\|\s*(?:sh|bash)", re.I | re.S),
+    re.compile(r"\bsudo\s", re.I),
+    re.compile(r"http\.server|\bnc\s+-l|\bsocat\s", re.I | re.S),
+    re.compile(r"(?:用|开|启|启动|创建|跑|挂|执行|通过).{0,8}(?:后台线程|后台进程|守护进程|常驻进程|常驻服务|daemon)", re.I | re.S),
+    re.compile(r"(?:绕过|避开|避免|突破|取消|无视).{0,6}超时", re.I | re.S),
+    re.compile(r"部署.{0,10}(?:ip|公网|服务器|端口|网页|服务|上线)", re.I | re.S),
+    re.compile(r"(?:暴露|开放|监听|启动|起个|起一个).{0,8}(?:端口|http\s*服务|web\s*服务|网页服务)", re.I | re.S),
+    re.compile(r"\b(?:nohup|setsid)\b|\bscreen\s+-dm|\btmux\s+new", re.I | re.S),
+    re.compile(r"(?:忽略|无视|跳过|覆盖).{0,8}(?:(?:以上|之前|上面|全部|所有|系统)?(?:规则|限制|指令|提示|设定))", re.I | re.S),
 )
 
 
 def is_unsafe(text):
-    return any(pattern.search(str(text or "")) for pattern in UNSAFE_PATTERNS)
+    raw = str(text or "")
+    if not raw.strip():
+        return False
+    if any(pattern.search(raw) for pattern in UNSAFE_PATTERNS):
+        return True
+    collapsed = re.sub(r"\s+", " ", raw).strip()
+    if collapsed != raw and any(pattern.search(collapsed) for pattern in UNSAFE_PATTERNS):
+        return True
+    return False
 
 
 # 交给 Codex 的固定前缀：纯后台执行器，只交真实结论、必要代码或 ./outbox/ 文件，不扮演人设、不代写群聊话术、不启常驻服务。
@@ -213,6 +221,17 @@ def _clip(text, limit):
         return s
     return s[:limit] + "…"
 
+
+def _format_harness_notice(task, timeout=180):
+    summary = re.sub(r"\s+", " ", str(task or "")).strip()
+    if len(summary) > 24:
+        summary = summary[:24] + "…"
+    sec = int(timeout or 180)
+    if summary:
+        return "〔系统｜已启动后台工具：{} · 限时 {}s〕".format(summary, sec)
+    return "〔系统｜已启动后台工具 · 限时 {}s〕".format(sec)
+
+
 _CLOSED_CODE_BLOCK = re.compile(r"```[a-zA-Z0-9_+-]*\s*\n?(.*?)```", re.S)
 _OPEN_CODE_BLOCK = re.compile(r"```[a-zA-Z0-9_+-]*\s*\n(.*)\Z", re.S)
 _META_REPLY_SPLIT = re.compile(
@@ -248,18 +267,31 @@ def _strip_outer_quotes(text):
     return s
 
 
-_INTERNAL_PATH_PATTERN = re.compile(r"/AstrBot/[^\s)\]）】>\"'`]+")
-_PRIVATE_URL_PATTERN = re.compile(
-    r"https?://(?:127\.0\.0\.1|localhost|10\.\d+\.\d+\.\d+|"
-    r"172\.(?:1[6-9]|2\d|3[01])\.\d+\.\d+|192\.168\.\d+\.\d+)(?::\d+)?[^\s)\]）】>\"'`]*"
+_INTERNAL_PATH_PATTERN = re.compile(
+    r"/(?:AstrBot|etc|opt|tmp|var|root|home)/[^\s)\]）】>\"'`]+"
 )
+_PRIVATE_URL_PATTERN = re.compile(
+    r"(?:https?://localhost(?::\d+)?|\blocalhost:\d+|"
+    r"(?:https?://)?(?:127\.0\.0\.1|\[::1\]|0\.0\.0\.0|169\.254\.\d+\.\d+|"
+    r"10\.\d+\.\d+\.\d+|172\.(?:1[6-9]|2\d|3[01])\.\d+\.\d+|192\.168\.\d+\.\d+)"
+    r"(?::\d+)?)(?:/[^\s)\]）】>\"'`]*)?"
+)
+_WS_URL_PATTERN = re.compile(r"wss?://[^\s)\]）】>\"'`]+", re.I)
+_SK_TOKEN_PATTERN = re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b")
 _EMPTY_MD_LINK_PATTERN = re.compile(r"\[[^\]]*\]\(\s*\)")
 
 
-def _scrub_internal_leaks(text):
-    """去掉意外露出的容器路径与内网 URL，避免误发到群里。"""
-    s = _PRIVATE_URL_PATTERN.sub("", str(text or ""))
+def _scrub_internal_leaks(text, extra_secrets=()):
+    """去掉意外露出的容器路径、内网/WS URL 与运行密钥，避免误发到群里。"""
+    s = str(text or "")
+    for secret in extra_secrets or ():
+        sec = str(secret or "").strip()
+        if len(sec) >= 8 and sec in s:
+            s = s.replace(sec, "")
+    s = _PRIVATE_URL_PATTERN.sub("", s)
+    s = _WS_URL_PATTERN.sub("", s)
     s = _INTERNAL_PATH_PATTERN.sub("", s)
+    s = _SK_TOKEN_PATTERN.sub("", s)
     s = _EMPTY_MD_LINK_PATTERN.sub("", s)
     s = re.sub(r"(?m)^\s*[-*•]\s*(?:文件|网页|链接|地址)?\s*[：:]?\s*$", "", s)
     s = re.sub(r"[ \t]{2,}", " ", s)
@@ -267,9 +299,9 @@ def _scrub_internal_leaks(text):
     return s.strip()
 
 
-def _sanitize_meta_reply(text):
+def _sanitize_meta_reply(text, extra_secrets=()):
     """兜底剥离「群里可以这么回：」等元话术外壳，并清理容器路径与内网地址。"""
-    cleaned = _scrub_internal_leaks(str(text or "").strip())
+    cleaned = _scrub_internal_leaks(str(text or "").strip(), extra_secrets=extra_secrets)
     if not cleaned:
         return ""
     match = _META_REPLY_SPLIT.search(cleaned)
@@ -277,19 +309,23 @@ def _sanitize_meta_reply(text):
         return cleaned
     tail = _strip_outer_quotes(cleaned[match.end():])
     if tail:
-        return _scrub_internal_leaks(tail)
-    return _scrub_internal_leaks(cleaned[:match.start()].strip())
+        return _scrub_internal_leaks(tail, extra_secrets=extra_secrets)
+    return _scrub_internal_leaks(cleaned[:match.start()].strip(), extra_secrets=extra_secrets)
 
 
 def _unwrap_reply_text(raw):
-    """主模型误吐出 reply JSON 时提取其中的正文。"""
+    """主模型误吐出控制 JSON 时安全剥壳；非 reply 动作返回空串防止 JSON 泄漏。"""
     text = str(raw or "").strip()
     if not text:
         return ""
     parsed = parse_full(text)
-    if parsed and parsed.get("action") == "reply":
-        return str(parsed.get("text") or "").strip()
+    if parsed:
+        if parsed.get("action") == "reply":
+            return str(parsed.get("text") or "").strip()
+        return ""
     return text
+
+
 # 第三层：模型仍然说查不了时的兜底话术。
 REFUSAL_HINTS = (
     "查不了", "无法查询", "不能查询", "没有联网", "无法联网",
@@ -346,9 +382,10 @@ class Brain:
         self._last_reply = {}
         self.memory = memory
         self.emoji_bank = emoji_bank
-        self.capabilities = capabilities or {}
         self.frequency = load_char_frequency(char_frequency)
-        self.style = {}
+        self.capabilities = capabilities or {}
+        self._styles = {}
+        self.style = self._styles
         self.expressions = {}
         self.modes = modes
         self.attention = attention
@@ -359,17 +396,30 @@ class Brain:
         self.subagent = subagent
         self.schedule = schedule
         self.harness = harness
+        self._targets_lock = threading.Lock()
         self._task_targets = {}
         self._repeat_seen = {}
         self._summary_lock = threading.Lock()
+        self._last_summary_attempt = {}
         self._last_reply_at = {}
         self._last_reply_user = {}
         self._last_bot_reply = {}
         self.context_builder = ContextBuilder(
-            self.persona, memory, self.style, attention=attention,
+            self.persona, memory, {}, attention=attention,
             modes=modes, persons=persons,
         )
         self.tool_loop = ToolLoop(model, capabilities=self.capabilities)
+
+    def _secrets(self):
+        secrets = []
+        for candidate in (
+            getattr(self.harness, "api_key", ""),
+            getattr(self.model, "api_key", ""),
+        ):
+            s = str(candidate or "").strip()
+            if len(s) >= 8:
+                secrets.append(s)
+        return secrets
 
     def handle(self, msg):
         """处理一条群消息；返回回复文本，由平台层负责真正发送。"""
@@ -406,20 +456,25 @@ class Brain:
         # 只拦最硬的客服腔；命中就沉默，不拿一句无关的话顶上。
         if any(word in reply for word in FILTER_WORDS):
             return {"replied": False, "text": "", "reason": "filtered"}
+        reply = _scrub_internal_leaks(reply, extra_secrets=self._secrets())
+        if not reply:
+            return {"replied": False, "text": "", "reason": "filtered"}
         self.store.add_message(msg.group_id, "bot", "大肥鱼", "bot", reply)
         self._last_reply[msg.group_id] = now
         return {"replied": True, "text": reply, "reason": reason}
 
     def command(self, msg, text=None):
-        """命令即时通道，不走防抖；返回回复文本或 None。"""
-        text = (text if text is not None else msg.text).strip()
-        result = self._command(msg, text)
+        """群聊命令即时通道：必须以 / 或 ／ 开头，防止日常口语误触。"""
+        raw = (text if text is not None else msg.text).strip()
+        if not raw.startswith(("/", "／")):
+            return None
+        result = self._command(msg, raw)
         if result is not None:
             self.store.add_message(msg.group_id, "bot", "大肥鱼", "bot", result)
         return result
 
     def handle_batch(self, batch):
-        """一批消息进入决策层：模式与提及判定 → 分层上下文 → 动作集 → 回复。"""
+        """一批消息进入决策层：模式与提及判定 → 安全校验 → 分层上下文 → 动作集 → 回复。"""
         group = batch.group_id
         items = getattr(batch, "items", None) or []
         last = items[-1] if items else None
@@ -430,19 +485,7 @@ class Brain:
         body_text = (getattr(batch, "body_text", "") or "").strip() or raw_text
         user_name = getattr(last, "user_name", "") if last else ""
         user_id = getattr(last, "user_id", "") if last else ""
-
-        # 危险请求（无限循环、删根目录、读密钥、起监听服务等）直接拒绝。
-        if any(is_unsafe(getattr(i, "text", "")) for i in items) or is_unsafe(raw_text):
-            return {"replied": True, "text": "这个不干。", "reason": "unsafe"}
-
-        # 人物档案先落库：即使这轮沉默，叫法与活跃度也要留下。
-        if self.persons:
-            for item in items[-8:]:
-                self.persons.observe(
-                    group, getattr(item, "user_id", ""),
-                    getattr(item, "user_name", ""),
-                    now=getattr(item, "ts", None),
-                )
+        persisted = bool(getattr(batch, "persisted", False))
 
         info = mentions.detect(
             body_text, at=bool(getattr(batch, "mentioned", False)),
@@ -450,59 +493,78 @@ class Brain:
         )
         batch.mention_info = info
 
-        # 模式：静默只让 @ 穿透，专注只接话题内的消息。
+        # 模式：静默只让定时规则 @ 穿透，专注只接话题内的消息。
         if self.modes:
             if not self.modes.allows(group, mentioned=info.mentioned):
                 return {"replied": False, "text": "", "reason": "mode_quiet"}
             if not self.modes.focus_hit(group, body_text):
                 return {"replied": False, "text": "", "reason": "off_topic"}
 
+        # 危险请求（无限循环、删根目录、读密钥、起监听服务等）直接拒绝；未被点名时不搭理。
+        quote_text = getattr(batch, "quote", "") or ""
+        if any(is_unsafe(getattr(i, "text", "")) for i in items) or is_unsafe(raw_text) or is_unsafe(quote_text):
+            if info.mentioned:
+                return {"replied": True, "text": "这个不干。", "reason": "unsafe"}
+            return {"replied": False, "text": "", "reason": "unsafe_silent"}
+
+        # 人物档案先落库：重放批不再重复累计活跃度。
+        if self.persons and not persisted:
+            for item in items[-8:]:
+                self.persons.observe(
+                    group, getattr(item, "user_id", ""),
+                    getattr(item, "user_name", ""),
+                    now=getattr(item, "ts", None),
+                )
+
         # 注意力：先按尚未入窗的新词比例判定漂移并写到 batch，再观测本批正文（不含昵称）。
         if self.attention:
             drift_lvl = self.attention.level(group, body_text)
             batch.drift_level = drift_lvl
-            if drift_lvl == "active":
-                self.attention.consume(group)
-            self.attention.observe(group, body_text)
+            if not persisted:
+                if drift_lvl == "active":
+                    self.attention.consume(group)
+                self.attention.observe(group, body_text)
 
-        # 先读上一批历史（避免本批消息重复出现在 history 和 user_text 里），再把本批入库。
+        # 先读上一批历史（避免本批消息重复出现在 history 和 user_text 里），再把新批入库。
         prev_history = self.store.recent(group, self.history_limit)
         prev_last = prev_history[-1:] if (self.memory and prev_history) else []
 
-        # 批内每条非空消息都按原始文本逐条落库，避免同批前几条提问丢失。
-        stored = False
-        for item in items:
-            item_text = str(getattr(item, "text", "") or "").strip()
-            if not item_text:
-                continue
-            self.store.add_message(
-                group,
-                getattr(item, "user_id", "") or "unknown",
-                getattr(item, "user_name", "") or "",
-                "user",
-                item_text,
-                ts=getattr(item, "ts", None),
-            )
-            stored = True
-        if not stored:
-            self.store.add_message(group, user_id or "unknown", user_name, "user", raw_text)
+        if not persisted:
+            stored = False
+            for item in items:
+                item_text = str(getattr(item, "text", "") or "").strip()
+                if not item_text:
+                    continue
+                self.store.add_message(
+                    group,
+                    getattr(item, "user_id", "") or "unknown",
+                    getattr(item, "user_name", "") or "",
+                    "user",
+                    item_text,
+                    ts=getattr(item, "ts", None),
+                )
+                stored = True
+            if not stored:
+                self.store.add_message(group, user_id or "unknown", user_name, "user", raw_text)
 
-        # 同一人短时间内重复同一句话：消息照记，但只回一次，避免连发刷屏。
-        repeat_key = _repeat_key(group, user_id, raw_text)
-        now = time.time()
-        seen_at = self._repeat_seen.get(repeat_key, 0)
-        self._repeat_seen[repeat_key] = now
-        if seen_at and now - seen_at < REPEAT_WINDOW:
-            return {"replied": False, "text": "", "reason": "repeat"}
-        if len(self._repeat_seen) > 500:
-            cutoff = now - REPEAT_WINDOW
-            self._repeat_seen = {
-                key: stamp for key, stamp in self._repeat_seen.items()
-                if stamp >= cutoff
-            }
+            # 同一人短时间内重复同一句话：消息照记，但只回一次；纯图与空归一化键不去重。
+            has_images = bool(getattr(batch, "images", None))
+            repeat_key = _repeat_key(group, user_id, raw_text)
+            if not has_images and repeat_key[2]:
+                now = time.time()
+                seen_at = self._repeat_seen.get(repeat_key, 0)
+                self._repeat_seen[repeat_key] = now
+                if seen_at and now - seen_at < REPEAT_WINDOW:
+                    return {"replied": False, "text": "", "reason": "repeat"}
+                if len(self._repeat_seen) > 500:
+                    cutoff = now - REPEAT_WINDOW
+                    self._repeat_seen = {
+                        key: stamp for key, stamp in self._repeat_seen.items()
+                        if stamp >= cutoff
+                    }
 
-        # 第一层：明确的任务请求（查询、搜索、实时信息）在完成入库、模式校验与去重后进后台。
-        if self._is_direct_task(raw_text):
+        # 第一层：仅明确提及机器人且含任务词的请求，才直接进后台任务。
+        if info.mentioned and self._is_direct_task(raw_text):
             dispatched = self._dispatch_task(group, raw_text, getattr(batch, "umo", ""))
             if dispatched:
                 return dispatched
@@ -522,26 +584,27 @@ class Brain:
         batch.history_summary = summary
 
         persona = self._resolve_persona(group, getattr(batch, "scene", "group"))
-        self.context_builder.persona = persona
 
         # 回复效果反馈：上一条消息是自己发的、现在群友接话了，就记一次正反馈。
-        if self.memory and prev_last and prev_last[-1].get("role") == "bot":
+        if self.memory and not persisted and prev_last and prev_last[-1].get("role") == "bot":
             self.memory.mark_followup(group)
-        # 群风格与黑话随聊天更新，供输出层使用。
+        # 按群隔离风格，避免多群并发互相污染。
         style_texts = [h.get("text", "") for h in history] + [
             str(getattr(i, "text", "") or "") for i in items
         ]
-        self.style = learn_style(style_texts, self.style)
-        self.context_builder.style = self.style
-        if self.memory:
+        group_style = learn_style(style_texts, self._styles.get(group))
+        self._styles[group] = group_style
+        if self.memory and not persisted:
             for word in mine_jargon([i.text for i in batch.items],
                                     self.memory.jargon(group)):
                 self.memory.add_jargon(group, word, word)
 
-        system = self.context_builder.build(group, body_text, user_name, batch, history)
+        system = self.context_builder.build(
+            group, body_text, user_name, batch, history,
+            persona=persona, style=group_style,
+        )
         capabilities = dict(self.capabilities)
         capabilities["view_image"] = bool(getattr(batch, "images", None))
-        self.tool_loop.capabilities = capabilities
 
         def executor(group_id, action, payload):
             if action == "recall":
@@ -556,10 +619,10 @@ class Brain:
                     self.memory.add_point(group_id, "event", payload)
                 return False, "记下了：{}".format(payload)
             if action == "schedule":
-                fake = Message(group, "", user_name, "提醒 " + payload, False, batch.umo)
-                reply = self._command(fake, "提醒 " + payload) or "没懂，发 /帮助"
-                self.context_builder.add_schedule(group_id, reply)
-                return True, reply
+                fake = Message(group, user_id, user_name, "提醒 " + payload, False, batch.umo)
+                reply_cmd = self._command(fake, "提醒 " + payload) or "没懂，发 /帮助"
+                self.context_builder.add_schedule(group_id, reply_cmd)
+                return True, reply_cmd
             if action == "view_image":
                 images = getattr(batch, "images", None) or []
                 if not images:
@@ -568,12 +631,6 @@ class Brain:
 
                 lines = [describe(self.model, data) for data in images[:2]]
                 return False, "；".join(line for line in lines if line) or "图里没看出什么"
-            if action == "send_face":
-                path = (self.emoji_bank.pick(group_id, payload, self.model)
-                        if self.emoji_bank else None)
-                if path and str(path).startswith("face:"):
-                    return True, "__FACEID__" + str(path).split(":", 1)[1]
-                return True, ("__FACE__" + str(path)) if path else "没存着表情"
             if action == "read_result":
                 return False, self.tool_loop.results.get(group_id, payload)
             if action == "subagent":
@@ -586,13 +643,17 @@ class Brain:
             return False, "这个动作还没接上"
 
         started = time.time()
-        decision = self.tool_loop.run(system, history, text, executor, group,
-                                      scene=getattr(batch, "scene", "group"))
+        decision = self.tool_loop.run(
+            system, history, text, executor, group,
+            scene=getattr(batch, "scene", "group"),
+            capabilities=capabilities,
+        )
         elapsed = time.time() - started
         if not decision:
+            err = getattr(self.tool_loop, "last_error", "") or ""
             if self.monitor:
-                self.monitor.record(group, "model_error", ok=False, latency=elapsed)
-            return {"replied": False, "text": "", "reason": "model_error"}
+                self.monitor.record(group, "model_error", ok=False, latency=elapsed, detail=err)
+            return {"replied": False, "text": "", "reason": "model_error", "error": err}
         action, reply = decision["action"], decision["text"]
         if action in ("silent", "wait"):
             if self.monitor:
@@ -609,7 +670,7 @@ class Brain:
             if picked:
                 return {"replied": True, "text": "", "image": str(picked),
                         "reason": "face"}
-            return {"replied": True, "text": "没存着表情", "reason": "face"}
+            return {"replied": False, "text": "", "reason": "silent"}
         if action == "subagent":
             dispatched = self._dispatch_task(
                 group, reply, getattr(batch, "umo", ""),
@@ -619,14 +680,6 @@ class Brain:
                 return dispatched
             return {"replied": True, "text": "后台正忙", "reason": "subagent_busy",
                     "elapsed": elapsed}
-        if reply.startswith("__FACEID__"):
-            return {"replied": True, "text": "",
-                    "face": reply[len("__FACEID__"):], "reason": "face"}
-        if reply.startswith("__FACE__"):
-            if self.monitor:
-                self.monitor.record(group, "face", ok=True, latency=elapsed)
-            return {"replied": True, "text": "", "image": reply[len("__FACE__"):],
-                    "reason": "face", "elapsed": elapsed}
         if not reply:
             if self.monitor:
                 self.monitor.record(group, "empty_reply", ok=False, latency=elapsed)
@@ -644,9 +697,12 @@ class Brain:
                 self.monitor.record(group, "filtered", ok=False, latency=elapsed)
             return {"replied": False, "text": "", "reason": "filtered",
                     "elapsed": elapsed}
+        reply = _scrub_internal_leaks(reply, extra_secrets=self._secrets())
+        if not reply:
+            return {"replied": False, "text": "", "reason": "filtered", "elapsed": elapsed}
         if self.memory:
             reply = apply_jargon_context(
-                decorate(typo(reply, chance=0.01, frequency=self.frequency), self.style,
+                decorate(typo(reply, chance=0.01, frequency=self.frequency), group_style,
                          self.expressions, body_text[:12]),
                 self.memory.jargon(group),
             )
@@ -661,7 +717,8 @@ class Brain:
         self._last_bot_reply[group] = (reply_key, time.time())
         if len(self._last_bot_reply) > 200:
             self._last_bot_reply.clear()
-        learn_expressions(body_text[:12], reply, self.expressions)
+        if len(self.expressions) < MAX_EXPRESSIONS:
+            learn_expressions(body_text[:12], reply, self.expressions)
         self.store.add_message(group, "bot", "大肥鱼", "bot", reply)
         self._last_reply_at[group] = time.time()
         self._last_reply_user[group] = last.user_id if last else ""
@@ -675,7 +732,7 @@ class Brain:
                                 tokens=tokens, detail=action)
         return {"replied": True, "text": reply, "reason": action,
                 "elapsed": elapsed, "parts": planned.parts,
-                "delays": planned.delays}
+                "delays": planned.delays, "cleaned": True}
 
     def view_rate(self, batch):
         """按语境给查看概率：问句 50%，60 秒内同一人延续非极短话 35%，其余走默认。"""
@@ -696,7 +753,7 @@ class Brain:
         """未通过查看抽签的消息不丢失，直接落入历史与人物档案库。"""
         group = getattr(batch, "group_id", "")
         items = getattr(batch, "items", None) or []
-        if not group or not items:
+        if not group or not items or getattr(batch, "persisted", False):
             return
         if self.persons:
             for item in items[-8:]:
@@ -744,7 +801,7 @@ class Brain:
         return TASK_PREFIX + budget_hint + str(prompt or "").strip()
 
     def _dispatch_task(self, group, text, umo="", ack_text=""):
-        """把任务交给后台 Codex；返回可直接发群的提示，失败返回空。"""
+        """把任务交给后台；真正拉起 Codex 时在单条回复内附带系统风格提示。"""
         task = str(text or "").strip()
         if not task:
             return {}
@@ -752,6 +809,8 @@ class Brain:
             return {"replied": True, "text": "这个不干。", "reason": "unsafe"}
         if not self.subagent:
             return {}
+
+        using_harness = bool(self.harness and self.harness.available())
 
         def runner(prompt):
             if self.harness and self.harness.available():
@@ -778,21 +837,56 @@ class Brain:
                 }
             return self.model.reply(TASK_PREFIX, [], prompt)[:600]
 
+        secrets = self._secrets()
         pre_history = self.store.recent(group, min(3, self.history_limit))
-        ack = _sanitize_meta_reply(_unwrap_reply_text(ack_text)) if ack_text else ""
-        if not ack or any(word in ack for word in FILTER_WORDS):
-            ack = "我瞅瞅，等会儿"
+        ack = _sanitize_meta_reply(_unwrap_reply_text(ack_text), extra_secrets=secrets) if ack_text else ""
+        if ack and any(word in ack for word in FILTER_WORDS):
+            ack = ""
 
-        task_id = self.subagent.submit("chat", task, runner)
+        if using_harness:
+            notice = _format_harness_notice(task, getattr(self.harness, "timeout", 180))
+            reply_text = "{}\n{}".format(ack, notice) if ack else notice
+        else:
+            reply_text = ack or "我瞅瞅，等会儿"
+
+        def _persist(payload):
+            if not self.store or not isinstance(payload, dict) or not hasattr(self.store, "save_pending_delivery"):
+                return
+            self.store.save_pending_delivery(
+                task_id=payload.get("id", ""),
+                group_id=group,
+                umo=umo,
+                prompt=payload.get("prompt") or task,
+                status=payload.get("status") or "failed",
+                reason=payload.get("reason") or "error",
+                result=payload.get("result") or "",
+                partial=payload.get("partial") or "",
+                files=payload.get("files") or [],
+                error=payload.get("error") or "",
+                pre_history=pre_history,
+                created_at=payload.get("created"),
+            )
+
+        submit_fn = self.subagent.submit
+        accepts_callback = False
+        try:
+            accepts_callback = "on_complete" in inspect.signature(submit_fn).parameters
+        except (TypeError, ValueError):
+            accepts_callback = False
+        if accepts_callback:
+            task_id = submit_fn("chat", task, runner, on_complete=_persist)
+        else:
+            task_id = submit_fn("chat", task, runner)
         if not task_id:
             return {}
-        self._task_targets[task_id] = (group, umo, pre_history)
-        self.store.add_message(group, "bot", "大肥鱼", "bot", ack)
+        with self._targets_lock:
+            self._task_targets[task_id] = (group, umo, pre_history)
+        self.store.add_message(group, "bot", "大肥鱼", "bot", reply_text)
         self._last_reply_at[group] = time.time()
-        return {"replied": True, "text": ack, "parts": [ack], "reason": "task"}
+        return {"replied": True, "text": reply_text, "parts": [reply_text], "reason": "task"}
 
     def spontaneous(self, group, umo=""):
-        """群安静太久时主动开一句；失败或像客服就保持沉默。"""
+        """群安静太久时主动开一句；失败、含敏感泄漏或像客服就保持沉默。"""
         if not self.model:
             return ""
         persona = self._resolve_persona(group)
@@ -801,10 +895,10 @@ class Brain:
                                      HEARTBEAT_PROMPT)
         except Exception:
             return ""
-        reply = str(reply or "").strip().splitlines()
-        if not reply:
+        lines = str(reply or "").strip().splitlines()
+        if not lines:
             return ""
-        line = reply[0].strip()[:60]
+        line = _scrub_internal_leaks(display_clean(lines[0].strip()), extra_secrets=self._secrets())[:60]
         if not line or any(word in line for word in FILTER_WORDS):
             return ""
         self.store.add_message(group, "bot", "大肥鱼", "bot", line)
@@ -838,18 +932,21 @@ class Brain:
 
     def _present_subagent_result(self, group, task, pre_history=None):
         """把后台子代理的客观结果交给主模型，按群人格转成直接发群的话。"""
+        secrets = self._secrets()
         raw = str(task.get("result") or "").strip()
         files = list(task.get("files") or [])
         if not raw and not files:
             return ""
         prompt = str(task.get("prompt") or "").strip()
         prose, blocks = _split_code_blocks(raw) if raw else ("", [])
-        fallback = _sanitize_meta_reply(prose) if blocks else _sanitize_meta_reply(raw)
+        safe_blocks = [_scrub_internal_leaks(b, extra_secrets=secrets) for b in blocks]
+        safe_blocks = [b for b in safe_blocks if b]
+        fallback = _sanitize_meta_reply(prose, extra_secrets=secrets) if safe_blocks else _sanitize_meta_reply(raw, extra_secrets=secrets)
         file_summary = self._describe_files(files)
 
         rewritten = ""
         if self.model is not None:
-            instruction = SUBAGENT_CODE_INTRO_PROMPT if blocks else SUBAGENT_REPLY_PROMPT
+            instruction = SUBAGENT_CODE_INTRO_PROMPT if safe_blocks else SUBAGENT_REPLY_PROMPT
             system = self._resolve_persona(group) + "\n\n" + instruction
             raw_history = (
                 pre_history
@@ -866,8 +963,8 @@ class Brain:
                 keep_recent=3,
                 self_names=("大肥鱼", "回声"),
             )
-            body = _clip(prose if blocks else raw, SUBAGENT_MODEL_INPUT_LIMIT)
-            if blocks and not body:
+            body = _clip(prose if safe_blocks else raw, SUBAGENT_MODEL_INPUT_LIMIT)
+            if safe_blocks and not body:
                 body = "（后台已完成计算/代码生成，请写一句简短的群聊开场白引出后面的内容）"
             elif files and not body:
                 body = "（后台已生成文件并准备直接发送到群里，请写一句简短自然的提示告诉群友看文件）"
@@ -887,96 +984,166 @@ class Brain:
                 candidate = self.model.reply(system, history, user_msg)
             except Exception:
                 candidate = ""
-            candidate = _sanitize_meta_reply(_unwrap_reply_text(candidate))
+            candidate = _sanitize_meta_reply(_unwrap_reply_text(candidate), extra_secrets=secrets)
             if candidate and not any(word in candidate for word in FILTER_WORDS):
                 rewritten = candidate
 
-        if blocks:
+        if safe_blocks:
             intro = rewritten
             if not intro and fallback and not any(word in fallback for word in FILTER_WORDS):
                 intro = fallback
-            code_part = "\n\n".join(blocks)
+            intro = display_clean(intro) if intro else ""
+            code_part = "\n\n".join(safe_blocks)
             return (intro + "\n" + code_part).strip() if intro else code_part
 
         if rewritten:
-            return rewritten
+            return display_clean(rewritten)
         if fallback and not any(word in fallback for word in FILTER_WORDS):
-            return fallback
+            return display_clean(fallback)
         if files:
             return "做好啦，文件发群里了。"
         return "查完了，不过这会儿没组织好词，你再问我一句。"
 
-    def poll_subagents(self):
-        """后台任务完成后交给主模型转述再回群；超时或失败也如实汇报，别让群里干等。"""
-        if not self.subagent:
-            return []
-        rows = []
+    @staticmethod
+    def _filter_valid_outbox_files(files, outbox_root):
+        valid = []
+        if not files:
+            return valid
+        root_resolved = Path(outbox_root).resolve(strict=False) if outbox_root else None
+        for item in files:
+            if not isinstance(item, dict):
+                continue
+            raw_path = str(item.get("path") or "").strip()
+            if not raw_path:
+                continue
+            p = Path(raw_path)
+            try:
+                if root_resolved is not None:
+                    resolved = p.resolve(strict=False)
+                    if resolved == root_resolved or root_resolved not in resolved.parents:
+                        continue
+                if p.is_file():
+                    valid.append(item)
+            except OSError:
+                continue
+        return valid
+
+    def _build_delivery_row(self, task, group, umo, pre_history=None):
         outbox_root = getattr(self.harness, "outbox_root", "") if self.harness else ""
         timeout_s = getattr(self.harness, "timeout", 180)
-        for task in self.subagent.poll():
-            target = self._task_targets.pop(task["id"], None)
-            files = list(task.get("files") or [])
-            if not target:
-                for item in files:
-                    cleanup_file_entry(item.get("path", ""), outbox_root)
-                continue
-            group = target[0]
-            umo = target[1]
-            pre_history = target[2] if len(target) >= 3 else None
-            ok = task.get("status") == "completed" and (
-                bool(task.get("result")) or bool(files)
+        secrets = self._secrets()
+        raw_files = list(task.get("files") or [])
+        files = self._filter_valid_outbox_files(raw_files, outbox_root) if outbox_root else raw_files
+        ok = task.get("status") == "completed" and (bool(task.get("result")) or bool(files))
+        short_prompt = _clip(str(task.get("prompt") or "").strip(), 20)
+        fail_msg = (
+            "刚才「{}」没弄成，等下再试".format(short_prompt)
+            if short_prompt else "没弄成，等下再试"
+        )
+        if ok:
+            text = self._present_subagent_result(group, {**task, "files": files}, pre_history=pre_history)
+        elif task.get("reason") == "timeout":
+            partial = _clip(_sanitize_meta_reply(task.get("partial") or "", extra_secrets=secrets), 220)
+            prefix = (
+                "刚才「{}」查了 {} 秒超时了，没来得及全整理完。".format(short_prompt, timeout_s)
+                if short_prompt
+                else "刚才这个任务查了 {} 秒超时了，没来得及全整理完。".format(timeout_s)
             )
-            short_prompt = _clip(str(task.get("prompt") or "").strip(), 20)
-            fail_msg = (
-                "刚才「{}」没弄成，等下再试".format(short_prompt)
-                if short_prompt else "没弄成，等下再试"
-            )
-            if ok:
-                text = self._present_subagent_result(group, task, pre_history=pre_history)
-            elif task.get("reason") == "timeout":
-                partial = _clip(_sanitize_meta_reply(task.get("partial") or ""), 220)
-                prefix = (
-                    "刚才「{}」查了 {} 秒超时了，没来得及全整理完。".format(short_prompt, timeout_s)
-                    if short_prompt
-                    else "刚才这个任务查了 {} 秒超时了，没来得及全整理完。".format(timeout_s)
-                )
-                if partial:
-                    text = (
-                        "{}目前查到一半的进展：{}\n"
-                        "你可以缩窄一点范围再问我，或者发更聚焦的关键词继续查。"
-                    ).format(prefix, partial)
-                else:
-                    text = prefix + "你可以把范围缩窄一点再让我查。"
+            if partial:
+                text = (
+                    "{}目前查到一半的进展：{}\n"
+                    "你可以缩窄一点范围再问我，或者发更聚焦的关键词继续查。"
+                ).format(prefix, partial)
             else:
-                text = fail_msg
-            if not text:
-                ok = False
-                text = fail_msg
-            if not ok:
-                for item in files:
+                text = prefix + "你可以把范围缩窄一点再让我查。"
+        else:
+            text = fail_msg
+        if not text:
+            ok = False
+            text = fail_msg
+        text = _scrub_internal_leaks(text, extra_secrets=secrets) or fail_msg
+        if not ok:
+            for item in raw_files:
+                cleanup_file_entry(item.get("path", ""), outbox_root)
+            files = []
+        else:
+            # 已经被过滤掉的无效文件路径一并清理
+            kept_paths = {f.get("path") for f in files}
+            for item in raw_files:
+                if item.get("path") not in kept_paths:
                     cleanup_file_entry(item.get("path", ""), outbox_root)
-                files = []
-            self.store.add_message(group, "bot", "大肥鱼", "bot", text)
-            rows.append({
-                "group": group,
-                "umo": umo,
-                "text": text,
-                "files": files,
-                "task": task["id"],
-                "ok": ok,
-                "error": task.get("error") or "",
-            })
+        self.store.add_message(group, "bot", "大肥鱼", "bot", text)
+        return {
+            "group": group,
+            "umo": umo,
+            "text": text,
+            "files": files,
+            "task": task.get("id") or task.get("task_id") or "",
+            "ok": ok,
+            "error": task.get("error") or "",
+            "cleaned": True,
+        }
+
+    def poll_subagents(self):
+        """回收本轮内存子任务以及跨重载持久化的待补发任务。"""
+        rows = []
+        seen_ids = set()
+        outbox_root = getattr(self.harness, "outbox_root", "") if self.harness else ""
+        if self.subagent:
+            for task in self.subagent.poll():
+                tid = task["id"]
+                seen_ids.add(tid)
+                if hasattr(self.store, "delete_pending_delivery"):
+                    self.store.delete_pending_delivery(tid)
+                with self._targets_lock:
+                    target = self._task_targets.pop(tid, None)
+                files = list(task.get("files") or [])
+                if not target:
+                    for item in files:
+                        cleanup_file_entry(item.get("path", ""), outbox_root)
+                    continue
+                group = target[0]
+                umo = target[1]
+                pre_history = target[2] if len(target) >= 3 else None
+                rows.append(self._build_delivery_row(task, group, umo, pre_history=pre_history))
+
+        if hasattr(self.store, "pop_pending_deliveries"):
+            for persisted in self.store.pop_pending_deliveries():
+                tid = persisted.get("task_id", "")
+                if tid and tid in seen_ids:
+                    continue
+                seen_ids.add(tid)
+                task_payload = {
+                    "id": tid,
+                    "prompt": persisted.get("prompt", ""),
+                    "status": persisted.get("status", "failed"),
+                    "reason": persisted.get("reason", "error"),
+                    "result": persisted.get("result", ""),
+                    "partial": persisted.get("partial", ""),
+                    "files": persisted.get("files") or [],
+                    "error": persisted.get("error", ""),
+                }
+                rows.append(
+                    self._build_delivery_row(
+                        task_payload,
+                        persisted.get("group_id", ""),
+                        persisted.get("umo", ""),
+                        pre_history=persisted.get("pre_history") or None,
+                    )
+                )
         return rows
 
     def _maybe_summarize(self, group, text):
-        """距上次摘要超过 10 分钟才跑一次；用数据库时间判断，重启也不会重复。"""
+        """距上次摘要或尝试超过 10 分钟才跑一次，避免模型空回时每轮重试。"""
         if not self.memory:
             return
-        last = self.memory.last_episode_at(group)
-        if last and time.time() - last < SUMMARY_INTERVAL:
+        now = time.time()
+        last = max(self.memory.last_episode_at(group), self._last_summary_attempt.get(group, 0.0))
+        if last and now - last < SUMMARY_INTERVAL:
             return
         if not self._summary_lock.acquire(blocking=False):
             return
+        self._last_summary_attempt[group] = now
 
         def work():
             try:
@@ -1063,46 +1230,18 @@ class Brain:
             for row in self.schedule.due(now):
                 fired = self.schedule.fire(row["id"], now)
                 if fired:
-                    due.append({"user_name": fired["user_name"],
-                                "text": fired["text"], "umo": fired["umo"]})
+                    due.append({
+                        "user_id": fired.get("user_id") or "",
+                        "user_name": fired["user_name"],
+                        "text": fired["text"],
+                        "umo": fired["umo"],
+                    })
         return due
 
     def _command(self, msg, text):
-        # AstrBot 分发前会剥掉命令前缀「/」，这里统一归一化。
-        cmd = text.lstrip("/").strip()
+        cmd = text.lstrip("/／").strip()
         if cmd in ("帮助", "help"):
             return HELP
-        if cmd in ("闭嘴", "shutup"):
-            if self.modes:
-                self.modes.set(msg.group_id, "quiet")
-            return "行，我不说了。"
-        if cmd in ("说话", "开麦", "speak"):
-            if self.modes:
-                self.modes.reset(msg.group_id)
-            return "行，我回来了。"
-        if cmd in ("忘掉", "清空"):
-            self.store.clear_messages(msg.group_id)
-            return "行，清了。"
-        if cmd.startswith("专注"):
-            topic = cmd[2:].strip()
-            if not topic:
-                return "专注什么？"
-            if self.modes:
-                self.modes.set(msg.group_id, "focus", topic=topic)
-            return "行，就聊{}。".format(topic[:20])
-        if cmd in ("随便", "正常", "normal"):
-            if self.modes:
-                self.modes.reset(msg.group_id)
-            return "行，随便聊。"
-        if cmd == "模式":
-            if not self.modes:
-                return "正常。"
-            state = self.modes.state(msg.group_id)
-            if state.get("mode") == "quiet":
-                return "现在闭嘴。"
-            if state.get("mode") == "focus":
-                return "只聊{}。".format(state.get("topic") or "")
-            return "正常。"
         if cmd == "待办":
             items = self.store.pending_reminders(msg.group_id)
             scheds = self.schedule.list(msg.group_id) if self.schedule else []
@@ -1123,9 +1262,11 @@ class Brain:
                 elif kind == "daily":
                     suffix = "（每天 {}）".format(spec)
                 else:
-                    suffix = "（{}）".format(
-                        datetime.fromtimestamp(item["next_at"]).strftime("%m-%d %H:%M")
-                    )
+                    try:
+                        ts_str = datetime.fromtimestamp(item["next_at"]).strftime("%m-%d %H:%M")
+                    except (OSError, OverflowError, ValueError, TypeError):
+                        ts_str = "待定"
+                    suffix = "（{}）".format(ts_str)
                 who = item.get("user_name") or "群友"
                 lines.append("- {}：{}{}".format(who, item["text"], suffix))
             return "还记着这几件：\n" + "\n".join(lines)
@@ -1133,25 +1274,39 @@ class Brain:
             return None
         return self._create_reminder(msg, cmd[2:].strip())
 
+    def _active_reminder_count(self, group_id):
+        count = len(self.store.pending_reminders(group_id))
+        if self.schedule:
+            count += len(self.schedule.list(group_id))
+        return count
+
     def _create_reminder(self, msg, body):
         if not body:
             return FORMAT_HINT
+        if self._active_reminder_count(msg.group_id) >= MAX_GROUP_REMINDERS:
+            return "本群待提醒太多了（最多 {} 条），先等些到点吧。".format(MAX_GROUP_REMINDERS)
 
         # 0. 规则：每 N 小时 / 每周几（走日程表，支持重复与错过补偿）
-        every = re.match(r"^每\s*(\d+)\s*(分钟|分|小时)\s*(.+)$", body)
+        every = re.match(r"^每\s*(\d+)\s*(分钟|分|个小时|小时)\s*(.+)$", body)
         if every and self.schedule:
             amount = int(every.group(1))
-            unit = every.group(2)
+            raw_unit = every.group(2)
+            unit = "小时" if raw_unit == "个小时" else raw_unit
             note = every.group(3).strip()
             minutes = amount * (60 if unit == "小时" else 1)
-            if note and minutes >= 1:
-                self.schedule.add(msg.group_id, note, "interval", str(minutes),
-                                  user_id=msg.user_id, user_name=msg.user_name,
-                                  umo=msg.umo)
-                return "行，每{}{}叫你：{}".format(amount, unit, note)
+            if not note or amount < 1:
+                return FORMAT_HINT
+            if minutes < MIN_INTERVAL_MINUTES:
+                return "循环间隔太短了，至少 {} 分钟起。".format(MIN_INTERVAL_MINUTES)
+            self.schedule.add(msg.group_id, note, "interval", str(minutes),
+                              user_id=msg.user_id, user_name=msg.user_name,
+                              umo=msg.umo)
+            return "行，每{}{}叫你：{}".format(amount, unit, note)
+
+        norm_body = body.replace("：", ":").replace("点半", ":30")
         weekly = re.match(
             r"^每(?:周|星期)([一二三四五六日天])\s*"
-            r"(\d{1,2}(?::\d{1,2}|点\d{0,2}))\s*(.+)$", body
+            r"(\d{1,2}(?::\d{1,2}|点\d{0,2}))\s*(.+)$", norm_body
         )
         if weekly and self.schedule:
             weekday, clock, note = weekly.group(1), weekly.group(2), weekly.group(3).strip()
@@ -1164,7 +1319,7 @@ class Brain:
             return "行，每周{} {} 叫你：{}".format(weekday, clock, note)
 
         # 0b. 规则：下周几（一次性，默认早上 9 点）
-        next_week = re.match(r"^下(?:周|星期)([一二三四五六日天])\s*(.*)$", body)
+        next_week = re.match(r"^下(?:周|星期)([一二三四五六日天])\s*(.*)$", norm_body)
         if next_week:
             weekday_char, rest = next_week.group(1), next_week.group(2).strip()
             clock_match = re.match(
@@ -1202,18 +1357,20 @@ class Brain:
         if daily:
             return self._add_daily(msg, *daily)
 
-        # 2. 规则：多久之后
-        m = re.match(r"^(\d+)\s*(分钟|分|秒|小时)?\s*(.+)$", body)
+        # 2. 规则：多久之后（必须带明确时间单位，避免误伤 22:00 / 3点）
+        m = re.match(r"^(\d+)\s*(分钟|分|秒|个小时|小时)\s*(.+)$", body)
         if m:
             amount = int(m.group(1))
-            unit = m.group(2) or "分钟"
+            raw_unit = m.group(2)
+            unit = "小时" if raw_unit == "个小时" else raw_unit
             note = m.group(3).strip()
             if not note or amount < 1:
                 return FORMAT_HINT
             scale = 1 if unit == "秒" else 3600 if unit == "小时" else 60
+            delay_seconds = min(365 * 86400, amount * scale)
             self.store.add_reminder(
                 msg.group_id, msg.user_id, msg.user_name, note,
-                time.time() + amount * scale, msg.umo,
+                time.time() + delay_seconds, msg.umo,
             )
             return "行，{}{}后叫你：{}".format(amount, unit, note)
 
@@ -1233,8 +1390,15 @@ class Brain:
 
     def _add_daily(self, msg, hour, minute, note):
         repeat = "daily:{:02d}:{:02d}".format(hour, minute)
+        clock = time.localtime()
+        last_fired = (
+            time.strftime("%Y-%m-%d", clock)
+            if (clock.tm_hour, clock.tm_min) >= (hour, minute)
+            else ""
+        )
         self.store.add_reminder(
             msg.group_id, msg.user_id, msg.user_name, note, time.time(), msg.umo, repeat,
+            last_fired=last_fired,
         )
         return "行，每天 {:02d}:{:02d} 叫你：{}".format(hour, minute, note)
 
@@ -1257,7 +1421,7 @@ class Brain:
         m = re.match(
             r"^(每天|每日|每晚)\s*(早上|上午|中午|下午|晚上|凌晨)?\s*"
             r"(\d{1,2}|[零一二两三四五六七八九十]{1,3})\s*"
-            r"(?:点|:)\s*(\d{1,2})?\s*(.+)$",
+            r"(?:点|:)(?:(\d{1,2})分?)?\s*(.+)$",
             text,
         )
         if not m:
@@ -1266,12 +1430,14 @@ class Brain:
         hour = int(hour_text) if hour_text.isdigit() else CN_HOUR.get(hour_text)
         if hour is None:
             return None
-        if prefix == "每晚" and hour < 12:
-            hour += 12
-        elif period in ("下午", "晚上") and hour < 12:
-            hour += 12
-        elif period == "中午" and hour < 12:
-            hour = 12
+        if prefix == "每晚" or period in ("下午", "晚上"):
+            if 1 <= hour <= 11:
+                hour += 12
+            elif hour == 12 and (prefix == "每晚" or period == "晚上"):
+                hour = 0
+        elif period == "中午":
+            if 1 <= hour <= 5:
+                hour += 12
         elif period == "凌晨" and hour == 12:
             hour = 0
         minute = int(minute_text) if minute_text else 0
@@ -1283,18 +1449,32 @@ class Brain:
     def _model_parse(self, body):
         if getattr(self.model, "name", "") != "openai":
             return None
+        now_dt = datetime.now()
+        weekdays_cn = "一二三四五六日"
+        prompt = "{}\n当前本地时间：{} 星期{}。".format(
+            PARSE_PROMPT, now_dt.strftime("%Y-%m-%d %H:%M"), weekdays_cn[now_dt.weekday()],
+        )
         try:
-            raw = self.model.reply(PARSE_PROMPT, [], body)
+            raw = self.model.reply(prompt, [], body)
         except Exception:
             return None
-        raw = re.sub(r"```(?:json)?", "", raw.strip()).strip()
-        match = re.search(r"\{[^{}]*\}", raw, re.S)
-        if not match:
-            return None
-        try:
-            data = json.loads(match.group(0))
-        except (ValueError, TypeError):
-            return None
+        cleaned = re.sub(r"```(?:json)?", "", str(raw or "").strip()).strip()
+        decoder = json.JSONDecoder()
+        data = None
+        idx = 0
+        while idx < len(cleaned):
+            pos = cleaned.find("{", idx)
+            if pos < 0:
+                break
+            try:
+                candidate, end = decoder.raw_decode(cleaned, pos)
+            except (ValueError, TypeError):
+                idx = pos + 1
+                continue
+            if isinstance(candidate, dict):
+                data = candidate
+                break
+            idx = max(pos + 1, end)
         if not isinstance(data, dict):
             return None
         text = str(data.get("text") or "").strip()

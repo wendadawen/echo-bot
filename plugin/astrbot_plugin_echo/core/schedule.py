@@ -90,31 +90,48 @@ class Schedule:
 
     def __init__(self, path=":memory:"):
         self._lock = threading.Lock()
-        self._db = sqlite3.connect(path, check_same_thread=False)
+        self._closed = False
+        self._db = sqlite3.connect(path, timeout=30.0, check_same_thread=False)
         self._db.row_factory = sqlite3.Row
-        self._db.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS schedules (
-                id TEXT PRIMARY KEY,
-                group_id TEXT NOT NULL,
-                user_id TEXT NOT NULL DEFAULT '',
-                user_name TEXT NOT NULL DEFAULT '',
-                umo TEXT NOT NULL DEFAULT '',
-                text TEXT NOT NULL,
-                kind TEXT NOT NULL,
-                spec TEXT NOT NULL DEFAULT '',
-                tz TEXT NOT NULL DEFAULT '',
-                missed TEXT NOT NULL DEFAULT 'fire_once',
-                next_at REAL NOT NULL,
-                last_fired REAL NOT NULL DEFAULT 0,
-                active INTEGER NOT NULL DEFAULT 1,
-                created REAL NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS schedules_due
-                ON schedules(active, next_at);
-            """
-        )
-        self._db.commit()
+        self._db.execute("PRAGMA busy_timeout=30000")
+        if str(path) != ":memory:":
+            try:
+                self._db.execute("PRAGMA journal_mode=WAL")
+                self._db.execute("PRAGMA synchronous=NORMAL")
+            except sqlite3.Error:
+                pass
+        with self._lock, self._db:
+            self._db.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS schedules (
+                    id TEXT PRIMARY KEY,
+                    group_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL DEFAULT '',
+                    user_name TEXT NOT NULL DEFAULT '',
+                    umo TEXT NOT NULL DEFAULT '',
+                    text TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    spec TEXT NOT NULL DEFAULT '',
+                    tz TEXT NOT NULL DEFAULT '',
+                    missed TEXT NOT NULL DEFAULT 'fire_once',
+                    next_at REAL NOT NULL,
+                    last_fired REAL NOT NULL DEFAULT 0,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    created REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS schedules_due
+                    ON schedules(active, next_at);
+                """
+            )
+
+    def close(self):
+        with self._lock:
+            if not self._closed:
+                self._closed = True
+                try:
+                    self._db.close()
+                except sqlite3.Error:
+                    pass
 
     def add(self, group_id, text, kind, spec="", due_at=None, tz="", missed="fire_once",
             user_id="", user_name="", umo="", now=None):
@@ -130,7 +147,7 @@ class Schedule:
         else:
             next_at = next_time(kind, spec, now, tz)
         row_id = uuid.uuid4().hex[:12]
-        with self._lock:
+        with self._lock, self._db:
             self._db.execute(
                 "INSERT INTO schedules(id, group_id, user_id, user_name, umo, text, "
                 "kind, spec, tz, missed, next_at, created) "
@@ -138,7 +155,6 @@ class Schedule:
                 (row_id, group_id, user_id, user_name, umo, str(text)[:200], kind,
                  str(spec), tz, missed, next_at, now),
             )
-            self._db.commit()
         return row_id
 
     def due(self, now=None):
@@ -154,11 +170,11 @@ class Schedule:
     def fire(self, schedule_id, now=None):
         """推进一条日程；返回是否应该真的发出去（错过的按策略决定）。"""
         now = time.time() if now is None else now
-        with self._lock:
+        with self._lock, self._db:
             row = self._db.execute(
                 "SELECT * FROM schedules WHERE id = ?", (str(schedule_id),)
             ).fetchone()
-            if row is None or not row["active"]:
+            if row is None or not row["active"] or row["next_at"] > now:
                 return None
             late = now - row["next_at"]
             kind = row["kind"]
@@ -167,7 +183,6 @@ class Schedule:
                     "UPDATE schedules SET active = 0, last_fired = ? WHERE id = ?",
                     (now, row["id"]),
                 )
-                self._db.commit()
                 if late > 6 * 3600 and row["missed"] == "skip":
                     return None
                 return dict(row)
@@ -186,14 +201,13 @@ class Schedule:
                 "UPDATE schedules SET next_at = ?, last_fired = ? WHERE id = ?",
                 (next_at, now, row["id"]),
             )
-            self._db.commit()
             payload = dict(row)
         return payload if send else None
 
     def list(self, group_id=None):
         sql = "SELECT * FROM schedules WHERE active = 1"
         params = []
-        if group_id:
+        if group_id is not None:
             sql += " AND group_id = ?"
             params.append(str(group_id))
         sql += " ORDER BY next_at"
@@ -204,19 +218,17 @@ class Schedule:
     def cancel(self, schedule_id, group_id=None):
         sql = "UPDATE schedules SET active = 0 WHERE id = ?"
         params = [str(schedule_id)]
-        if group_id:
+        if group_id is not None:
             sql += " AND group_id = ?"
             params.append(str(group_id))
-        with self._lock:
+        with self._lock, self._db:
             cur = self._db.execute(sql, params)
-            self._db.commit()
             return cur.rowcount > 0
 
     def clear(self, group_id):
-        with self._lock:
+        with self._lock, self._db:
             cur = self._db.execute(
                 "UPDATE schedules SET active = 0 WHERE group_id = ? AND active = 1",
                 (str(group_id),),
             )
-            self._db.commit()
             return cur.rowcount

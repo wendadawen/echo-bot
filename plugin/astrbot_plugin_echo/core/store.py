@@ -1,18 +1,52 @@
-"""持久化：消息历史、定时提醒。只用 Python 标准库。"""
+"""持久化：消息历史、定时提醒、重载跨实例待投递队列。只用 Python 标准库。"""
 
+import json
 import sqlite3
 import threading
 import time
 
 DEFAULT_HISTORY_LIMIT = 30
 
+_PENDING_DELIVERY_DDL = """
+CREATE TABLE IF NOT EXISTS pending_deliveries (
+    task_id TEXT PRIMARY KEY,
+    group_id TEXT NOT NULL,
+    umo TEXT NOT NULL DEFAULT '',
+    prompt TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'failed',
+    reason TEXT NOT NULL DEFAULT 'error',
+    result TEXT NOT NULL DEFAULT '',
+    partial TEXT NOT NULL DEFAULT '',
+    files_json TEXT NOT NULL DEFAULT '[]',
+    error TEXT NOT NULL DEFAULT '',
+    pre_history_json TEXT NOT NULL DEFAULT '[]',
+    created_at REAL NOT NULL
+);
+"""
+
+
+def _configure_conn(conn, path):
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=30000")
+    if str(path) != ":memory:":
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+        except sqlite3.Error:
+            pass
+    return conn
+
 
 class Store:
     def __init__(self, path=":memory:"):
+        self._path = str(path)
+        self._closed = False
         self._lock = threading.RLock()
-        self._db = sqlite3.connect(path, check_same_thread=False)
-        self._db.row_factory = sqlite3.Row
-        with self._lock:
+        self._db = _configure_conn(
+            sqlite3.connect(self._path, timeout=30.0, check_same_thread=False),
+            self._path,
+        )
+        with self._lock, self._db:
             self._db.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS messages (
@@ -24,6 +58,8 @@ class Store:
                     text TEXT NOT NULL,
                     ts REAL NOT NULL
                 );
+                CREATE INDEX IF NOT EXISTS idx_messages_group_seq
+                    ON messages(group_id, seq);
                 CREATE TABLE IF NOT EXISTS reminders (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     group_id TEXT NOT NULL,
@@ -36,7 +72,10 @@ class Store:
                     repeat TEXT NOT NULL DEFAULT '',
                     last_fired TEXT NOT NULL DEFAULT ''
                 );
+                CREATE INDEX IF NOT EXISTS idx_reminders_done_due
+                    ON reminders(done, due_at);
                 """
+                + _PENDING_DELIVERY_DDL
             )
             # 兼容早期版本的数据库文件
             columns = {row["name"] for row in self._db.execute("PRAGMA table_info(reminders)")}
@@ -44,35 +83,42 @@ class Store:
                 self._db.execute("ALTER TABLE reminders ADD COLUMN repeat TEXT NOT NULL DEFAULT ''")
             if "last_fired" not in columns:
                 self._db.execute("ALTER TABLE reminders ADD COLUMN last_fired TEXT NOT NULL DEFAULT ''")
-            self._db.commit()
+
+    def close(self):
+        with self._lock:
+            if not self._closed:
+                self._closed = True
+                try:
+                    self._db.close()
+                except sqlite3.Error:
+                    pass
 
     def add_message(self, group_id, user_id, user_name, role, text, ts=None):
         ts = time.time() if ts is None else ts
-        with self._lock:
+        with self._lock, self._db:
             cur = self._db.execute(
                 "INSERT INTO messages(group_id, user_id, user_name, role, text, ts) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
                 (group_id, user_id, user_name, role, text, ts),
             )
-            self._db.commit()
             return cur.lastrowid
 
     def recent(self, group_id, n=DEFAULT_HISTORY_LIMIT):
         with self._lock:
             rows = self._db.execute(
                 "SELECT * FROM messages WHERE group_id = ? ORDER BY seq DESC LIMIT ?",
-                (group_id, n),
+                (group_id, max(0, int(n))),
             ).fetchall()
         return [dict(r) for r in reversed(rows)]
 
-    def add_reminder(self, group_id, user_id, user_name, text, due_at, umo="", repeat=""):
-        with self._lock:
+    def add_reminder(self, group_id, user_id, user_name, text, due_at, umo="", repeat="",
+                     last_fired=""):
+        with self._lock, self._db:
             cur = self._db.execute(
-                "INSERT INTO reminders(group_id, user_id, user_name, text, due_at, umo, repeat) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (group_id, user_id, user_name, text, due_at, umo, repeat),
+                "INSERT INTO reminders(group_id, user_id, user_name, text, due_at, umo, repeat, last_fired) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (group_id, user_id, user_name, text, due_at, umo, repeat, str(last_fired or "")),
             )
-            self._db.commit()
             return cur.lastrowid
 
     def pending_reminders(self, group_id):
@@ -94,18 +140,141 @@ class Store:
         return [dict(r) for r in rows]
 
     def mark_reminder_done(self, rid):
-        with self._lock:
+        with self._lock, self._db:
             self._db.execute("UPDATE reminders SET done = 1 WHERE id = ?", (rid,))
-            self._db.commit()
 
     def mark_reminder_fired(self, rid, day):
-        with self._lock:
+        with self._lock, self._db:
             self._db.execute("UPDATE reminders SET last_fired = ? WHERE id = ?", (day, rid))
-            self._db.commit()
 
     def clear_messages(self, group_id):
         """清空本群聊天记录（提醒与记忆不动）。"""
-        with self._lock:
+        with self._lock, self._db:
             cur = self._db.execute("DELETE FROM messages WHERE group_id = ?", (group_id,))
-            self._db.commit()
             return cur.rowcount
+
+    def save_pending_delivery(self, task_id, group_id, umo="", prompt="", status="failed",
+                              reason="error", result="", partial="", files=None,
+                              error="", pre_history=None, created_at=None):
+        """持久化待投递后台结果；即使主连接已因重载关闭也回退短连接写盘，防丢结果。"""
+        task_id = str(task_id or "").strip()
+        if not task_id:
+            return False
+        created = time.time() if created_at is None else float(created_at)
+        files_json = json.dumps(list(files or []), ensure_ascii=False)
+        history_json = json.dumps(list(pre_history or []), ensure_ascii=False)
+        params = (
+            task_id,
+            str(group_id or ""),
+            str(umo or ""),
+            str(prompt or ""),
+            str(status or "failed"),
+            str(reason or "error"),
+            str(result or ""),
+            str(partial or ""),
+            files_json,
+            str(error or ""),
+            history_json,
+            created,
+        )
+        sql = (
+            "INSERT OR REPLACE INTO pending_deliveries"
+            "(task_id, group_id, umo, prompt, status, reason, result, partial, "
+            "files_json, error, pre_history_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+        with self._lock:
+            if not self._closed:
+                try:
+                    with self._db:
+                        self._db.execute(sql, params)
+                    return True
+                except sqlite3.ProgrammingError:
+                    pass
+                except sqlite3.Error:
+                    return False
+        if self._path == ":memory:":
+            return False
+        conn = None
+        try:
+            conn = _configure_conn(
+                sqlite3.connect(self._path, timeout=30.0, check_same_thread=False),
+                self._path,
+            )
+            with conn:
+                conn.executescript(_PENDING_DELIVERY_DDL)
+                conn.execute(sql, params)
+            return True
+        except sqlite3.Error:
+            return False
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    pass
+
+    def pop_pending_deliveries(self, limit=20):
+        """原子取出并移除待补发的后台任务结果。"""
+        with self._lock:
+            if self._closed:
+                return []
+            with self._db:
+                rows = self._db.execute(
+                    "SELECT * FROM pending_deliveries ORDER BY created_at ASC LIMIT ?",
+                    (max(1, int(limit)),),
+                ).fetchall()
+                if not rows:
+                    return []
+                ids = [r["task_id"] for r in rows]
+                placeholders = ",".join("?" for _ in ids)
+                self._db.execute(
+                    "DELETE FROM pending_deliveries WHERE task_id IN ({})".format(placeholders),
+                    ids,
+                )
+        out = []
+        for r in rows:
+            item = dict(r)
+            try:
+                files = json.loads(item.pop("files_json", "[]") or "[]")
+            except (ValueError, TypeError):
+                files = []
+            try:
+                pre_history = json.loads(item.pop("pre_history_json", "[]") or "[]")
+            except (ValueError, TypeError):
+                pre_history = []
+            item["files"] = files if isinstance(files, list) else []
+            item["pre_history"] = pre_history if isinstance(pre_history, list) else []
+            out.append(item)
+        return out
+
+    def delete_pending_delivery(self, task_id):
+        if not task_id:
+            return False
+        with self._lock:
+            if self._closed:
+                return False
+            with self._db:
+                cur = self._db.execute(
+                    "DELETE FROM pending_deliveries WHERE task_id = ?", (str(task_id),)
+                )
+                return cur.rowcount > 0
+
+    def pending_delivery_paths(self):
+        """返回仍在待补发队列里的文件路径集合，防止启动清理误删。"""
+        with self._lock:
+            if self._closed:
+                return set()
+            rows = self._db.execute("SELECT files_json FROM pending_deliveries").fetchall()
+        paths = set()
+        for r in rows:
+            try:
+                items = json.loads(r["files_json"] or "[]")
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(items, list):
+                continue
+            for entry in items:
+                if isinstance(entry, dict) and entry.get("path"):
+                    paths.add(str(entry["path"]))
+        return paths

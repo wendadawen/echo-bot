@@ -9,6 +9,7 @@
 
 import json
 import re
+import threading
 
 # name -> (说明, 参数名, 是否终态, 需要的场景)
 ACTION_SPECS = {
@@ -59,6 +60,7 @@ ACTION_PROMPT = (
 
 MAX_ROUNDS = 6
 RESULT_LIMIT = 260
+_CTRL_PATTERN = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
 def available(scene="group", capabilities=None):
@@ -78,6 +80,21 @@ def render_prompt(scene="group", capabilities=None):
     return ACTION_PROMPT.replace("{actions}", "动作列表：\n" + "\n".join(lines))
 
 
+def _strip_code_fence(raw):
+    cleaned = str(raw or "").strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.I)
+        cleaned = re.sub(r"\s*```\s*$", "", cleaned)
+    return cleaned.strip()
+
+
+def _looks_like_control_json(raw):
+    text = _strip_code_fence(raw)
+    if not text:
+        return False
+    return text.startswith("{") and ('"action"' in text or "'action'" in text)
+
+
 def parse(raw):
     """解析模型输出；失败返回 None，由调用方降级。保持只返回 action/text 两键。"""
     full = parse_full(raw)
@@ -89,34 +106,39 @@ def parse(raw):
 def parse_full(raw):
     if not isinstance(raw, str):
         return None
-    cleaned = re.sub(r"```(?:json)?", "", raw.strip()).strip()
-    match = re.search(r"\{[^{}]*\}", cleaned, re.S)
-    if not match:
+    cleaned = _strip_code_fence(raw)
+    if not cleaned:
         return None
-    try:
-        data = json.loads(match.group(0))
-    except (ValueError, TypeError):
-        return None
-    if not isinstance(data, dict):
-        return None
-    action = data.get("action")
-    if action not in ACTIONS:
-        return None
-    text = str(data.get("text") or data.get("seconds") or "").strip()[:300]
-    reply = str(data.get("reply") or "").strip()[:120]
-    return {"action": action, "text": text, "seconds": data.get("seconds"), "reply": reply}
+    decoder = json.JSONDecoder()
+    idx = 0
+    while idx < len(cleaned):
+        pos = cleaned.find("{", idx)
+        if pos < 0:
+            break
+        try:
+            data, end = decoder.raw_decode(cleaned, pos)
+        except (ValueError, TypeError):
+            idx = pos + 1
+            continue
+        if isinstance(data, dict) and data.get("action") in ACTIONS:
+            action = data["action"]
+            text = str(data.get("text") or data.get("seconds") or "").strip()[:300]
+            reply = str(data.get("reply") or "").strip()[:120]
+            return {"action": action, "text": text, "seconds": data.get("seconds"), "reply": reply}
+        idx = max(pos + 1, end)
+    return None
 
 
-def validate(action, payload, scene="group"):
-    """参数校验：防住明显不合法的动作与超长/控制字符输入。"""
-    if action not in available(scene):
+def validate(action, payload, scene="group", capabilities=None, reply=""):
+    """参数校验：防住明显不合法的动作、超长与控制字符输入。"""
+    if action not in available(scene, capabilities):
         return False, "这个动作在当前场景不可用"
     spec = ACTION_SPECS[action]
     if spec[1] == "text" and not payload and action != "view_image":
         return False, "缺少参数"
     if len(payload) > 300:
         return False, "参数过长"
-    if re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", payload):
+    if _CTRL_PATTERN.search(payload) or (reply and _CTRL_PATTERN.search(str(reply))):
         return False, "参数含控制字符"
     if action == "wait":
         try:
@@ -145,14 +167,17 @@ class ToolResultStore:
     def __init__(self, limit=20):
         self.limit = limit
         self._rows = []
+        self._lock = threading.Lock()
 
     def add(self, group_id, action, result):
-        self._rows.append((group_id, action, condense(result)))
-        del self._rows[:-self.limit]
-        return len(self._rows)
+        with self._lock:
+            self._rows.append((group_id, action, condense(result)))
+            del self._rows[:-self.limit]
+            return len(self._rows)
 
     def get(self, group_id, index=None):
-        rows = [r for r in self._rows if r[0] == group_id]
+        with self._lock:
+            rows = [r for r in self._rows if r[0] == group_id]
         if index is None or str(index).strip() == "":
             return rows[-1][2] if rows else ""
         try:
@@ -161,7 +186,8 @@ class ToolResultStore:
             return ""
 
     def recent(self, group_id, limit=3):
-        rows = [r for r in self._rows if r[0] == group_id]
+        with self._lock:
+            rows = [r for r in self._rows if r[0] == group_id]
         return ["[{}] {}".format(action, text) for _, action, text in rows[-limit:]]
 
 
@@ -190,9 +216,20 @@ class ToolLoop:
         self.max_rounds = max_rounds
         self.capabilities = capabilities
         self.results = ToolResultStore()
+        self._local = threading.local()
 
-    def run(self, system, history, user_text, executor, group_id, scene="group"):
-        prompt = system + "\n\n" + render_prompt(scene, self.capabilities)
+    @property
+    def last_error(self):
+        return getattr(self._local, "last_error", "")
+
+    def _set_error(self, value):
+        self._local.last_error = str(value or "")
+
+    def run(self, system, history, user_text, executor, group_id, scene="group",
+            capabilities=None):
+        self._set_error("")
+        caps = self.capabilities if capabilities is None else capabilities
+        prompt = system + "\n\n" + render_prompt(scene, caps)
         observations = []
         last_action = None
         for _ in range(self.max_rounds):
@@ -201,14 +238,18 @@ class ToolLoop:
                 round_prompt += "\n\n前几轮工具结果：\n" + "\n".join(observations[-3:])
             try:
                 raw = self.model.reply(round_prompt, history, user_text)
-            except Exception:
+            except Exception as exc:
+                self._set_error(exc)
                 return None
             full = parse_full(raw)
             if full is None:
-                # 模型没按格式输出时把原文当作一次普通回复。
+                if _looks_like_control_json(raw):
+                    observations.append("[格式错误] JSON 不合法或未闭合，请输出完整单行 JSON")
+                    continue
+                # 模型按普通口语直答时当作普通回复。
                 return {"action": "reply", "text": str(raw or "").strip()[:300]}
             action, payload = full["action"], full["text"]
-            ok, reason = validate(action, payload, scene)
+            ok, reason = validate(action, payload, scene, capabilities=caps, reply=full.get("reply", ""))
             if not ok:
                 observations.append("[校验失败] {}".format(reason))
                 last_action = action

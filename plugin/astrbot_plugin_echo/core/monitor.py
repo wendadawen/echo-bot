@@ -12,37 +12,53 @@ import time
 class Monitor:
     def __init__(self, path=":memory:"):
         self._lock = threading.Lock()
-        self._db = sqlite3.connect(path, check_same_thread=False)
+        self._closed = False
+        self._db = sqlite3.connect(path, timeout=30.0, check_same_thread=False)
         self._db.row_factory = sqlite3.Row
-        self._db.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                group_id TEXT NOT NULL DEFAULT '',
-                kind TEXT NOT NULL,
-                ok INTEGER NOT NULL DEFAULT 1,
-                latency REAL NOT NULL DEFAULT 0,
-                tokens INTEGER NOT NULL DEFAULT 0,
-                detail TEXT NOT NULL DEFAULT '',
-                ts REAL NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS events_group_ts ON events(group_id, ts);
-            """
-        )
-        self._db.commit()
+        self._db.execute("PRAGMA busy_timeout=30000")
+        if str(path) != ":memory:":
+            try:
+                self._db.execute("PRAGMA journal_mode=WAL")
+                self._db.execute("PRAGMA synchronous=NORMAL")
+            except sqlite3.Error:
+                pass
+        with self._lock, self._db:
+            self._db.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    group_id TEXT NOT NULL DEFAULT '',
+                    kind TEXT NOT NULL,
+                    ok INTEGER NOT NULL DEFAULT 1,
+                    latency REAL NOT NULL DEFAULT 0,
+                    tokens INTEGER NOT NULL DEFAULT 0,
+                    detail TEXT NOT NULL DEFAULT '',
+                    ts REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS events_group_ts ON events(group_id, ts);
+                """
+            )
+
+    def close(self):
+        with self._lock:
+            if not self._closed:
+                self._closed = True
+                try:
+                    self._db.close()
+                except sqlite3.Error:
+                    pass
 
     def record(self, group_id, kind, ok=True, latency=0.0, tokens=0, detail="",
                now=None):
         now = time.time() if now is None else now
         try:
-            with self._lock:
+            with self._lock, self._db:
                 self._db.execute(
                     "INSERT INTO events(group_id, kind, ok, latency, tokens, detail, ts) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (str(group_id or ""), str(kind)[:24], 1 if ok else 0,
                      float(latency or 0), int(tokens or 0), str(detail)[:200], now),
                 )
-                self._db.commit()
         except sqlite3.Error:
             return False
         return True
@@ -105,7 +121,6 @@ class Monitor:
     def prune(self, days=7, now=None):
         now = time.time() if now is None else now
         cutoff = now - float(days) * 86400
-        with self._lock:
+        with self._lock, self._db:
             cur = self._db.execute("DELETE FROM events WHERE ts < ?", (cutoff,))
-            self._db.commit()
             return cur.rowcount

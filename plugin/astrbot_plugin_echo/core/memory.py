@@ -99,8 +99,16 @@ class Memory:
 
     def __init__(self, path=":memory:"):
         self._lock = threading.RLock()
-        self._db = sqlite3.connect(path, check_same_thread=False)
+        self._closed = False
+        self._db = sqlite3.connect(path, timeout=30.0, check_same_thread=False)
         self._db.row_factory = sqlite3.Row
+        self._db.execute("PRAGMA busy_timeout=30000")
+        if str(path) != ":memory:":
+            try:
+                self._db.execute("PRAGMA journal_mode=WAL")
+                self._db.execute("PRAGMA synchronous=NORMAL")
+            except sqlite3.Error:
+                pass
         self._fts = False
         with self._lock:
             self._db.executescript(
@@ -174,6 +182,15 @@ class Memory:
             except sqlite3.OperationalError:
                 self._fts = False
             self._db.commit()
+
+    def close(self):
+        with self._lock:
+            if not self._closed:
+                self._closed = True
+                try:
+                    self._db.close()
+                except sqlite3.Error:
+                    pass
 
     def _migrate(self):
         """给旧库补列；SQLite 的 CREATE TABLE IF NOT EXISTS 不会新增字段。"""
@@ -303,6 +320,8 @@ class Memory:
             self._db.commit()
 
     def _fts_hits(self, group_id, query, limit):
+        if not self._fts:
+            return []
         tokens = [t for t in re.findall(r"[\u4e00-\u9fff]{2,}|[a-zA-Z0-9]{3,}", query or "")][:6]
         if not tokens:
             return []
@@ -310,15 +329,18 @@ class Memory:
         try:
             with self._lock:
                 rows = self._db.execute(
-                    "SELECT rowid FROM points_fts WHERE points_fts MATCH ? LIMIT ?",
-                    (match, limit * 4),
+                    "SELECT p.id AS rowid FROM points_fts f "
+                    "JOIN memory_points p ON p.id = f.rowid "
+                    "WHERE points_fts MATCH ? AND p.group_id = ? AND p.state = 'active' "
+                    "LIMIT ?",
+                    (match, str(group_id), max(1, int(limit) * 4)),
                 ).fetchall()
             return [r["rowid"] for r in rows]
         except sqlite3.OperationalError:
             return []
 
     def recall(self, group_id, query, limit=4, now=None):
-        """混合检索：FTS5 命中 + 关键词命中 + 时间衰减权重；命中即再激活。"""
+        """混合检索：FTS5 命中 + 关键词命中 + 时间衰减权重；只对真实命中再激活。"""
         now = time.time() if now is None else now
         words = [
             w.lower()
@@ -343,18 +365,19 @@ class Memory:
             content_lower = row["content"].lower()
             hit = sum(1 for w in words if w in content_lower)
             fts = 1.0 if row["id"] in fts_ids else 0.0
-            scored.append((weight + hit * 0.5 + fts, row["content"], row["id"], row["weight"]))
+            matched = bool(hit > 0 or fts > 0.0)
+            scored.append((weight + hit * 0.5 + fts, row["content"], row["id"], row["weight"], matched))
         scored.sort(key=lambda item: item[0], reverse=True)
         chosen = scored[:max(0, limit - len(episodes))]
-        if chosen:
-            with self._lock:
-                for _, _, rid, orig_weight in chosen:
+        matched_rows = [item for item in chosen if item[4]]
+        if matched_rows:
+            with self._lock, self._db:
+                for _, _, rid, orig_weight, _ in matched_rows:
                     self._db.execute(
                         "UPDATE memory_points SET last_hit=?, weight=? WHERE id=?",
                         (now, min(5.0, float(orig_weight) + 0.3), rid),
                     )
-                self._db.commit()
-        return (episodes + [content for _, content, _, _ in chosen])[:limit]
+        return (episodes + [content for _, content, _, _, _ in chosen])[:limit]
 
     # ---- 人物画像与关系 ----
     def upsert_person(self, group_id, user_name, category, content, now=None, source="auto"):

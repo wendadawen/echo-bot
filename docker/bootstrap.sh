@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# 第一次启动时按 CPU 架构补齐 QQ 客户端和 NapCat。
-# 这两个包不进镜像：它们是第三方二进制，由容器自己下载，下载结果留在数据卷里。
+# 第一次启动时按 CPU 架构补齐 QQ 客户端和 NapCat，并同步内置插件进命名卷。
+# 第三方二进制由容器自己下载，下载结果留在命名卷里；默认不挂载宿主机目录。
 set -euo pipefail
+umask 077
 
 DATA=/AstrBot/data
 CACHE="$DATA/bootstrap"
@@ -17,31 +18,46 @@ case "$arch" in
 esac
 napcat_url="${NAPCAT_ZIP_URL:-https://github.com/XingYunStar/NapCatQQ/releases/download/v4.18.42/NapCat.Shell.zip}"
 
-mkdir -p "$CACHE" "$NC/config" "$NC/logs" "$NC/cache" "$NC/plugins" "$NC/home" "$DATA/plugins"
+mkdir -p "$CACHE" "$NC/config" "$NC/logs" "$NC/cache" "$NC/plugins" "$NC/home" \
+  "$DATA/plugins" "$DATA/config" "$DATA/plugin_data"
+chmod 700 "$CACHE" "$NC/config" "$NC/home" "$DATA/config" "$DATA/plugin_data" 2>/dev/null || true
 
-# 没挂源码时，用镜像里自带的插件补一份
-if [[ ! -d "$DATA/plugins/astrbot_plugin_echo" ]]; then
-  cp -a /opt/echo/plugin/astrbot_plugin_echo "$DATA/plugins/"
+# 默认同步镜像内置插件到数据卷；仅在显式独立挂载了插件目录时保留外部挂载内容。
+if ! grep -Fq " $DATA/plugins/astrbot_plugin_echo " /proc/self/mountinfo 2>/dev/null; then
+  rm -rf "$DATA/plugins/astrbot_plugin_echo"
+  cp -a /opt/echo/plugin/astrbot_plugin_echo "$DATA/plugins/astrbot_plugin_echo"
+  chmod -R u=rwX,go=rX "$DATA/plugins/astrbot_plugin_echo"
 fi
+
+CURL_OPTS=(--proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 300 --retry 3)
 
 # 链接解析插件为第三方 AGPL 项目，源码不进镜像，按固定版本下载到数据卷。
 resolver_ref="${LINK_RESOLVER_REF:-5562b96b5b528a78bd9851197f4ea35d3285d9e4}"
 resolver_dir="$DATA/plugins/astrbot_plugin_link_resolver"
 if [[ ! -f "$resolver_dir/metadata.yaml" ]]; then
   echo "[bootstrap] 下载链接解析插件"
-  curl -fL --retry 3 -o "$CACHE/link_resolver.tar.gz" \
-    "https://github.com/vacacia/astrbot_plugin_link_resolver/archive/${resolver_ref}.tar.gz"
+  if [[ ! -s "$CACHE/link_resolver.tar.gz" ]]; then
+    curl -fL "${CURL_OPTS[@]}" -o "$CACHE/link_resolver.tar.gz.part" -- \
+      "https://github.com/vacacia/astrbot_plugin_link_resolver/archive/${resolver_ref}.tar.gz"
+    mv -f "$CACHE/link_resolver.tar.gz.part" "$CACHE/link_resolver.tar.gz"
+  fi
   rm -rf "$CACHE/link_resolver" "$resolver_dir"
   mkdir -p "$CACHE/link_resolver"
-  tar -xzf "$CACHE/link_resolver.tar.gz" -C "$CACHE/link_resolver" --strip-components=1
+  tar --no-same-owner --no-same-permissions -xzf "$CACHE/link_resolver.tar.gz" -C "$CACHE/link_resolver" --strip-components=1
   mv "$CACHE/link_resolver" "$resolver_dir"
   echo "[bootstrap] 链接解析插件就绪"
 fi
 
 if [[ ! -f "$APP/loadNapCat.cjs" ]]; then
   echo "[bootstrap] 第一次启动，下载 QQ 客户端（$arch）和 NapCat，可能要几分钟"
-  curl -fL --retry 3 -o "$CACHE/qq.deb" "$qq_url"
-  curl -fL --retry 3 -o "$CACHE/napcat.zip" "$napcat_url"
+  if [[ ! -s "$CACHE/qq.deb" ]]; then
+    curl -fL "${CURL_OPTS[@]}" -o "$CACHE/qq.deb.part" -- "$qq_url"
+    mv -f "$CACHE/qq.deb.part" "$CACHE/qq.deb"
+  fi
+  if [[ ! -s "$CACHE/napcat.zip" ]]; then
+    curl -fL "${CURL_OPTS[@]}" -o "$CACHE/napcat.zip.part" -- "$napcat_url"
+    mv -f "$CACHE/napcat.zip.part" "$CACHE/napcat.zip"
+  fi
   mkdir -p "$QQROOT"
   dpkg-deb -x "$CACHE/qq.deb" "$QQROOT"
   python3 - "$APP" "$CACHE/napcat.zip" <<'PY'
@@ -58,25 +74,49 @@ package = app / "package.json"
 settings = json.loads(package.read_text(encoding="utf-8"))
 settings["main"] = "./loadNapCat.cjs"
 package.write_text(json.dumps(settings, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-(app / "loadNapCat.cjs").write_text(
-    "const { pathToFileURL } = require('node:url');\n"
-    "const path = require('node:path');\n"
-    "import(pathToFileURL(path.join(__dirname, 'napcat', 'napcat.mjs')).href);\n",
-    encoding="utf-8",
-)
 PY
   for name in config logs cache plugins; do
     [[ -e "$APP/napcat/$name" ]] || ln -s "$NC/$name" "$APP/napcat/$name"
   done
+  cat > "$APP/loadNapCat.cjs" <<'JS'
+const { pathToFileURL } = require('node:url');
+const path = require('node:path');
+import(pathToFileURL(path.join(__dirname, 'napcat', 'napcat.mjs')).href);
+JS
   echo "[bootstrap] 客户端装好了"
 fi
 
-# NapCat 的反向 WebSocket 连到同一个容器里的 AstrBot
-python3 - "$NC/config" "${ONEBOT_TOKEN:-}" "${BOT_QQ:-}" <<'PY'
-import json, sys
+# 若未显式指定 ONEBOT_TOKEN，自动生成 32 字节随机密钥并持久化在命名卷里，避免容器内无鉴权 WS。
+token_file="$CACHE/onebot_token"
+effective_token="${ONEBOT_TOKEN:-}"
+if [[ -z "$effective_token" ]]; then
+  if [[ -s "$token_file" ]]; then
+    effective_token="$(tr -d '[:space:]' < "$token_file")"
+  else
+    effective_token="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+    printf '%s\n' "$effective_token" > "${token_file}.part"
+    chmod 600 "${token_file}.part"
+    mv -f "${token_file}.part" "$token_file"
+  fi
+fi
+
+# NapCat 的反向 WebSocket 连到同一个容器里的 AstrBot；通过环境变量传密文，不进命令行 argv。
+ONEBOT_TOKEN_EFFECTIVE="$effective_token" BOT_QQ_VALUE="${BOT_QQ:-}" python3 - "$NC/config" <<'PY'
+import json, os, sys
 from pathlib import Path
 
-cfg_dir, token, qq = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+cfg_dir = Path(sys.argv[1])
+token = os.environ.get("ONEBOT_TOKEN_EFFECTIVE", "")
+qq = os.environ.get("BOT_QQ_VALUE", "")
+
+def atomic_write_secret(path, text):
+    tmp = path.with_name(path.name + ".tmp")
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    os.chmod(str(tmp), 0o600)
+    os.replace(str(tmp), str(path))
+
 client = {
     "enable": True,
     "name": "AstrBot",
@@ -100,16 +140,25 @@ names = ["onebot11.json"] + ([f"onebot11_{qq}.json"] if qq.isdigit() else [])
 for name in names:
     path = cfg_dir / name
     if not path.exists():
-        path.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        atomic_write_secret(path, json.dumps(config, ensure_ascii=False, indent=2) + "\n")
 PY
 
-# 把 OneBot v11 平台补进面板配置，省得手动创建
-python3 - "${ONEBOT_TOKEN:-}" <<'PY'
-import copy, importlib, json, sys
+# 把 OneBot v11 平台补进面板配置，限定容器内环回监听并对齐鉴权 Token。
+ONEBOT_TOKEN_EFFECTIVE="$effective_token" python3 - <<'PY'
+import copy, importlib, json, os
 from pathlib import Path
 
 path = Path("/AstrBot/data/cmd_config.json")
-token = sys.argv[1]
+token = os.environ.get("ONEBOT_TOKEN_EFFECTIVE", "")
+
+def atomic_write_secret(target, text):
+    tmp = target.with_name(target.name + ".tmp")
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    os.chmod(str(tmp), 0o600)
+    os.replace(str(tmp), str(target))
+
 try:
     cfg = json.loads(path.read_text(encoding="utf-8-sig"))
 except FileNotFoundError:
@@ -128,8 +177,8 @@ else:
     if not any(isinstance(x, dict) and x.get("type") == "aiocqhttp" for x in platforms):
         platforms.append({
             "id": "napcat", "type": "aiocqhttp", "enable": True,
-            "ws_reverse_host": "0.0.0.0", "ws_reverse_port": 6199,
+            "ws_reverse_host": "127.0.0.1", "ws_reverse_port": 6199,
             "ws_reverse_token": token,
         })
-        path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        atomic_write_secret(path, json.dumps(cfg, ensure_ascii=False, indent=2) + "\n")
 PY

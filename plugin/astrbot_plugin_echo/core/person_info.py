@@ -58,42 +58,59 @@ class PersonStore:
 
     def __init__(self, path=":memory:"):
         self._lock = threading.RLock()
-        self._db = sqlite3.connect(path, check_same_thread=False)
+        self._closed = False
+        self._db = sqlite3.connect(path, timeout=30.0, check_same_thread=False)
         self._db.row_factory = sqlite3.Row
-        self._db.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS identities (
-                group_id TEXT NOT NULL,
-                user_id TEXT NOT NULL,
-                name TEXT NOT NULL,
-                kind TEXT NOT NULL DEFAULT 'nick',
-                hits INTEGER NOT NULL DEFAULT 1,
-                updated_at REAL NOT NULL,
-                PRIMARY KEY (group_id, user_id, name)
-            );
-            CREATE INDEX IF NOT EXISTS identities_name
-                ON identities(group_id, name);
-            CREATE TABLE IF NOT EXISTS individuals (
-                user_id TEXT PRIMARY KEY,
-                first_seen REAL NOT NULL,
-                last_seen REAL NOT NULL,
-                msg_count INTEGER NOT NULL DEFAULT 1,
-                groups TEXT NOT NULL DEFAULT ''
-            );
-            CREATE TABLE IF NOT EXISTS profiles (
-                group_id TEXT NOT NULL,
-                user_id TEXT NOT NULL,
-                traits TEXT NOT NULL DEFAULT '',
-                preferences TEXT NOT NULL DEFAULT '',
-                events TEXT NOT NULL DEFAULT '',
-                relation TEXT NOT NULL DEFAULT '',
-                intimacy REAL NOT NULL DEFAULT 0.5,
-                updated_at REAL NOT NULL,
-                PRIMARY KEY (group_id, user_id)
-            );
-            """
-        )
-        self._db.commit()
+        self._db.execute("PRAGMA busy_timeout=30000")
+        if str(path) != ":memory:":
+            try:
+                self._db.execute("PRAGMA journal_mode=WAL")
+                self._db.execute("PRAGMA synchronous=NORMAL")
+            except sqlite3.Error:
+                pass
+        with self._lock, self._db:
+            self._db.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS identities (
+                    group_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    kind TEXT NOT NULL DEFAULT 'nick',
+                    hits INTEGER NOT NULL DEFAULT 1,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY (group_id, user_id, name)
+                );
+                CREATE INDEX IF NOT EXISTS identities_name
+                    ON identities(group_id, name);
+                CREATE TABLE IF NOT EXISTS individuals (
+                    user_id TEXT PRIMARY KEY,
+                    first_seen REAL NOT NULL,
+                    last_seen REAL NOT NULL,
+                    msg_count INTEGER NOT NULL DEFAULT 1,
+                    groups TEXT NOT NULL DEFAULT ''
+                );
+                CREATE TABLE IF NOT EXISTS profiles (
+                    group_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    traits TEXT NOT NULL DEFAULT '',
+                    preferences TEXT NOT NULL DEFAULT '',
+                    events TEXT NOT NULL DEFAULT '',
+                    relation TEXT NOT NULL DEFAULT '',
+                    intimacy REAL NOT NULL DEFAULT 0.5,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY (group_id, user_id)
+                );
+                """
+            )
+
+    def close(self):
+        with self._lock:
+            if not self._closed:
+                self._closed = True
+                try:
+                    self._db.close()
+                except sqlite3.Error:
+                    pass
 
     # ---- identity ----
     def observe(self, group_id, user_id, name, card="", now=None):
@@ -101,7 +118,7 @@ class PersonStore:
         if not user_id:
             return
         now = time.time() if now is None else now
-        with self._lock:
+        with self._lock, self._db:
             for value, kind in ((name, "nick"), (card, "card")):
                 value = str(value or "").strip()[:40]
                 if not value:
@@ -151,10 +168,14 @@ class PersonStore:
             ).fetchall()
         best, best_score = None, 0.0
         for row in rows:
-            other = row["name"]
+            other = str(row["name"] or "").strip()
+            if not other:
+                continue
             score = similarity(name, other)
-            if name in other or other in name:
-                score = max(score, 0.85)
+            if len(name) >= 2 and len(other) >= 2 and (name in other or other in name):
+                overlap = min(len(name), len(other)) / float(max(len(name), len(other)))
+                if overlap >= 0.5:
+                    score = max(score, 0.85)
             if score > best_score:
                 best, best_score = row["user_id"], score
         return best if best_score >= threshold else None
@@ -189,7 +210,7 @@ class PersonStore:
         if not user_id:
             return {}
         now = time.time() if now is None else now
-        with self._lock:
+        with self._lock, self._db:
             current = self.profile(group_id, user_id)
             merged = {
                 "traits": fields.get("traits", current.get("traits", "")),
@@ -224,7 +245,7 @@ class PersonStore:
         if not old_id or not new_id or old_id == new_id:
             return 0
         moved = 0
-        with self._lock:
+        with self._lock, self._db:
             rows = self._db.execute(
                 "SELECT group_id, name, kind, hits FROM identities WHERE user_id = ?",
                 (old_id,),

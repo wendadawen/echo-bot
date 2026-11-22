@@ -56,8 +56,13 @@ def compact(history, budget_tokens=900, keep_recent=5, self_names=()):
     total_cost = sum(estimate_tokens(_text(row)) for row in rows)
     if total_cost <= budget_tokens:
         return rows, ""
-    tail = rows[-keep_recent:]
-    head = rows[:-keep_recent]
+    keep = max(0, int(keep_recent or 0))
+    if keep == 0:
+        tail = []
+        head = list(rows)
+    else:
+        tail = rows[-keep:]
+        head = rows[:-keep]
     kept = list(tail)
     used = sum(estimate_tokens(_text(row)) for row in tail)
     # 从旧到新挑重要消息补进来，直到预算用完。

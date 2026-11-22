@@ -846,8 +846,10 @@ class TestIncidentRegressions(unittest.TestCase):
             brain.subagent = SubAgentManager()
             dispatched = brain._dispatch_task("g1", "写一个电影控制台网页发我", "demo:group-1")
             self.assertEqual("task", dispatched["reason"])
-            # 确认派发回执也记入历史库，保证后续问答连贯
-            self.assertEqual("我瞅瞅，等会儿", store.recent("g1", 5)[-1]["text"])
+            # 确认调用 Harness 时带系统风格调用提示并记入历史库，保证后续问答连贯
+            expected_notice = "〔系统｜已启动后台工具：写一个电影控制台网页发我 · 限时 180s〕"
+            self.assertEqual(expected_notice, dispatched["text"])
+            self.assertEqual(expected_notice, store.recent("g1", 5)[-1]["text"])
 
             rows = []
             for _ in range(50):
@@ -1211,9 +1213,13 @@ class TestIncidentRegressions(unittest.TestCase):
         brain.subagent = SubAgentManager()
         res = brain.handle_batch(make_batch("你怎么没查？"))
         self.assertEqual("task", res["reason"])
-        self.assertEqual("抱歉刚才漏了，我现在补查。", res["text"])
-        self.assertEqual(["抱歉刚才漏了，我现在补查。"], res["parts"])
-        self.assertEqual("抱歉刚才漏了，我现在补查。", store.recent("g1", 5)[-1]["text"])
+        expected = (
+            "抱歉刚才漏了，我现在补查。\n"
+            "〔系统｜已启动后台工具：调研目前先进的 MoE offloading 论… · 限时 180s〕"
+        )
+        self.assertEqual(expected, res["text"])
+        self.assertEqual([expected], res["parts"])
+        self.assertEqual(expected, store.recent("g1", 5)[-1]["text"])
 
         rows = []
         for _ in range(50):

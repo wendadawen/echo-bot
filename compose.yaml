@@ -1,27 +1,35 @@
-# 一个容器跑整套。所有值都有默认，不建 .env 也能直接跑。
+# 一个容器跑整套，所有持久化数据放在 Docker 命名卷（不挂载宿主机目录）。
 services:
   astrbot:
     image: ${BOT_IMAGE:-ghcr.io/wendadawen/echo-bot:latest}
     container_name: ${CONTAINER_NAME:-echo-bot}
     restart: unless-stopped
+    mem_limit: ${MEM_LIMIT:-4g}
+    pids_limit: ${PIDS_LIMIT:-512}
     environment:
       TZ: ${TZ:-Asia/Shanghai}
       ONEBOT_TOKEN: ${ONEBOT_TOKEN:-}
       NAPCAT_WEBUI_TOKEN: ${NAPCAT_WEBUI_TOKEN:-}
       BOT_QQ: ${BOT_QQ:-}
+      BOT_API_KEY: ${BOT_API_KEY:-}
+      BOT_API_BASE: ${BOT_API_BASE:-}
+      BOT_MODEL: ${BOT_MODEL:-}
+      BOT_HISTORY_LIMIT: ${BOT_HISTORY_LIMIT:-}
+      BOT_TASK_TIMEOUT: ${BOT_TASK_TIMEOUT:-}
       QQ_DEB_AMD64: ${QQ_DEB_AMD64:-}
       QQ_DEB_ARM64: ${QQ_DEB_ARM64:-}
       NAPCAT_ZIP_URL: ${NAPCAT_ZIP_URL:-}
     ports:
-      - "${PANEL_PORT:-6185}:6185" # AstrBot 面板
-      - "${ONEBOT_PORT:-6199}:6199" # OneBot v11 反向 WS
-      - "${NAPCAT_PORT:-6099}:6099" # 扫码登录页
+      - "${BIND_HOST:-127.0.0.1}:${PANEL_PORT:-6185}:6185" # AstrBot 面板
+      - "${BIND_HOST:-127.0.0.1}:${NAPCAT_PORT:-6099}:6099" # 扫码登录页
     volumes:
-      - ./data:/AstrBot/data
-      - ./plugin/astrbot_plugin_echo:/AstrBot/data/plugins/astrbot_plugin_echo
+      - echo_bot_data:/AstrBot/data
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:6185/', timeout=3)"]
       interval: 15s
       timeout: 5s
       retries: 20
       start_period: 300s
+
+volumes:
+  echo_bot_data:

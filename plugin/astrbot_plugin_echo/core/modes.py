@@ -6,6 +6,7 @@
 """
 
 import re
+import threading
 import time
 
 MODES = ("normal", "focus", "quiet")
@@ -43,6 +44,7 @@ class ModePolicy:
 
     def __init__(self, rules=None):
         # rules: [(群或 "*", "23:00-08:00", "quiet"), ...]
+        self._lock = threading.RLock()
         self._state = {}
         self._rules = []
         for group, span, mode in rules or []:
@@ -56,8 +58,9 @@ class ModePolicy:
         hour1, minute1, hour2, minute2 = (int(x) for x in match.groups())
         if hour1 > 23 or hour2 > 23 or minute1 > 59 or minute2 > 59:
             raise ValueError("时间超出范围")
-        self._rules.append((str(group_id or "*"), (hour1, minute1),
-                            (hour2, minute2), name))
+        with self._lock:
+            self._rules.append((str(group_id or "*"), (hour1, minute1),
+                                (hour2, minute2), name))
 
     def set(self, group_id, mode, topic="", ttl=None, now=None):
         name = normalize(mode)
@@ -65,31 +68,36 @@ class ModePolicy:
             raise ValueError("未知模式：{}".format(mode))
         now = time.time() if now is None else now
         until = now + ttl if ttl else 0
-        self._state[str(group_id)] = {
-            "mode": name,
-            "topic": str(topic or "").strip()[:80],
-            "until": until,
-            "set_at": now,
-            "source": "manual",
-        }
+        with self._lock:
+            self._state[str(group_id)] = {
+                "mode": name,
+                "topic": str(topic or "").strip()[:80],
+                "until": until,
+                "set_at": now,
+                "source": "manual",
+            }
         return name
 
     def reset(self, group_id):
-        self._state.pop(str(group_id), None)
+        with self._lock:
+            self._state.pop(str(group_id), None)
 
     def state(self, group_id, now=None):
         now = time.time() if now is None else now
-        row = self._state.get(str(group_id))
-        if row and row["until"] and now >= row["until"]:
-            self._state.pop(str(group_id), None)
-            row = None
-        if row:
-            return dict(row)
-        # 没有手动模式时看时段规则；群专属优先于全局。
-        stamp = time.localtime(now)
-        for group, start, end, mode in self._rules:
-            if group not in ("*", str(group_id)):
-                continue
+        gid = str(group_id)
+        with self._lock:
+            row = self._state.get(gid)
+            if row and row["until"] and now >= row["until"]:
+                self._state.pop(gid, None)
+                row = None
+            if row:
+                return dict(row)
+            # 没有手动模式时看时段规则；群专属优先于全局。
+            stamp = time.localtime(now)
+            rules_ordered = [r for r in self._rules if r[0] == gid] + [
+                r for r in self._rules if r[0] == "*"
+            ]
+        for group, start, end, mode in rules_ordered:
             if in_window(stamp, start, end):
                 return {"mode": mode, "topic": "", "until": 0, "set_at": 0,
                         "source": "rule"}
