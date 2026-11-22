@@ -207,6 +207,11 @@ class TestIncidentRegressions(unittest.TestCase):
         builder = ContextBuilder("persona", None)
         self.assertEqual("", builder._section("effect", "g1", "", "", None))
 
+    def test_persona_does_not_expose_base_model(self):
+        from astrbot_plugin_echo.core.brain import PERSONA
+        self.assertIn("不报", PERSONA)
+        self.assertNotIn("如实回答", PERSONA)
+
     def test_empty_batch_is_silent(self):
         self.assertEqual("empty", make_brain().handle_batch(make_batch(""))["reason"])
 
