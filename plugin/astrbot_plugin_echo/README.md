@@ -22,8 +22,6 @@
 | `reply_chance` | `20` | 非 @ 消息接话概率（%） |
 | `reminder_enabled` | `true` | 定时提醒开关 |
 
-配置 `api_key` 后，`/提醒` 支持自然语言写法，由模型解析并校验后创建。修改配置后需重载插件。
-
 ## 许可
 
 MIT。仓库：https://github.com/wendadawen/echo-bot
