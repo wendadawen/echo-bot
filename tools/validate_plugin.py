@@ -39,6 +39,7 @@ REQUIRED = [
     "core/jargon.py",
     "core/forward.py",
     "core/harness.py",
+    "core/weather.py",
 ]
 
 META_FIELDS = ["name", "display_name", "desc", "version", "author", "repo", "astrbot_version"]
