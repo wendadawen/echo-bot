@@ -167,7 +167,7 @@ class TestBrain(unittest.TestCase):
         store = Store(":memory:")
         brain = Brain(store, model, 0.0)
         result = brain.handle(msg("/提醒 明天下午三点左右提醒我取快递"))
-        self.assertIn("格式：", result["text"])
+        self.assertEqual("没懂", result["text"])
         self.assertEqual([], store.pending_reminders("g1"))
 
     def test_model_gets_command_constraints(self):

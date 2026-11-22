@@ -24,6 +24,20 @@ if [[ ! -d "$DATA/plugins/astrbot_plugin_echo" ]]; then
   cp -a /opt/echo/plugin/astrbot_plugin_echo "$DATA/plugins/"
 fi
 
+# 链接解析插件为第三方 AGPL 项目，源码不进镜像，按固定版本下载到数据卷。
+resolver_ref="${LINK_RESOLVER_REF:-5562b96b5b528a78bd9851197f4ea35d3285d9e4}"
+resolver_dir="$DATA/plugins/astrbot_plugin_link_resolver"
+if [[ ! -f "$resolver_dir/metadata.yaml" ]]; then
+  echo "[bootstrap] 下载链接解析插件"
+  curl -fL --retry 3 -o "$CACHE/link_resolver.tar.gz" \
+    "https://github.com/vacacia/astrbot_plugin_link_resolver/archive/${resolver_ref}.tar.gz"
+  rm -rf "$CACHE/link_resolver" "$resolver_dir"
+  mkdir -p "$CACHE/link_resolver"
+  tar -xzf "$CACHE/link_resolver.tar.gz" -C "$CACHE/link_resolver" --strip-components=1
+  mv "$CACHE/link_resolver" "$resolver_dir"
+  echo "[bootstrap] 链接解析插件就绪"
+fi
+
 if [[ ! -f "$APP/loadNapCat.cjs" ]]; then
   echo "[bootstrap] 第一次启动，下载 QQ 客户端（$arch）和 NapCat，可能要几分钟"
   curl -fL --retry 3 -o "$CACHE/qq.deb" "$qq_url"

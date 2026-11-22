@@ -65,6 +65,9 @@ class Echo(Star):
         text = (event.get_message_str() or "").strip()
         if not text:
             return
+        # 含链接的消息交给链接解析插件，本插件不抢答、也不阻断后续处理。
+        if "http://" in text or "https://" in text:
+            return
         message = Message(
             group_id="{}:{}".format(event.get_platform_name(), event.get_group_id() or ""),
             user_id=sender,
