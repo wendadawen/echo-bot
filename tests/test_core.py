@@ -1,9 +1,11 @@
 """核心逻辑单测：不安装 AstrBot、不联网、全部使用内存数据库。"""
 
+import json
 import sys
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugin"))
 
@@ -11,6 +13,20 @@ from astrbot_plugin_echo.core.brain import Brain  # noqa: E402
 from astrbot_plugin_echo.core.messages import Message  # noqa: E402
 from astrbot_plugin_echo.core.models import MockModel, OpenAIModel, build_model  # noqa: E402
 from astrbot_plugin_echo.core.store import Store  # noqa: E402
+
+
+class FakeResponse:
+    def __init__(self, payload):
+        self.payload = json.dumps(payload).encode("utf-8")
+
+    def read(self):
+        return self.payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
 
 
 def make_brain(chance=0.0):
@@ -80,6 +96,20 @@ class TestBrain(unittest.TestCase):
             self.assertEqual("mention", result["reason"])
             self.assertNotIn("记住了", result["text"])
 
+    def test_model_error_stays_silent(self):
+        class BrokenModel:
+            name = "broken"
+
+            def reply(self, system, history, user_text):
+                raise RuntimeError("boom")
+
+        store = Store(":memory:")
+        brain = Brain(store, BrokenModel(), 1.0)
+        result = brain.handle(msg("你好"))
+        self.assertFalse(result["replied"])
+        self.assertEqual("model_error", result["reason"])
+        self.assertIn("boom", result["error"])
+
 
 class TestModels(unittest.TestCase):
     def test_default_is_mock(self):
@@ -93,6 +123,20 @@ class TestModels(unittest.TestCase):
     def test_mock_model_is_deterministic(self):
         m = MockModel()
         self.assertEqual("在呢，怎么啦？", m.reply("人设", [], "在吗"))
+
+    def test_null_content_falls_back_to_reasoning(self):
+        model = OpenAIModel("key", "http://example/v1", "demo")
+        payload = {"choices": [{"message": {"role": "assistant", "content": None,
+                                            "reasoning_content": "想了一下"}}]}
+        with patch("urllib.request.urlopen", return_value=FakeResponse(payload)):
+            self.assertEqual("想了一下", model.reply("人设", [], "你好"))
+
+    def test_empty_response_raises_clear_error(self):
+        model = OpenAIModel("key", "http://example/v1", "demo")
+        payload = {"choices": [{"message": {"role": "assistant", "content": None}}]}
+        with patch("urllib.request.urlopen", return_value=FakeResponse(payload)):
+            with self.assertRaises(RuntimeError):
+                model.reply("人设", [], "你好")
 
 
 if __name__ == "__main__":

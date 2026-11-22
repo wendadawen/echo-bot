@@ -45,7 +45,13 @@ class Brain:
         try:
             reply = self.model.reply(self.persona, history, text)
         except Exception as exc:
-            reply = "（模型没连上：{}）".format(exc)
+            # 模型出错时保持安静，不把内部错误发到群里；由插件层记日志。
+            return {
+                "replied": False,
+                "text": "",
+                "reason": "model_error",
+                "error": str(exc),
+            }
         self.store.add_message(msg.group_id, "bot", "回声", "bot", reply)
         return {
             "replied": True,

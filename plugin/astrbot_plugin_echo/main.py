@@ -75,6 +75,8 @@ class Echo(Star):
         )
         # 核心层是同步的纯逻辑；模型网络请求放在线程里，避免阻塞事件循环。
         result = await asyncio.to_thread(self.brain.handle, message)
+        if result.get("reason") == "model_error":
+            logger.error("模型调用失败：%s", result.get("error"))
         if not result["replied"]:
             return
         event.stop_event()

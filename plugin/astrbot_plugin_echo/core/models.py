@@ -70,7 +70,17 @@ class OpenAIModel(BaseModel):
         )
         with urllib.request.urlopen(req, timeout=self.timeout) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-        return data["choices"][0]["message"]["content"].strip()
+        choices = data.get("choices") or []
+        if not choices:
+            raise RuntimeError("模型未返回候选结果")
+        message = choices[0].get("message") or {}
+        content = message.get("content")
+        if not isinstance(content, str):
+            content = message.get("reasoning_content") or message.get("text") or ""
+        text = content.strip() if isinstance(content, str) else str(content).strip()
+        if not text:
+            raise RuntimeError("模型返回空内容")
+        return text
 
 
 def build_model(config=None):
