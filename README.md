@@ -38,7 +38,6 @@ docker compose logs --tail 100 astrbot
 | `api_base` | `https://api.openai.com/v1` | OpenAI 兼容接口地址 |
 | `model` | `gpt-4o-mini` | 模型 ID |
 | `reply_chance` | `20` | 非 @ 消息接话概率（%） |
-| `persona` | 内置人设 | 系统提示词 |
 | `reminder_enabled` | `true` | 定时提醒开关 |
 
 配置 `api_key` 后，`/提醒` 也支持自然语言写法，由模型解析并校验后创建。修改配置后需重载插件或执行 `docker compose restart`。将机器人账号加入群聊，在群内 @ 发送 `/帮助` 验证。插件仅处理群消息。

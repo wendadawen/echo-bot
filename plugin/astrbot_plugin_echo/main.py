@@ -40,7 +40,7 @@ class Echo(Star):
             self.store,
             self.model,
             chance=int(self.config.get("reply_chance", 20)) / 100.0,
-            persona=str(self.config.get("persona") or PERSONA),
+            persona=PERSONA,
         )
         self.reminders_enabled = bool(self.config.get("reminder_enabled", True))
         self._reminder_task = None
