@@ -120,9 +120,12 @@ COMMANDS = (
 
 HELP = "\n".join("/{}  {}".format(name, desc) for name, desc in COMMANDS)
 
-# 第一层：代码直接拦住明确的任务请求，不给模型自由回答的机会。
-TASK_HINTS = (
-    "查询", "查一下", "查查", "搜一下", "搜索", "帮我查", "实时", "最新", "天气",
+# 第一层：只放常见、明确的任务词，避免「今天天气不错」也被当成任务。
+TASK_HINTS = ("查询", "查一下", "搜一下", "搜索", "帮我查", "实时", "最新")
+# 交给 Codex 的固定前缀：约束口吻和格式，内容不变，不影响缓存前缀。
+TASK_PREFIX = (
+    "用群聊里说话的口吻回答，一两句，短句，不要 markdown、latex、代码块、"
+    "标题、列表，不要贴命令、日志或数据来源。任务："
 )
 # 第三层：模型仍然说查不了时的兜底话术。
 REFUSAL_HINTS = (
@@ -454,7 +457,7 @@ class Brain:
 
         def runner(prompt):
             if self.harness and self.harness.available():
-                result = self.harness.run(group, prompt)
+                result = self.harness.run(group, TASK_PREFIX + prompt)
                 if result:
                     return result
             return self.model.reply(self.persona, [], prompt)[:600]
@@ -463,7 +466,7 @@ class Brain:
         if not task_id:
             return {}
         self._task_targets[task_id] = (group, umo)
-        return {"replied": True, "text": "放后台了，跑完发群里", "reason": "task"}
+        return {"replied": True, "text": "行，我去查，等我一下", "reason": "task"}
 
     def spontaneous(self, group, umo=""):
         """群安静太久时主动开一句；失败或像客服就保持沉默。"""

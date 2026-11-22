@@ -12,15 +12,29 @@ from dataclasses import dataclass, field
 from .expression import delay as expression_delay
 from .expression import split as expression_split
 
-MARK_PATTERN = re.compile(r"^#+\s*")
+MARK_PATTERN = re.compile(r"^#+\s*", re.M)
+LIST_PATTERN = re.compile(r"^\s*[-*+]\s+", re.M)
+CODE_BLOCK = re.compile(r"```.*?```", re.S)
+LATEX_PATTERNS = (
+    re.compile(r"\$\$(.+?)\$\$", re.S),
+    re.compile(r"\\\[(.*?)\\\]", re.S),
+    re.compile(r"\\\((.*?)\\\)", re.S),
+    re.compile(r"\$([^$\n]+)\$"),
+)
+LINK_PATTERN = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 
 
 def clean(part):
-    """去掉模型偶尔带出的反引号、粗体和标题记号。"""
+    """去掉 QQ 不认识的 markdown / latex / 代码块，公式保留内容。"""
     text = str(part or "").strip()
-    text = text.strip("`").strip()
-    text = text.replace("**", "")
+    text = CODE_BLOCK.sub("", text)
+    for pattern in LATEX_PATTERNS:
+        text = pattern.sub(r"\1", text)
+    text = LINK_PATTERN.sub(r"\1", text)
     text = MARK_PATTERN.sub("", text)
+    text = LIST_PATTERN.sub("", text)
+    text = text.replace("**", "").replace("`", "")
+    text = re.sub(r"\n{2,}", "\n", text)
     return text.strip()
 
 
