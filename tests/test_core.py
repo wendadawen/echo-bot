@@ -94,7 +94,7 @@ class TestBrain(unittest.TestCase):
         self.assertIn("不说了", brain.handle(msg("/闭嘴"))["text"])
         self.assertFalse(brain.handle(msg("随便聊聊"))["replied"])
         self.assertFalse(brain.handle(msg("在吗", mentioned=False))["replied"])
-        self.assertIn("说", brain.handle(msg("/说话"))["text"])
+        self.assertIn("回来", brain.handle(msg("/说话"))["text"])
         self.assertTrue(brain.handle(msg("在吗"))["replied"])
 
     def test_commands_still_work_while_muted(self):
