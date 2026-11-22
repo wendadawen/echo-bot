@@ -51,14 +51,40 @@ def msg(text, mentioned=True, group="g1", umo="demo:group-1"):
 
 
 class TestBrain(unittest.TestCase):
-    def test_mention_forces_reply_and_probability(self):
+    def test_mention_forces_reply_and_fallback(self):
         store, brain = make_brain(0.0)
+        brain.window = 0
+        brain.cooldown = 0
         self.assertFalse(brain.handle(msg("今天好累", mentioned=False))["replied"])
         r = brain.handle(msg("今天好累"))
         self.assertTrue(r["replied"])
         self.assertEqual("mention", r["reason"])
         brain.chance = 1.0
         self.assertTrue(brain.handle(msg("再来一句", mentioned=False))["replied"])
+
+    def test_window_keeps_conversation_going(self):
+        store, brain = make_brain(0.0)
+        brain.cooldown = 0
+        self.assertEqual("mention", brain.handle(msg("在吗"))["reason"])
+        self.assertEqual("window", brain.handle(msg("今天好累", mentioned=False))["reason"])
+
+    def test_idle_chatter_stays_silent(self):
+        store, brain = make_brain(0.0)
+        brain.window = 0
+        self.assertFalse(brain.handle(msg("哈哈", mentioned=False))["replied"])
+
+    def test_question_replies_outside_window(self):
+        store, brain = make_brain(0.0)
+        brain.window = 0
+        r = brain.handle(msg("这是怎么回事", mentioned=False))
+        self.assertTrue(r["replied"])
+        self.assertEqual("question", r["reason"])
+
+    def test_cooldown_silences_immediate_followup(self):
+        store, brain = make_brain(0.0)
+        brain.window = 0
+        self.assertEqual("question", brain.handle(msg("怎么了", mentioned=False))["reason"])
+        self.assertFalse(brain.handle(msg("在吗", mentioned=False))["replied"])
 
     def test_reply_is_written_to_history(self):
         store, brain = make_brain()

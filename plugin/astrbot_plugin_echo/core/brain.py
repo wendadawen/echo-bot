@@ -91,13 +91,26 @@ CN_HOUR = {
     "十一": 11, "十二": 12,
 }
 
+# 被点名后进入短对话窗口；刚说过话则安静一会儿。
+WINDOW_SECONDS = 240
+COOLDOWN_SECONDS = 20
+QUESTION_MARKS = (
+    "?", "？", "吗", "呢", "怎么", "为什么", "是不是", "能不能",
+    "有没有", "要不要", "什么", "啥", "谁",
+)
+
 
 class Brain:
-    def __init__(self, store, model, chance=0.2, persona=PERSONA):
+    def __init__(self, store, model, chance=0.0, persona=PERSONA,
+                 window=WINDOW_SECONDS, cooldown=COOLDOWN_SECONDS):
         self.store = store
         self.model = model
         self.chance = chance
         self.persona = persona or PERSONA
+        self.window = window
+        self.cooldown = cooldown
+        self._windows = {}
+        self._last_reply = {}
 
     def handle(self, msg):
         """处理一条群消息；返回回复文本，由平台层负责真正发送。"""
@@ -106,15 +119,19 @@ class Brain:
             msg.group_id, msg.user_id, msg.user_name, "user", msg.text, msg.ts
         )
         text = msg.text.strip()
+        now = time.time()
+        if msg.mentioned:
+            self._windows[msg.group_id] = now + self.window
         direct = self._command(msg, text)
         if direct is not None:
             self.store.add_message(msg.group_id, "bot", "回声", "bot", direct)
+            self._last_reply[msg.group_id] = now
             return {"replied": True, "text": direct, "reason": "command"}
         if not text:
             return {"replied": False, "text": "", "reason": "empty"}
 
-        should_reply = msg.mentioned or (random.random() < self.chance)
-        if not should_reply:
+        reason = self._should_reply(msg, text, now)
+        if not reason:
             return {"replied": False, "text": "", "reason": "skipped"}
 
         try:
@@ -131,11 +148,26 @@ class Brain:
         if any(word in reply for word in SOFT_WORDS):
             reply = random.choice(HARD_REPLIES)
         self.store.add_message(msg.group_id, "bot", "回声", "bot", reply)
-        return {
-            "replied": True,
-            "text": reply,
-            "reason": "mention" if msg.mentioned else "chance",
-        }
+        self._last_reply[msg.group_id] = now
+        return {"replied": True, "text": reply, "reason": reason}
+
+    def _should_reply(self, msg, text, now):
+        """按对话节奏决定是否开口；返回原因，None 表示保持沉默。"""
+        if msg.mentioned:
+            return "mention"
+        if now - self._last_reply.get(msg.group_id, 0) < self.cooldown:
+            return None
+        if now < self._windows.get(msg.group_id, 0):
+            return "window"
+        if self._worth_replying(text):
+            return "question"
+        if self.chance and random.random() < self.chance:
+            return "fallback"
+        return None
+
+    @staticmethod
+    def _worth_replying(text):
+        return "回声" in text or any(k in text for k in QUESTION_MARKS)
 
     def tick(self, now=None):
         """返回到点的提醒。一次性提醒标记完成；每天提醒只在当天首次触发。"""

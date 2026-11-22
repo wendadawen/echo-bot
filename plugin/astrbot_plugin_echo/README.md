@@ -19,7 +19,7 @@
 | `api_key` | 空 | 模型凭据；留空使用内置模拟回复 |
 | `api_base` | `https://api.openai.com/v1` | OpenAI 兼容接口地址 |
 | `model` | `gpt-4o-mini` | 模型 ID |
-| `reply_chance` | `20` | 非 @ 消息接话概率（%） |
+| `reply_chance` | `0` | 兜底接话概率（%） |
 | `reminder_enabled` | `true` | 定时提醒开关 |
 
 ## 许可

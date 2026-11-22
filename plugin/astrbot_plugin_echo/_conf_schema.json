@@ -1,9 +1,9 @@
 {
   "reply_chance": {
-    "description": "普通群消息主动接话概率（%）",
+    "description": "兜底接话概率（%）",
     "type": "int",
-    "default": 20,
-    "hint": "0 表示只有 @ 或命令才回复，100 表示每条都回。真正 @ 和命令不受此值影响。"
+    "default": 0,
+    "hint": "0 表示不随机接话；大于 0 时仅作为最后兜底。@、问句、对话窗口不受此值影响。"
   },
   "api_base": {
     "description": "模型接口地址（OpenAI 兼容）",
