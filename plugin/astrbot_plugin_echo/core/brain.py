@@ -2,6 +2,7 @@
 
 import json
 import re
+import threading
 import time
 from datetime import datetime, timedelta
 
@@ -99,6 +100,7 @@ FILTER_WORDS = (
 )
 
 REPEAT_WINDOW = 30
+SUMMARY_INTERVAL = 600
 
 
 def _repeat_key(group_id, user_id, text):
@@ -195,12 +197,12 @@ class Brain:
         self.harness = harness
         self._task_targets = {}
         self._repeat_seen = {}
+        self._summary_lock = threading.Lock()
         self.context_builder = ContextBuilder(
             self.persona, memory, self.style, attention=attention,
             modes=modes, persons=persons,
         )
         self.tool_loop = ToolLoop(model, capabilities=self.capabilities)
-        self._batch_count = 0
 
     def handle(self, msg):
         """处理一条群消息；返回回复文本，由平台层负责真正发送。"""
@@ -430,9 +432,7 @@ class Brain:
             self.memory.record_reply(group, reply)
         learn_expressions(text[:12], reply, self.expressions)
         self.store.add_message(group, "bot", "大肥鱼", "bot", reply)
-        self._batch_count += 1
-        if self.memory and self._batch_count % 4 == 0:
-            self._summarize(group, text)
+        self._maybe_summarize(group, text)
         planned = display_plan(reply, elapsed=elapsed)
         if self.monitor:
             tokens = (compaction.estimate_tokens(system)
@@ -508,6 +508,24 @@ class Brain:
                 "error": task.get("error") or "",
             })
         return rows
+
+    def _maybe_summarize(self, group, text):
+        """距上次摘要超过 10 分钟才跑一次；用数据库时间判断，重启也不会重复。"""
+        if not self.memory:
+            return
+        last = self.memory.last_episode_at(group)
+        if last and time.time() - last < SUMMARY_INTERVAL:
+            return
+        if not self._summary_lock.acquire(blocking=False):
+            return
+
+        def work():
+            try:
+                self._summarize(group, text)
+            finally:
+                self._summary_lock.release()
+
+        threading.Thread(target=work, name="echo-summary", daemon=True).start()
 
     def _summarize(self, group, text):
         """每隔几批把对话压成 Episode / 记忆点 / 人物档案 / 关系。"""

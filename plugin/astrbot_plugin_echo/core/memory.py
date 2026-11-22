@@ -192,6 +192,14 @@ class Memory:
                         table, name, ddl))
 
     # ---- Episode ----
+    def last_episode_at(self, group_id):
+        """最近一条情节的时间，用来判断摘要间隔，重启后仍然有效。"""
+        row = self._db.execute(
+            "SELECT MAX(created_at) FROM episodes WHERE group_id = ?",
+            (str(group_id),),
+        ).fetchone()
+        return float(row[0] or 0.0)
+
     def add_episode(self, group_id, text, now=None, source="", external_id=""):
         if not text:
             return
