@@ -127,6 +127,11 @@ class TestIncidentRegressions(unittest.TestCase):
         from astrbot_plugin_echo.core.actions import ACTIONS
         self.assertEqual("subagent", ACTIONS[0])
 
+    def test_task_prefix_has_no_search_recipe(self):
+        from astrbot_plugin_echo.core.brain import TASK_PREFIX
+        self.assertNotIn("duckduckgo", TASK_PREFIX.lower())
+        self.assertNotIn("curl", TASK_PREFIX.lower())
+
     def test_task_prefix_allows_code(self):
         from astrbot_plugin_echo.core.brain import TASK_PREFIX
         self.assertIn("代码", TASK_PREFIX)
