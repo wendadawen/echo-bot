@@ -487,19 +487,22 @@ class Brain:
         return line
 
     def poll_subagents(self):
-        """后台任务完成后取回结论，交给平台层发回原群。"""
+        """后台任务完成后取回结论；失败也回一句，别让群里干等。"""
         if not self.subagent:
             return []
         rows = []
         for task in self.subagent.poll():
             target = self._task_targets.pop(task["id"], None)
-            if not target or not task.get("result"):
+            if not target:
                 continue
+            ok = task.get("status") == "completed" and bool(task.get("result"))
             rows.append({
                 "group": target[0],
                 "umo": target[1],
-                "text": task["result"],
+                "text": task["result"] if ok else "没办成，那边没给结果",
                 "task": task["id"],
+                "ok": ok,
+                "error": task.get("error") or "",
             })
         return rows
 

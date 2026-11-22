@@ -169,6 +169,22 @@ class TestTaskRouting(unittest.TestCase):
         self.assertEqual("task", result["reason"])
         self.assertTrue(result["text"])
 
+    def test_failed_task_reports_to_group(self):
+        def boom(prompt):
+            raise RuntimeError("炸了")
+
+        task_id = self.brain.subagent.submit("chat", "查天气", boom)
+        self.brain._task_targets[task_id] = ("g1", "demo:group-1")
+        rows = []
+        for _ in range(50):
+            rows = self.brain.poll_subagents()
+            if rows:
+                break
+            time.sleep(0.05)
+        self.assertEqual(1, len(rows))
+        self.assertFalse(rows[0]["ok"])
+        self.assertIn("没办成", rows[0]["text"])
+
     def test_refusal_falls_back_to_task(self):
         class RefuseModel:
             def reply(self, system, history, user_text):
