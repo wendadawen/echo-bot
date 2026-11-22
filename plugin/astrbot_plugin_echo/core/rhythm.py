@@ -72,7 +72,10 @@ class Batch:
 
     @property
     def text(self):
-        return "\n".join("{}：{}".format(i.user_name, i.text) for i in self.items)
+        return "\n".join(
+            "{}：{}".format(i.user_name, i.text)
+            for i in self.items if str(i.text or "").strip()
+        )
 
     @property
     def last_user(self):

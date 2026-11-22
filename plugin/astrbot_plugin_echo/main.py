@@ -187,6 +187,8 @@ class Echo(Star):
         return
 
     async def _collect_image(self, group_id, part):
+        if not self.emoji_bank:
+            return
         url = str(getattr(part, "url", "") or "")
         data = b""
         if url.startswith("http"):
@@ -295,10 +297,14 @@ class Echo(Star):
                         continue
                     elapsed = float(result.get("elapsed") or 0.0)
                     if result.get("face"):
-                        await self.context.send_message(
-                            batch.umo,
-                            MessageChain([Face(id=int(result["face"]))]),
-                        )
+                        try:
+                            face = Face(id=int(result["face"]))
+                        except (TypeError, ValueError):
+                            face = None
+                        if face is not None:
+                            await self.context.send_message(
+                                batch.umo, MessageChain([face])
+                            )
                     elif result.get("image"):
                         await self._send_image(group, batch.umo, result["image"])
                     else:

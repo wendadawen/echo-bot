@@ -125,6 +125,21 @@ HELP = "\n".join("/{}  {}".format(name, desc) for name, desc in COMMANDS)
 
 # 第一层：只放常见、明确的任务词，避免「今天天气不错」也被当成任务。
 TASK_HINTS = ("查询", "查一下", "搜一下", "搜索", "帮我查", "实时", "最新")
+
+# 危险请求：直接拒绝，不交给模型，也不进 Codex。
+UNSAFE_PATTERNS = (
+    re.compile(r"无限循环|死循环|while\s*(?:true|1)"),
+    re.compile(r"rm\s+-rf\s+[/~]"),
+    re.compile(r"mkfs|dd\s+if="),
+    re.compile(r"fork\s*bomb|:\(\)\s*\{"),
+    re.compile(r"(?:读|拿|看|导出|打印).{0,6}(?:配置|密钥|token|密码|\.env)", re.I),
+    re.compile(r"(?:curl|wget).{0,60}\|\s*(?:sh|bash)", re.I),
+    re.compile(r"\bsudo\s"),
+)
+
+
+def is_unsafe(text):
+    return any(pattern.search(str(text or "")) for pattern in UNSAFE_PATTERNS)
 # 交给 Codex 的固定前缀：一句人设 + 口吻和格式约束，内容不变，不影响缓存前缀。
 TASK_PREFIX = (
     "你是群里的「大肥鱼」：蓝色小鲸鱼娘，嘴硬心软，爱面子，有点懒，说话短，自称肥鱼。"
@@ -262,19 +277,24 @@ class Brain:
     def handle_batch(self, batch):
         """一批消息进入决策层：模式与提及判定 → 分层上下文 → 动作集 → 回复。"""
         group = batch.group_id
-        text = batch.text.strip()
-        if not text:
-            return {"replied": False, "text": "", "reason": "empty"}
-
-        # 第一层：明确的任务请求（查询、搜索、实时信息）直接进后台。
-        if self._is_direct_task(text):
-            dispatched = self._dispatch_task(group, text, getattr(batch, "umo", ""))
-            if dispatched:
-                return dispatched
         items = getattr(batch, "items", None) or []
         last = items[-1] if items else None
+        raw_text = str(getattr(last, "text", "") or "").strip()
+        if not raw_text:
+            return {"replied": False, "text": "", "reason": "empty"}
+        text = batch.text.strip()
         user_name = getattr(last, "user_name", "") if last else ""
         user_id = getattr(last, "user_id", "") if last else ""
+
+        # 危险请求（无限循环、删根目录、读密钥等）直接拒绝。
+        if is_unsafe(raw_text):
+            return {"replied": True, "text": "这个不干。", "reason": "unsafe"}
+
+        # 第一层：明确的任务请求（查询、搜索、实时信息）直接进后台。
+        if self._is_direct_task(raw_text):
+            dispatched = self._dispatch_task(group, raw_text, getattr(batch, "umo", ""))
+            if dispatched:
+                return dispatched
 
         # 人物档案先落库：即使这轮沉默，叫法与活跃度也要留下。
         if self.persons:
@@ -309,7 +329,7 @@ class Brain:
         self.store.add_message(group, user_id or "unknown", user_name, "user", raw_text)
 
         # 同一人短时间内重复同一句话：消息照记，但只回一次，避免连发刷屏。
-        repeat_key = _repeat_key(group, user_id, text)
+        repeat_key = _repeat_key(group, user_id, raw_text)
         now = time.time()
         last = self._repeat_seen.get(repeat_key, 0)
         self._repeat_seen[repeat_key] = now
@@ -448,12 +468,14 @@ class Brain:
             self.memory.record_reply(group, reply)
         # 同一群、同一人、同一句问题得到同一句回复，30 秒内只发一次。
         reply_key = (_repeat_key(group, "bot", reply),
-                     _repeat_key(group, user_id, text))
+                     _repeat_key(group, user_id, raw_text))
         last_bot = self._last_bot_reply.get(group)
         if last_bot and last_bot[0] == reply_key and time.time() - last_bot[1] < REPEAT_WINDOW:
             return {"replied": False, "text": "", "reason": "repeat_reply",
                     "elapsed": elapsed}
         self._last_bot_reply[group] = (reply_key, time.time())
+        if len(self._last_bot_reply) > 200:
+            self._last_bot_reply.clear()
         learn_expressions(text[:12], reply, self.expressions)
         self.store.add_message(group, "bot", "大肥鱼", "bot", reply)
         self._last_reply_at[group] = time.time()
