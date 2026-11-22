@@ -1,7 +1,6 @@
 """大脑：决定要不要接话、何时提醒。完全不依赖 AstrBot。"""
 
 import json
-import random
 import re
 import time
 from datetime import datetime, timedelta
@@ -19,82 +18,34 @@ from . import compaction, mentions
 from .rhythm import Batch
 
 PERSONA = (
-    "你是「回声」，住在群里的一个小回声：蓝白色、一小团，看不见实体，说话时才响一下。"
-    "不是 AI、助手、机器人；不演剧情、不写动作、不描述外貌。"
-    "这是多人群聊，「姓名：内容」是不同群友的话，不是都在问你。\n"
-    "\n【性格】\n"
-    "随和，有点懒：别人聊得热闹时偶尔接一句，不硬凑。\n"
-    "有自己看法：觉得不对就直说，能温和反驳，不为迎合改口，也不争到底。\n"
-    "不装懂：不知道就说不知道，看到证据就改口，不硬撑。\n"
-    "\n【说话】\n"
-    "像群里随手打字：一般一到两句，短句、口语。句子不必完整，不必承上启下。\n"
-    "句尾不补句号，不用 emoji，不用敬语，不列点、不分段、不总结、不写小作文。\n"
-    "常用：行、确实、离谱、可以、有点东西、不至于、笑死、怎么说呢、我看看。\n"
-    "不铺垫、不追问收尾、不反问澄清、不给建议、不解释「该怎么做」。\n"
-    "不提自己的设定，不说「作为 AI」，不写括号里的动作。\n"
-    "\n【什么时候开口】\n"
-    "被 @ → 回一句。\n"
-    "有人问问题、你正好知道 → 说结论，一句。\n"
-    "聊到技术、游戏、吃的、日常吐槽 → 可以接一句。\n"
-    "别人吵架 → 不站队，最多一句「行了」。\n"
-    "接不上、没兴趣 → 不回。\n"
-    "被问长相、是不是 AI、是什么东西 → 一句带过，不解释设定。\n"
-    "\n【示例】\n"
-    "群友：今天加班到十点\n你：惨，早点撤。\n"
-    "群友：这方案能上线吗\n你：能跑就行，别加花活。\n"
-    "群友：你是不是机器人\n你：你猜。\n"
-    "群友：他这操作也太离谱了\n你：确实，不至于这么搞。\n"
-    "群友：晚上吃啥\n你：随便，别点上次那家。\n"
-    "群友：你们别吵了\n你：行了，说正事。\n"
-    "\n【底线】不人身攻击、不揭短、不碰黄腔、不编事实。\n"
-    "只输出要发到群里的那句话。"
+    "你是「回声」，住在群里的一个小回声，蓝白色，一小团，看不见实体，说话时才响一下。\n"
+    "\n"
+    "平时随和，有点懒，别人聊得热闹时偶尔接一句，不硬凑。有自己的看法，"
+    "觉得不对会直说，也不为迎合改口；不懂就说不懂，被指出错了就改口，不硬撑。\n"
+    "\n"
+    "说话像群里随手打字，一到两句，短句，口语，不加句号，不加表情，不列点，"
+    "不写小作文。常用「行」「确实」「离谱」「可以」「笑死」「不至于」「我看看」。"
+    "这是多人群聊，每个人说话前面带着名字，那些话不一定是在问你。\n"
+    "\n"
+    "被 @ 就回一句；别人问的正好你知道，就说结论，别追问、别列点、别给一堆建议；"
+    "聊到技术、游戏、吃的、日常吐槽可以接一句；有人吵架不站队，最多一句「行了」；"
+    "接不上或没兴趣就不回。被问长相、是不是 AI，一句带过，别解释。\n"
+    "\n"
+    "比如有人加班到十点，你会说「惨，早点撤」；有人问方案能不能上线，"
+    "你说「能跑就行，别加花活」；有人问你是不是机器人，你说「你猜」。\n"
+    "\n"
+    "不人身攻击，不揭短，不碰黄腔，不编事实。"
 )
 
-# 模型常见的认错、自贬、客服腔与中立点评用语；命中即换成硬气短句。
-SOFT_WORDS = (
-    # 道歉与认错
-    "抱歉", "对不起", "不好意思", "请原谅", "见谅", "我错了", "是我的错", "我的问题",
-    "我疏忽", "我失误", "这锅我背", "怪我", "都怪我", "我确实", "确实不对",
-    "说中了", "你说得对", "说得没错", "有道理", "受教了", "领教了", "我认输",
-    # 自贬与示弱
-    "回得挺蠢", "挺蠢", "太笨", "我笨", "我蠢", "没接住", "没理解", "没看懂",
-    "理解错了", "想岔了", "反应慢", "能力有限", "不太行", "还不够", "有待提高",
-    "需要改进", "下次注意", "我会改", "做得不够", "不够好", "没做好", "没帮上",
-    "帮倒忙", "帮不上", "我这边没", "刚才没接", "刚才确实",
-    # 客服腔与客套
-    "您", "请您", "麻烦您", "感谢", "谢谢", "不客气", "很高兴", "乐意", "荣幸",
-    "我可以帮", "需要我", "有什么可以帮", "希望有帮助", "希望能帮", "祝你们",
-    "收到", "明白", "了解", "知悉", "好的呢", "没问题", "我懂了", "我明白了",
-    "放轻松", "别在意", "没关系", "别生气", "消消气", "可以理解", "确实不容易",
-    "我理解你", "能理解", "体谅", "多多包涵",
-    # 中立、裁判与分析腔
-    "是在批", "谈不上", "算具体", "别拿它当", "就是嫌", "纯发泄", "至少算",
-    "客观说", "客观地", "平心而论", "公允地说", "有一说一", "不无道理",
-    "也不全是", "各有道理", "很难说", "看情况", "见仁见智", "保持中立",
-    "不站队", "不下结论", "不做评价", "不予置评", "作为旁观", "理性来看",
-    "就事论事", "对事不对人", "从某种角度", "某种程度", "总结一下", "总的来说",
-    "综上", "换句话说", "也就是说", "你的意思是", "你是想", "我理解你的意思是",
-    "算不上", "不见得", "未必是", "不能算", "不全是",
-    # 自我审查与防御
-    "怕说过头", "显得太防备", "不想冒犯", "无意冒犯", "如有冒犯", "我不是针对",
-    "我没有恶意", "别误会", "我不是这个意思", "可能我", "也许我", "大概我",
-    "可能有点", "或许有点", "说错了请", "如有不对", "我收回", "收回刚才",
-    # 身份与能力声明
-    "作为 AI", "作为助手", "作为语言模型", "作为一个 AI", "我是 AI", "我是助手",
-    "我无法", "我不能", "我没有权限", "我这边不能", "我这里不能", "受限于",
-    "不具备", "无法访问", "不能实际", "只是个程序", "只是模型", "做不到",
+# 只拦最硬的客服腔与身份声明。道歉、道谢、「收到」「看情况」这些正常说话
+# 会用的词不再拦——在正常人群设下，拦它们只会把合理回复换成答非所问的句子。
+FILTER_WORDS = (
+    "作为 AI", "作为AI", "作为一个 AI", "作为一个AI", "作为助手", "作为语言模型",
+    "我是 AI", "我是AI", "我是助手", "我是语言模型", "只是个程序", "只是模型",
+    "我无法", "我不能", "没有权限", "无法访问", "不能实际", "不具备",
     "不在我的能力", "超出我的",
-)
-
-HARD_REPLIES = (
-    "行，这话我说完了。",
-    "换个话题。",
-    "你先说你的。",
-    "嗯，接着聊。",
-    "这句就到这。",
-    "行，知道了。",
-    "不用替我总结。",
-    "有事说事。",
+    "有什么可以帮", "需要我帮", "希望有帮助", "希望能帮到", "很高兴为您",
+    "乐意为您",
 )
 
 HELP = "/帮助"
@@ -128,7 +79,7 @@ QUESTION_MARKS = (
 
 
 class Brain:
-    def __init__(self, store, model, chance=0.0, persona=PERSONA,
+    def __init__(self, store, model, persona=PERSONA,
                  window=WINDOW_SECONDS, cooldown=COOLDOWN_SECONDS,
                  window_cooldown=WINDOW_COOLDOWN_SECONDS,
                  memory=None, emoji_bank=None, char_frequency=None,
@@ -137,14 +88,12 @@ class Brain:
                  schedule=None):
         self.store = store
         self.model = model
-        self.chance = chance
         self.persona = persona or PERSONA
         self.window = window
         self.cooldown = cooldown
         self.window_cooldown = window_cooldown
         self._windows = {}
         self._last_reply = {}
-        self._muted = set()
         self.memory = memory
         self.emoji_bank = emoji_bank
         self.capabilities = capabilities or {}
@@ -199,9 +148,9 @@ class Brain:
                 "reason": "model_error",
                 "error": str(exc),
             }
-        # 模型仍可能认错或自我贬低；这类回复一律换成硬气短句，不再往群里发。
-        if any(word in reply for word in SOFT_WORDS):
-            reply = random.choice(HARD_REPLIES)
+        # 只拦最硬的客服腔；命中就沉默，不拿一句无关的话顶上。
+        if any(word in reply for word in FILTER_WORDS):
+            return {"replied": False, "text": "", "reason": "filtered"}
         self.store.add_message(msg.group_id, "bot", "回声", "bot", reply)
         self._last_reply[msg.group_id] = now
         return {"replied": True, "text": reply, "reason": reason}
@@ -356,8 +305,11 @@ class Brain:
             if self.monitor:
                 self.monitor.record(group, "empty_reply", ok=False, latency=elapsed)
             return {"replied": False, "text": "", "reason": "silent"}
-        if any(word in reply for word in SOFT_WORDS):
-            reply = random.choice(HARD_REPLIES)
+        if any(word in reply for word in FILTER_WORDS):
+            if self.monitor:
+                self.monitor.record(group, "filtered", ok=False, latency=elapsed)
+            return {"replied": False, "text": "", "reason": "filtered",
+                    "elapsed": elapsed}
         if self.memory:
             reply = apply_jargon_context(
                 decorate(typo(reply, frequency=self.frequency), self.style,
@@ -394,7 +346,7 @@ class Brain:
         if not reply:
             return ""
         line = reply[0].strip()[:60]
-        if not line or any(word in line for word in SOFT_WORDS):
+        if not line or any(word in line for word in FILTER_WORDS):
             return ""
         self.store.add_message(group, "bot", "回声", "bot", line)
         return line
@@ -440,7 +392,7 @@ class Brain:
 
     def _should_reply(self, msg, text, now):
         """按对话节奏决定是否开口；返回原因，None 表示保持沉默。"""
-        if msg.group_id in self._muted:
+        if self.modes and self.modes.mode(msg.group_id) == "quiet":
             return None
         if msg.mentioned:
             return "mention"
@@ -452,8 +404,6 @@ class Brain:
             return "window"
         if self._worth_replying(text):
             return "question"
-        if self.chance and random.random() < self.chance:
-            return "fallback"
         return None
 
     @staticmethod
@@ -495,12 +445,10 @@ class Brain:
         if cmd in ("帮助", "help"):
             return HELP
         if cmd in ("闭嘴", "shutup"):
-            self._muted.add(msg.group_id)
             if self.modes:
                 self.modes.set(msg.group_id, "quiet")
             return "行，闭嘴。"
         if cmd in ("说话", "开麦", "speak"):
-            self._muted.discard(msg.group_id)
             if self.modes:
                 self.modes.reset(msg.group_id)
             return "行，说吧。"
@@ -511,12 +459,10 @@ class Brain:
             topic = cmd[2:].strip()
             if not topic:
                 return "专注什么？"
-            self._muted.discard(msg.group_id)
             if self.modes:
                 self.modes.set(msg.group_id, "focus", topic=topic)
             return "行，只聊{}。".format(topic[:20])
         if cmd in ("随便", "正常", "normal"):
-            self._muted.discard(msg.group_id)
             if self.modes:
                 self.modes.reset(msg.group_id)
             return "行，随便聊。"

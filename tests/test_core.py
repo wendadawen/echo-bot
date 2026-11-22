@@ -41,9 +41,13 @@ class ScriptedModel:
         return self.output
 
 
-def make_brain(chance=0.0):
+def make_brain():
+    from astrbot_plugin_echo.core.modes import ModePolicy
+
     store = Store(":memory:")
-    return store, Brain(store, MockModel(), chance)
+    brain = Brain(store, MockModel())
+    brain.modes = ModePolicy()
+    return store, brain
 
 
 def msg(text, mentioned=True, group="g1", umo="demo:group-1"):
@@ -51,44 +55,42 @@ def msg(text, mentioned=True, group="g1", umo="demo:group-1"):
 
 
 class TestBrain(unittest.TestCase):
-    def test_mention_forces_reply_and_fallback(self):
-        store, brain = make_brain(0.0)
+    def test_mention_forces_reply(self):
+        store, brain = make_brain()
         brain.window = 0
         brain.cooldown = 0
         self.assertFalse(brain.handle(msg("今天好累", mentioned=False))["replied"])
         r = brain.handle(msg("今天好累"))
         self.assertTrue(r["replied"])
         self.assertEqual("mention", r["reason"])
-        brain.chance = 1.0
-        self.assertTrue(brain.handle(msg("再来一句", mentioned=False))["replied"])
 
     def test_window_keeps_conversation_going(self):
-        store, brain = make_brain(0.0)
+        store, brain = make_brain()
         brain.cooldown = 0
         brain.window_cooldown = 0
         self.assertEqual("mention", brain.handle(msg("在吗"))["reason"])
         self.assertEqual("window", brain.handle(msg("今天好累", mentioned=False))["reason"])
 
     def test_idle_chatter_stays_silent(self):
-        store, brain = make_brain(0.0)
+        store, brain = make_brain()
         brain.window = 0
         self.assertFalse(brain.handle(msg("哈哈", mentioned=False))["replied"])
 
     def test_question_replies_outside_window(self):
-        store, brain = make_brain(0.0)
+        store, brain = make_brain()
         brain.window = 0
         r = brain.handle(msg("这是怎么回事", mentioned=False))
         self.assertTrue(r["replied"])
         self.assertEqual("question", r["reason"])
 
     def test_cooldown_silences_immediate_followup(self):
-        store, brain = make_brain(0.0)
+        store, brain = make_brain()
         brain.window = 0
         self.assertEqual("question", brain.handle(msg("怎么了", mentioned=False))["reason"])
         self.assertFalse(brain.handle(msg("在吗", mentioned=False))["replied"])
 
     def test_mute_silences_until_unmute(self):
-        store, brain = make_brain(0.0)
+        store, brain = make_brain()
         self.assertIn("闭嘴", brain.handle(msg("/闭嘴"))["text"])
         self.assertFalse(brain.handle(msg("随便聊聊"))["replied"])
         self.assertFalse(brain.handle(msg("在吗", mentioned=False))["replied"])
@@ -96,7 +98,7 @@ class TestBrain(unittest.TestCase):
         self.assertTrue(brain.handle(msg("在吗"))["replied"])
 
     def test_commands_still_work_while_muted(self):
-        store, brain = make_brain(0.0)
+        store, brain = make_brain()
         brain.handle(msg("/闭嘴"))
         result = brain.handle(msg("/帮助"))
         self.assertEqual("command", result["reason"])
@@ -105,7 +107,7 @@ class TestBrain(unittest.TestCase):
     def test_focus_command_sets_topic_and_resume(self):
         from astrbot_plugin_echo.core.modes import ModePolicy
 
-        store, brain = make_brain(0.0)
+        store, brain = make_brain()
         brain.modes = ModePolicy()
         self.assertIn("只聊归并排序", brain.handle(msg("/专注 归并排序"))["text"])
         self.assertEqual("focus", brain.modes.mode("g1"))
@@ -117,7 +119,7 @@ class TestBrain(unittest.TestCase):
     def test_mode_command_reports_state(self):
         from astrbot_plugin_echo.core.modes import ModePolicy
 
-        store, brain = make_brain(0.0)
+        store, brain = make_brain()
         brain.modes = ModePolicy()
         self.assertIn("正常", brain.handle(msg("/模式"))["text"])
         brain.handle(msg("/闭嘴"))
@@ -178,7 +180,7 @@ class TestBrain(unittest.TestCase):
             def reply(self, system, history, user_text):
                 raise RuntimeError("boom")
 
-        brain = Brain(Store(":memory:"), BrokenModel(), 1.0)
+        brain = Brain(Store(":memory:"), BrokenModel())
         result = brain.handle(msg("你好"))
         self.assertFalse(result["replied"])
         self.assertEqual("model_error", result["reason"])
@@ -216,7 +218,7 @@ class TestBrain(unittest.TestCase):
     def test_model_fallback_creates_once_reminder(self):
         model = ScriptedModel('{"kind":"once","minutes":180,"text":"取快递"}')
         store = Store(":memory:")
-        brain = Brain(store, model, 0.0)
+        brain = Brain(store, model)
         result = brain.handle(msg("/提醒 明天下午三点左右提醒我取快递"))
         self.assertEqual("command", result["reason"])
         self.assertIn("180分钟后", result["text"])
@@ -228,48 +230,48 @@ class TestBrain(unittest.TestCase):
     def test_model_fallback_rejects_invalid_output(self):
         model = ScriptedModel("我不太确定")
         store = Store(":memory:")
-        brain = Brain(store, model, 0.0)
+        brain = Brain(store, model)
         result = brain.handle(msg("/提醒 明天下午三点左右提醒我取快递"))
         self.assertIn("帮助", result["text"])
         self.assertEqual([], store.pending_reminders("g1"))
 
     def test_model_gets_group_chat_context(self):
         model = ScriptedModel("嗯嗯")
-        brain = Brain(Store(":memory:"), model, 1.0)
+        brain = Brain(Store(":memory:"), model)
         brain.handle(msg("随便聊聊"))
         self.assertIn("多人群聊", model.systems[0])
 
-    def test_apology_is_replaced(self):
-        class ApologyModel:
+    def test_service_tone_is_filtered(self):
+        class ServiceModel:
             name = "openai"
 
             def reply(self, system, history, user_text):
-                return "确实说中了，我刚才没接住，抱歉。"
+                return "作为 AI，我无法帮你处理这个。"
 
-        brain = Brain(Store(":memory:"), ApologyModel(), 1.0)
-        result = brain.handle(msg("你好笨"))
-        self.assertTrue(result["replied"])
-        self.assertNotIn("抱歉", result["text"])
-        self.assertNotIn("说中", result["text"])
-        self.assertTrue(result["text"])
+        brain = Brain(Store(":memory:"), ServiceModel())
+        result = brain.handle(msg("帮我个忙"))
+        self.assertFalse(result["replied"])
+        self.assertEqual("filtered", result["reason"])
 
-    def test_soft_words_cover_main_categories(self):
-        from astrbot_plugin_echo.core.brain import HARD_REPLIES, SOFT_WORDS
+    def test_filter_only_covers_service_tone(self):
+        from astrbot_plugin_echo.core.brain import FILTER_WORDS
 
-        for word in ("抱歉", "能力有限", "谢谢", "平心而论", "怕说过头", "作为 AI"):
-            self.assertIn(word, SOFT_WORDS)
-        self.assertGreaterEqual(len(SOFT_WORDS), 100)
-        self.assertGreaterEqual(len(HARD_REPLIES), 5)
+        for word in ("作为 AI", "我无法", "有什么可以帮"):
+            self.assertIn(word, FILTER_WORDS)
+        # 正常说话会用的词不该再被拦。
+        for word in ("抱歉", "谢谢", "收到", "看情况", "确实"):
+            self.assertNotIn(word, FILTER_WORDS)
+        self.assertLessEqual(len(FILTER_WORDS), 40)
 
     def test_model_parse_extracts_json_from_prose(self):
         model = ScriptedModel('好的，结果是 {"kind":"once","minutes":10,"text":"开会"}')
-        brain = Brain(Store(":memory:"), model, 0.0)
+        brain = Brain(Store(":memory:"), model)
         self.assertEqual(10, brain._model_parse("十分钟后提醒我开会")["minutes"])
 
     def test_model_fallback_scheduled(self):
         output = '{"kind":"scheduled","day_offset":1,"hour":15,"minute":0,"text":"取快递"}'
         store = Store(":memory:")
-        brain = Brain(store, ScriptedModel(output), 0.0)
+        brain = Brain(store, ScriptedModel(output))
         result = brain.handle(msg("/提醒 明天下午三点左右提醒我取快递"))
         self.assertEqual("command", result["reason"])
         self.assertIn("我 @ 你", result["text"])

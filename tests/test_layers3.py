@@ -153,7 +153,7 @@ class TestForward(unittest.TestCase):
 class TestBrainScheduleAndForget(unittest.TestCase):
     def setUp(self):
         self.store = Store(":memory:")
-        self.brain = Brain(self.store, MockModel(), 0.0)
+        self.brain = Brain(self.store, MockModel())
         self.brain.schedule = Schedule()
 
     def test_every_hours_reminder(self):

@@ -162,12 +162,3 @@ def decorate(text, style=None, store=None, situation=""):
     if learned and random.random() < 0.15:
         text = learned
     return text
-
-
-def reply_marks(mentioned=False, quoted=None):
-    """引用与反应标记：由平台层决定是否真的发出。"""
-    marks = {"reply": bool(quoted), "at": bool(mentioned), "reaction": None}
-    if random.random() < 0.06:
-        # QQ 内置表情 ID，平台层自行决定要不要发
-        marks["reaction"] = random.choice((0, 1, 2, 3, 4, 5))
-    return marks
