@@ -104,7 +104,7 @@ def mine_jargon(messages, existing=None, min_count=3, top=8):
 
 
 def learn_style(messages, profile=None):
-    """群风格学习：平均句长、口头禅、标点习惯，用于约束输出长度。"""
+    """群风格学习：平均句长、口头禅、标点习惯；长度只作提示参考，不用于硬截断。"""
     profile = dict(profile or {})
     lengths, marks, words = [], 0, {}
     for line in messages or []:
@@ -118,7 +118,7 @@ def learn_style(messages, profile=None):
     if lengths:
         avg = sum(lengths) / len(lengths)
         profile["avg_len"] = round(avg, 1)
-        profile["max_len"] = max(12, min(80, int(avg * 2)))
+        profile["max_len"] = max(40, min(120, int(avg * 3)))
         profile["punctuation"] = round(marks / len(lengths), 2)
     profile["catchphrases"] = [w for w, n in
                                sorted(words.items(), key=lambda kv: (-kv[1], kv[0]))
@@ -151,13 +151,10 @@ def apply_jargon(text, jargon):
 
 
 def decorate(text, style=None, store=None, situation=""):
-    """输出前的最后一跳：长度约束、复用学到的表达、偶尔打错字、替换黑话。"""
+    """输出前的最后一跳：复用学到的表达，长度交给拆条处理。"""
     text = (text or "").strip()
     if not text:
         return ""
-    max_len = (style or {}).get("max_len")
-    if max_len and len(text) > max_len:
-        text = text[:max_len]
     learned = pick_expression(situation, store)
     if learned and random.random() < 0.15:
         text = learned
