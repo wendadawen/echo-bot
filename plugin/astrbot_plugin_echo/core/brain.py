@@ -101,6 +101,25 @@ FILTER_WORDS = (
 
 REPEAT_WINDOW = 30
 SUMMARY_INTERVAL = 600
+DEFAULT_HISTORY_LIMIT = 30
+MIN_HISTORY_LIMIT = 1
+MAX_HISTORY_LIMIT = 200
+
+
+def _parse_history_limit(value, default=DEFAULT_HISTORY_LIMIT):
+    """解析上下文聊天记录条数配置，支持数字与数字字符串并限制在合理范围。"""
+    if value is None or isinstance(value, bool):
+        return default
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return default
+        value = stripped
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(MIN_HISTORY_LIMIT, min(MAX_HISTORY_LIMIT, parsed))
 
 
 def _repeat_key(group_id, user_id, text):
@@ -297,13 +316,15 @@ class Brain:
                  memory=None, emoji_bank=None, char_frequency=None,
                  capabilities=None, modes=None, attention=None, persons=None,
                  monitor=None, prompt_store=None, personas=None, subagent=None,
-                 schedule=None, harness=None):
+                 schedule=None, harness=None,
+                 history_limit=DEFAULT_HISTORY_LIMIT):
         self.store = store
         self.model = model
         self.persona = persona or PERSONA
         self.window = window
         self.cooldown = cooldown
         self.window_cooldown = window_cooldown
+        self.history_limit = _parse_history_limit(history_limit)
         self._windows = {}
         self._last_reply = {}
         self.memory = memory
@@ -335,7 +356,7 @@ class Brain:
 
     def handle(self, msg):
         """处理一条群消息；返回回复文本，由平台层负责真正发送。"""
-        history = self.store.recent(msg.group_id, 12)
+        history = self.store.recent(msg.group_id, self.history_limit)
         self.store.add_message(
             msg.group_id, msg.user_id, msg.user_name, "user", msg.text, msg.ts
         )
@@ -389,6 +410,7 @@ class Brain:
         if not raw_text:
             return {"replied": False, "text": "", "reason": "empty"}
         text = batch.text.strip()
+        body_text = (getattr(batch, "body_text", "") or "").strip() or raw_text
         user_name = getattr(last, "user_name", "") if last else ""
         user_id = getattr(last, "user_id", "") if last else ""
 
@@ -406,7 +428,7 @@ class Brain:
                 )
 
         info = mentions.detect(
-            text, at=bool(getattr(batch, "mentioned", False)),
+            body_text, at=bool(getattr(batch, "mentioned", False)),
             self_names=("大肥鱼", "回声"), quoted=getattr(batch, "quote", "") or "",
         )
         batch.mention_info = info
@@ -415,19 +437,20 @@ class Brain:
         if self.modes:
             if not self.modes.allows(group, mentioned=info.mentioned):
                 return {"replied": False, "text": "", "reason": "mode_quiet"}
-            if not self.modes.focus_hit(group, text):
+            if not self.modes.focus_hit(group, body_text):
                 return {"replied": False, "text": "", "reason": "off_topic"}
 
-        # 注意力：先按尚未入窗的新词比例判定漂移并写到 batch，再观测本批文本。
+        # 注意力：先按尚未入窗的新词比例判定漂移并写到 batch，再观测本批正文（不含昵称）。
         if self.attention:
-            drift_lvl = self.attention.level(group, text)
+            drift_lvl = self.attention.level(group, body_text)
             batch.drift_level = drift_lvl
             if drift_lvl == "active":
                 self.attention.consume(group)
-            self.attention.observe(group, text)
+            self.attention.observe(group, body_text)
 
-        # 先看上一条落库消息是不是自己发的，才能准确给上一条回复记正反馈。
-        prev_last = self.store.recent(group, 1) if self.memory else []
+        # 先读上一批历史（避免本批消息重复出现在 history 和 user_text 里），再把本批入库。
+        prev_history = self.store.recent(group, self.history_limit)
+        prev_last = prev_history[-1:] if (self.memory and prev_history) else []
 
         # 批内每条非空消息都按原始文本逐条落库，避免同批前几条提问丢失。
         stored = False
@@ -469,12 +492,15 @@ class Brain:
 
         history = [
             {**item, "text": _clip(item.get("text"), 300)}
-            for item in self.store.recent(group, 12)
+            for item in prev_history
         ]
 
-        # 上下文压缩：超预算时保留最近与点名消息，其余压成摘要。
+        # 上下文压缩：超预算时保留最近与点名消息，其余压成摘要；预算随 history_limit 缩放。
+        budget_tokens = min(12000, max(900, self.history_limit * 90))
+        keep_recent = min(self.history_limit, max(5, self.history_limit // 2))
         history, summary = compaction.compact(
-            history, budget_tokens=900, keep_recent=5, self_names=("大肥鱼", "回声")
+            history, budget_tokens=budget_tokens, keep_recent=keep_recent,
+            self_names=("大肥鱼", "回声"),
         )
         batch.history_summary = summary
 
@@ -485,14 +511,17 @@ class Brain:
         if self.memory and prev_last and prev_last[-1].get("role") == "bot":
             self.memory.mark_followup(group)
         # 群风格与黑话随聊天更新，供输出层使用。
-        self.style = learn_style([h.get("text", "") for h in history], self.style)
+        style_texts = [h.get("text", "") for h in history] + [
+            str(getattr(i, "text", "") or "") for i in items
+        ]
+        self.style = learn_style(style_texts, self.style)
         self.context_builder.style = self.style
         if self.memory:
             for word in mine_jargon([i.text for i in batch.items],
                                     self.memory.jargon(group)):
                 self.memory.add_jargon(group, word, word)
 
-        system = self.context_builder.build(group, text, user_name, batch, history)
+        system = self.context_builder.build(group, body_text, user_name, batch, history)
         capabilities = dict(self.capabilities)
         capabilities["view_image"] = bool(getattr(batch, "images", None))
         self.tool_loop.capabilities = capabilities
@@ -585,11 +614,11 @@ class Brain:
                 self.monitor.record(group, "empty_reply", ok=False, latency=elapsed)
             return {"replied": False, "text": "", "reason": "silent"}
         # 第三层：模型仍然说查不了，或问句里说不知道，就替它转一次后台。
-        uncertain = is_question(text) and any(
+        uncertain = is_question(body_text) and any(
             hint in reply for hint in UNCERTAIN_HINTS
         )
         if uncertain or any(hint in reply for hint in REFUSAL_HINTS):
-            dispatched = self._dispatch_task(group, text, getattr(batch, "umo", ""))
+            dispatched = self._dispatch_task(group, body_text, getattr(batch, "umo", ""))
             if dispatched:
                 return dispatched
         if any(word in reply for word in FILTER_WORDS):
@@ -600,7 +629,7 @@ class Brain:
         if self.memory:
             reply = apply_jargon_context(
                 decorate(typo(reply, chance=0.01, frequency=self.frequency), self.style,
-                         self.expressions, text[:12]),
+                         self.expressions, body_text[:12]),
                 self.memory.jargon(group),
             )
             self.memory.record_reply(group, reply)
@@ -614,7 +643,7 @@ class Brain:
         self._last_bot_reply[group] = (reply_key, time.time())
         if len(self._last_bot_reply) > 200:
             self._last_bot_reply.clear()
-        learn_expressions(text[:12], reply, self.expressions)
+        learn_expressions(body_text[:12], reply, self.expressions)
         self.store.add_message(group, "bot", "大肥鱼", "bot", reply)
         self._last_reply_at[group] = time.time()
         self._last_reply_user[group] = last.user_id if last else ""
@@ -632,7 +661,7 @@ class Brain:
 
     def view_rate(self, batch):
         """按语境给查看概率：问句 50%，刚说完同一人接话 60%，其余走默认。"""
-        text = getattr(batch, "text", "")
+        text = (getattr(batch, "body_text", "") or "").strip() or getattr(batch, "text", "")
         if is_question(text):
             return 0.5
         group = getattr(batch, "group_id", "")
@@ -684,7 +713,7 @@ class Brain:
             return ""
         persona = self._resolve_persona(group)
         try:
-            reply = self.model.reply(persona, self.store.recent(group, 6),
+            reply = self.model.reply(persona, self.store.recent(group, min(6, self.history_limit)),
                                      HEARTBEAT_PROMPT)
         except Exception:
             return ""
@@ -712,7 +741,7 @@ class Brain:
             system = self._resolve_persona(group) + "\n\n" + instruction
             clipped_history = [
                 {**item, "text": _clip(item.get("text"), SUBAGENT_HISTORY_ITEM_LIMIT)}
-                for item in self.store.recent(group, 6)
+                for item in self.store.recent(group, min(6, self.history_limit))
             ]
             history, _ = compaction.compact(
                 clipped_history,

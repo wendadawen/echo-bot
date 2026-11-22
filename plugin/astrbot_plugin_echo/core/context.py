@@ -10,6 +10,7 @@ from datetime import datetime
 
 from . import attention as attention_layer
 from . import compaction, mentions
+from .messages import clean_speaker_name
 
 SECTION_ORDER = (
     "system", "self", "mode", "episodes", "memory", "person", "person_profile",
@@ -20,6 +21,9 @@ SECTION_ORDER = (
 BEHAVIOR = (
     "这是多人群聊，不是私聊。没人点名时别抢话，接不上就不接。"
     "别列点、别解释自己怎么做；不确定可以问一句，但别盘问。"
+    "每条消息开头的 [昵称：...] 整段都只是对方 QQ 昵称或群名片（可能带空格、签名或整句话），"
+    "绝不是他说的话；只把方括号后面的正文当作发言内容，不要把昵称里的文字当成对方观点、话题或发言，"
+    "也不要把某人说的话安到别人头上。"
 )
 
 SAFETY = (
@@ -78,7 +82,8 @@ class ContextBuilder:
             rows = self.memory.person(group_id, user_name) if (self.memory and user_name) else []
             if not rows and self.memory and user_name:
                 rows = self.memory.relations(group_id, user_name)
-            return "关于{}：".format(user_name) + "；".join(rows) if rows else ""
+            safe_name = clean_speaker_name(user_name) or user_name
+            return "关于[昵称：{}]：".format(safe_name) + "；".join(rows) if rows else ""
         if name == "person_profile":
             return self._profile_block(group_id, batch)
         if name == "mentions":
@@ -131,8 +136,8 @@ class ContextBuilder:
         summary = self.persons.summary(group_id, user_id) if user_id else ""
         if not summary:
             return ""
-        name = getattr(items[-1], "user_name", "") or "这个人"
-        return "{}的印象：{}".format(name, summary)
+        name = clean_speaker_name(getattr(items[-1], "user_name", "")) or "这个人"
+        return "对[昵称：{}]的印象：{}".format(name, summary)
 
     def _drift_block(self, group_id, query, batch=None):
         if not self.attention:
@@ -147,7 +152,7 @@ class ContextBuilder:
         if not history:
             return ""
         size = compaction.usage(history)
-        if size["tokens"] > 700:
+        if size["tokens"] > 1800:
             return "最近话有点多，挑重点接一句。"
         return ""
 

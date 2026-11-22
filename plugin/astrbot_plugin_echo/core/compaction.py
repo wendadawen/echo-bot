@@ -7,6 +7,8 @@
 
 import re
 
+from .messages import format_speaker_message
+
 URL_PATTERN = re.compile(r"https?://\S+")
 SPACE_PATTERN = re.compile(r"\s+")
 
@@ -94,7 +96,7 @@ def _summarize(rows):
         )
         text = URL_PATTERN.sub("[链接]", _text(row)).strip().replace("\n", " ")
         if text:
-            lines.append("{}：{}".format(name, text[:40]))
+            lines.append(format_speaker_message(name, text[:40]))
     if not lines:
         return ""
     return "（较早的对话）" + "；".join(lines[-3:])

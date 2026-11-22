@@ -17,6 +17,8 @@ import time
 import uuid
 from dataclasses import dataclass, field
 
+from .messages import format_speaker_message
+
 DEBOUNCE_PRESETS = {
     "fast": dict(quiet=1.0, active=3.0, same=1.0, other=0.5,
                  cap=8.0, mention_cap=1.0, image_min=4.0),
@@ -75,7 +77,14 @@ class Batch:
     @property
     def text(self):
         return "\n".join(
-            "{}：{}".format(i.user_name, i.text)
+            format_speaker_message(i.user_name, i.text)
+            for i in self.items if str(i.text or "").strip()
+        )
+
+    @property
+    def body_text(self):
+        return "\n".join(
+            str(i.text or "").strip()
             for i in self.items if str(i.text or "").strip()
         )
 

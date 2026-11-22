@@ -5,6 +5,8 @@ MaiBot 有 `view_forward_message` 工具；我们没有统一的组件定义，�
 只依赖标准库。
 """
 
+from .messages import format_speaker_message
+
 MAX_ITEMS = 20
 MAX_CHARS = 800
 
@@ -55,7 +57,7 @@ def extract(component):
             body = _get(body, "text", "content", default="")
         text = str(body or "").strip().replace("\n", " ")
         if text:
-            lines.append("{}：{}".format(sender or "群友", text[:80]))
+            lines.append(format_speaker_message(sender or "群友", text[:80]))
     return lines
 
 

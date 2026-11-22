@@ -231,11 +231,11 @@ class TestAuditFixes(unittest.TestCase):
         comp = Nodes([Node("阿伟", [Plain("今晚吃啥")]), Node("小美", [Plain("火锅")])])
         self.assertTrue(forward.looks_like_forward(comp))
         lines = forward.extract(comp)
-        self.assertEqual(["阿伟：今晚吃啥", "小美：火锅"], lines)
+        self.assertEqual(["[昵称：阿伟] 今晚吃啥", "[昵称：小美] 火锅"], lines)
 
         single = Node("阿伟", [Plain("单条节点")])
         self.assertTrue(forward.looks_like_forward(single))
-        self.assertEqual(["阿伟：单条节点"], forward.extract(single))
+        self.assertEqual(["[昵称：阿伟] 单条节点"], forward.extract(single))
 
     def test_heartbeat_supports_overnight_active_hours(self):
         hb = Heartbeat(quiet=10, min_interval=10, active_hours=(22, 6))

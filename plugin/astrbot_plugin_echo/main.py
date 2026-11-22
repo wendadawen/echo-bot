@@ -5,6 +5,7 @@ AstrBot 插件入口：只负责把平台事件转成批次、把核心层的动
 """
 
 import asyncio
+import os
 import re
 import time
 import urllib.request
@@ -25,7 +26,7 @@ from .core.forward import render as forward_render
 from .core.heartbeat import Heartbeat
 from .core.harness import CodexHarness
 from .core.memory import Memory
-from .core.messages import Message
+from .core.messages import Message, format_speaker_message
 from .core.models import build_model
 from .core.modes import ModePolicy
 from .core.monitor import Monitor
@@ -80,6 +81,9 @@ class Echo(Star):
         self._last_umo = {}
         self._heartbeat_at = 0.0
         self._handled_turns = set()
+        raw_history_limit = self.config.get("history_limit")
+        if raw_history_limit is None or raw_history_limit == "":
+            raw_history_limit = os.environ.get("BOT_HISTORY_LIMIT")
         self.brain = Brain(
             self.store,
             self.model,
@@ -98,6 +102,7 @@ class Echo(Star):
             subagent=self.subagent,
             schedule=self.schedule,
             harness=self.harness,
+            history_limit=raw_history_limit,
         )
         self.reminders_enabled = bool(self.config.get("reminder_enabled", True))
         self._reminder_task = None
@@ -246,7 +251,7 @@ class Echo(Star):
             body = re.sub(r"\s+", " ", body)[:100]
             sender_name = str(getattr(part, "sender_nickname", "") or "").strip()
             if sender_name and body:
-                return "{}：{}".format(sender_name, body)
+                return format_speaker_message(sender_name, body)
             if body:
                 return body
             if sender_name:

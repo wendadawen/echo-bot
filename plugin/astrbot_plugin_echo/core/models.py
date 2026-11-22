@@ -7,6 +7,8 @@ import json
 import os
 import urllib.request
 
+from .messages import format_speaker_message
+
 
 class BaseModel:
     name = "base"
@@ -47,10 +49,11 @@ class OpenAIModel(BaseModel):
     def reply(self, system, history, user_text):
         messages = [{"role": "system", "content": system}]
         for item in history:
-            role = "assistant" if item["role"] == "bot" else "user"
+            item_role = item.get("role")
+            role = "assistant" if item_role == "bot" else "user"
             content = item["text"]
-            if role == "user" and item.get("user_name"):
-                content = "{}：{}".format(item["user_name"], content)
+            if item_role != "system" and role == "user" and item.get("user_name"):
+                content = format_speaker_message(item["user_name"], content)
             messages.append({"role": role, "content": content})
         messages.append({"role": "user", "content": user_text})
         payload = {

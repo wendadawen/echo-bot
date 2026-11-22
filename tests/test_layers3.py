@@ -139,8 +139,8 @@ class TestForward(unittest.TestCase):
         self.assertTrue(forward.looks_like_forward(node))
         lines = forward.extract(node)
         self.assertEqual(2, len(lines))
-        self.assertIn("阿伟：在吗", lines[0])
-        self.assertIn("小明：看这个", lines[1])
+        self.assertIn("[昵称：阿伟] 在吗", lines[0])
+        self.assertIn("[昵称：小明] 看这个", lines[1])
         self.assertIn("转发的聊天", forward.render(lines))
 
     def test_unknown_component(self):

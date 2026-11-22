@@ -7,17 +7,22 @@ import time
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugin"))
 
-from astrbot_plugin_echo.core import display, mentions, vision  # noqa: E402
+from astrbot_plugin_echo.core import compaction, display, mentions, vision  # noqa: E402
 from astrbot_plugin_echo.core.actions import ACTION_PROMPT, parse_full  # noqa: E402
 from astrbot_plugin_echo.core.brain import Brain, HELP, is_unsafe  # noqa: E402
+from astrbot_plugin_echo.core.context import ContextBuilder  # noqa: E402
 from astrbot_plugin_echo.core.expression import decorate  # noqa: E402
 from astrbot_plugin_echo.core.harness import CodexHarness  # noqa: E402
-from astrbot_plugin_echo.core.memory import Memory  # noqa: E402
-from astrbot_plugin_echo.core.messages import Message  # noqa: E402
-from astrbot_plugin_echo.core.models import MockModel  # noqa: E402
+from astrbot_plugin_echo.core.memory import MEMORY_PROMPT, Memory  # noqa: E402
+from astrbot_plugin_echo.core.messages import (  # noqa: E402
+    Message, clean_speaker_name, format_speaker_message,
+)
+from astrbot_plugin_echo.core.models import MockModel, OpenAIModel  # noqa: E402
+from astrbot_plugin_echo.core.person_info import PersonStore  # noqa: E402
 from astrbot_plugin_echo.core.rhythm import Batch, Item, Rhythm  # noqa: E402
 from astrbot_plugin_echo.core.schedule import Schedule  # noqa: E402
 from astrbot_plugin_echo.core.store import Store  # noqa: E402
@@ -615,6 +620,191 @@ class TestIncidentRegressions(unittest.TestCase):
             self.assertEqual(1, migrated.stats("g9")["g9"])
             self.assertFalse(f1.exists())
             self.assertTrue(f2.exists())
+
+    def test_speaker_name_isolated_from_utterance_and_prompts(self):
+        # 1) 昵称清洗与边界包裹
+        self.assertEqual(
+            "高志朋 我不建议任何人来hw",
+            clean_speaker_name("高志朋\n  我不建议任何人来hw"),
+        )
+        self.assertEqual(
+            "(管理员)张三",
+            clean_speaker_name("[管理员]张三"),
+        )
+        self.assertEqual(
+            "[昵称：高志朋 我不建议任何人来hw] 有点自信",
+            format_speaker_message("高志朋 我不建议任何人来hw", "有点自信"),
+        )
+        self.assertEqual("纯正文", format_speaker_message("   ", "纯正文"))
+
+        # 2) Batch 区分带昵称的 text 与纯正文 body_text
+        now = time.time()
+        b = Batch(
+            "g1",
+            items=[Item("有点自信", "2764", "高志朋 我不建议任何人来hw", True, "umo", now)],
+            started=now,
+            deadline=now,
+        )
+        self.assertEqual("[昵称：高志朋 我不建议任何人来hw] 有点自信", b.text)
+        self.assertEqual("有点自信", b.body_text)
+
+        # 3) OpenAIModel.reply 历史格式化：user 带 [昵称：...]，bot/system 不带
+        captured_payload = {}
+
+        class FakeResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return json.dumps({
+                    "choices": [{"message": {"role": "assistant", "content": "好的"}}]
+                }).encode("utf-8")
+
+        def fake_urlopen(req, timeout=40):
+            captured_payload.update(json.loads(req.data.decode("utf-8")))
+            return FakeResp()
+
+        oa = OpenAIModel("k", "http://localhost/v1", "m")
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            oa.reply(
+                "sys",
+                [
+                    {"role": "system", "user_name": "摘要", "text": "（较早的对话）前情"},
+                    {"role": "user", "user_name": "高志朋 我不建议任何人来hw", "text": "有点自信"},
+                    {"role": "bot", "user_name": "大肥鱼", "text": "行"},
+                ],
+                "[昵称：文红兵] 哈喽",
+            )
+        msgs = captured_payload["messages"]
+        self.assertEqual({"role": "user", "content": "（较早的对话）前情"}, msgs[1])
+        self.assertEqual(
+            {"role": "user", "content": "[昵称：高志朋 我不建议任何人来hw] 有点自信"},
+            msgs[2],
+        )
+        self.assertEqual({"role": "assistant", "content": "行"}, msgs[3])
+
+        # 4) ContextBuilder / MEMORY_PROMPT / compaction._summarize 均有昵称隔离与说明
+        mem = Memory(":memory:")
+        mem.upsert_person("g1", "高志朋 我不建议任何人来hw", "preference", "喜欢喝美式")
+        persons = PersonStore(":memory:")
+        persons.observe("g1", "2764", "高志朋 我不建议任何人来hw")
+        persons.upsert_profile("g1", "2764", traits="爱测试")
+        cb = ContextBuilder("你是大肥鱼", mem, persons=persons)
+        built = cb.build("g1", query="有点自信", user_name="高志朋 我不建议任何人来hw", batch=b)
+        self.assertIn("[昵称：...] 整段都只是对方 QQ 昵称或群名片", built)
+        self.assertIn("关于[昵称：高志朋 我不建议任何人来hw]：", built)
+        self.assertIn("对[昵称：高志朋 我不建议任何人来hw]的印象：", built)
+        self.assertIn("[昵称：...] 里的整段文字只是 QQ 昵称/群名片", MEMORY_PROMPT)
+        _, comp_sum = compaction.compact(
+            [{"role": "user", "user_name": "高志朋 别信我名字", "text": "第一句话"} for _ in range(10)],
+            budget_tokens=1,
+            keep_recent=1,
+        )
+        self.assertIn("[昵称：高志朋 别信我名字] 第一句话", comp_sum)
+
+        # 5) 昵称含 "大肥鱼" 或 "?" 不得误触提及检测、查看概率、第 3 层问句判定，且 history 不重复本批消息
+        store = Store(":memory:")
+        store.add_message("g1", "u0", "阿伟", "user", "前一条发言1")
+        store.add_message("g1", "bot", "大肥鱼", "bot", "前一条回复2")
+
+        seen_histories = []
+
+        class InspectModel:
+            def reply(self, system, history, user_text):
+                seen_histories.append((list(history), user_text))
+                return "这个我不知道"
+
+        brain = Brain(store, InspectModel())
+        brain.subagent = SubAgentManager()
+        tricky = Batch(
+            "g1",
+            items=[Item("随便聊聊", "u9", "大肥鱼是不是傻?", False, "demo:group-1", now)],
+            started=now,
+            deadline=now,
+        )
+        self.assertIsNone(brain.view_rate(tricky))
+        res = brain.handle_batch(tricky)
+        self.assertFalse(tricky.mention_info.mentioned)
+        self.assertNotEqual("task", res["reason"])
+        self.assertEqual(2, len(seen_histories[0][0]))
+        self.assertEqual("[昵称：大肥鱼是不是傻?] 随便聊聊", seen_histories[0][1])
+
+        # 正文确为问句且模型回答不确定时，进后台的任务文本应只含纯正文 body_text
+        submitted = []
+        brain.subagent.submit = lambda kind, prompt, runner: (submitted.append(prompt) or "tid1")
+        q_batch = Batch(
+            "g1",
+            items=[Item("今天几号？", "u9", "高志朋 我不建议任何人来hw", True, "demo:group-1", now + 1)],
+            started=now + 1,
+            deadline=now + 1,
+        )
+        q_res = brain.handle_batch(q_batch)
+        self.assertEqual("task", q_res["reason"])
+        self.assertEqual(["今天几号？"], submitted)
+
+    def test_history_limit_default_30_and_config_schema(self):
+        # 1) Store.recent 默认返回 30 条
+        store = Store(":memory:")
+        for i in range(40):
+            store.add_message("g1", "u1", "阿伟", "user", "消息{}".format(i))
+        recent_default = store.recent("g1")
+        self.assertEqual(30, len(recent_default))
+        self.assertEqual("消息10", recent_default[0]["text"])
+        self.assertEqual("消息39", recent_default[-1]["text"])
+
+        # 2) Brain 默认 history_limit=30，且 30 条常规消息不会因旧 900-token 预算被压缩截断
+        seen = []
+
+        class CaptureModel:
+            def reply(self, system, history, user_text):
+                seen.append(list(history))
+                return "收到"
+
+        store30 = Store(":memory:")
+        for i in range(35):
+            store30.add_message("g1", "u1", "阿伟", "user", "群里日常聊两句编号{}".format(i) + "哈哈" * 12)
+        brain = Brain(store30, CaptureModel())
+        self.assertEqual(30, brain.history_limit)
+        res = brain.handle_batch(make_batch("在干嘛"))
+        self.assertTrue(res["replied"])
+        self.assertEqual(30, len(seen[0]))
+        self.assertFalse(any(h.get("role") == "system" for h in seen[0]))
+
+        # 3) history_limit 支持整数/字符串/边界限制/非法回退
+        self.assertEqual(25, Brain(Store(":memory:"), MockModel(), history_limit="25").history_limit)
+        self.assertEqual(1, Brain(Store(":memory:"), MockModel(), history_limit=0).history_limit)
+        self.assertEqual(1, Brain(Store(":memory:"), MockModel(), history_limit=-3).history_limit)
+        self.assertEqual(200, Brain(Store(":memory:"), MockModel(), history_limit=500).history_limit)
+        self.assertEqual(30, Brain(Store(":memory:"), MockModel(), history_limit="abc").history_limit)
+        self.assertEqual(30, Brain(Store(":memory:"), MockModel(), history_limit=None).history_limit)
+        self.assertEqual(30, Brain(Store(":memory:"), MockModel(), history_limit=False).history_limit)
+
+        # 自定义 history_limit=5 生效
+        seen5 = []
+
+        class Capture5Model:
+            def reply(self, system, history, user_text):
+                seen5.append(list(history))
+                return "收到"
+
+        store5 = Store(":memory:")
+        for i in range(15):
+            store5.add_message("g1", "u1", "阿伟", "user", "第{}条".format(i))
+        Brain(store5, Capture5Model(), history_limit=5).handle_batch(make_batch("最近聊啥"))
+        self.assertEqual(5, len(seen5[0]))
+
+        # 4) 插件配置 schema 开放 history_limit（int, default=30）
+        schema_path = (
+            Path(__file__).resolve().parents[1]
+            / "plugin" / "astrbot_plugin_echo" / "_conf_schema.json"
+        )
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        self.assertIn("history_limit", schema)
+        self.assertEqual("int", schema["history_limit"]["type"])
+        self.assertEqual(30, schema["history_limit"]["default"])
 
 
 class TestRhythm(unittest.TestCase):

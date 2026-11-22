@@ -20,6 +20,8 @@ MEMORY_PROMPT = (
     '"persons":[{"name":"谁","category":"person|preference|event|relationship","content":"一条短事实"}],'
     '"relations":[{"a":"甲","b":"乙","relation":"关系"}],'
     '"points":[{"category":"person|preference|event|relationship|jargon","content":"一条短事实"}]}\n'
+    "注意：[昵称：...] 里的整段文字只是 QQ 昵称/群名片（可能带空格、签名、吐槽或完整句子），"
+    "绝不是发言内容；严禁从昵称中提取事件、观点、黑话或人物画像，只根据方括号后面的实际发言提炼。\n"
     '没有值得记的就输出 {"episode":"","points":[]}。每条不超过 40 字，各数组最多 3 条。'
 )
 

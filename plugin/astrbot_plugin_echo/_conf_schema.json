@@ -22,5 +22,11 @@
     "type": "bool",
     "default": true,
     "hint": "关闭后 /提醒 仍可登记，但不会主动发送。"
+  },
+  "history_limit": {
+    "description": "上下文聊天记录条数",
+    "type": "int",
+    "default": 30,
+    "hint": "每次回复时带入的本群最近消息条数，默认 30（范围 1-200）。"
   }
 }

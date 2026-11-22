@@ -4,6 +4,8 @@ import sqlite3
 import threading
 import time
 
+DEFAULT_HISTORY_LIMIT = 30
+
 
 class Store:
     def __init__(self, path=":memory:"):
@@ -55,7 +57,7 @@ class Store:
             self._db.commit()
             return cur.lastrowid
 
-    def recent(self, group_id, n=12):
+    def recent(self, group_id, n=DEFAULT_HISTORY_LIMIT):
         with self._lock:
             rows = self._db.execute(
                 "SELECT * FROM messages WHERE group_id = ? ORDER BY seq DESC LIMIT ?",
