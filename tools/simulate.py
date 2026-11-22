@@ -14,7 +14,7 @@ from astrbot_plugin_echo.core.store import Store  # noqa: E402
 
 def main():
     store = Store(":memory:")
-    brain = Brain(store, MockModel(), chance=1.0)
+    brain = Brain(store, MockModel())
     script = [
         ("阿伟", "你好", True),
         ("小美", "今晚怎么办？", True),
