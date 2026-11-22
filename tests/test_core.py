@@ -276,10 +276,10 @@ class TestBrain(unittest.TestCase):
     def test_filter_only_covers_service_tone(self):
         from astrbot_plugin_echo.core.brain import FILTER_WORDS
 
-        for word in ("作为 AI", "我无法", "有什么可以帮"):
+        for word in ("作为 AI", "有什么可以帮"):
             self.assertIn(word, FILTER_WORDS)
-        # 正常说话会用的词不该再被拦。
-        for word in ("抱歉", "谢谢", "收到", "看情况", "确实"):
+        # 正常拒绝和日常用词不该被当成客服腔吞掉。
+        for word in ("我无法", "我不能", "没有权限", "抱歉", "谢谢", "收到", "看情况", "确实"):
             self.assertNotIn(word, FILTER_WORDS)
         self.assertLessEqual(len(FILTER_WORDS), 40)
 
