@@ -1,5 +1,6 @@
 """回归测试：线上遇到过的问题、危险请求和边界情况，全部固化在这里。"""
 
+import json
 import sys
 import tempfile
 import time
@@ -129,6 +130,32 @@ class TestIncidentRegressions(unittest.TestCase):
         from astrbot_plugin_echo.core.brain import TASK_PREFIX
         self.assertIn("代码", TASK_PREFIX)
         self.assertNotIn("不要 markdown", TASK_PREFIX)
+
+    def test_context_ignores_huge_max_len(self):
+        from astrbot_plugin_echo.core.context import BEHAVIOR, ContextBuilder
+        builder = ContextBuilder("persona", None, {"max_len": 4000})
+        self.assertEqual("", builder._section("defect", "g1", "", "", None))
+        self.assertNotIn("不许澄清反问", BEHAVIOR)
+
+    def test_summary_writes_person_profile(self):
+        from astrbot_plugin_echo.core.person_info import PersonStore
+
+        class PersonModel:
+            def reply(self, system, history, user_text):
+                return json.dumps({
+                    "episode": "阿伟在学归并排序",
+                    "persons": [{"name": "阿伟", "category": "person",
+                                 "content": "在学归并排序"}],
+                    "relations": [],
+                    "points": [],
+                }, ensure_ascii=False)
+
+        people = PersonStore(":memory:")
+        people.observe("g1", "1001", "阿伟")
+        brain = Brain(Store(":memory:"), PersonModel(),
+                      memory=Memory(":memory:"), persons=people)
+        brain._summarize("g1", "阿伟：我在学归并排序")
+        self.assertEqual("在学归并排序", people.profile("g1", "1001")["traits"])
 
     def test_empty_batch_is_silent(self):
         self.assertEqual("empty", make_brain().handle_batch(make_batch(""))["reason"])

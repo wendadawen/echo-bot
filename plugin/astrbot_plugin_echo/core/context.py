@@ -19,7 +19,7 @@ SECTION_ORDER = (
 
 BEHAVIOR = (
     "这是多人群聊，不是私聊。没人点名时别抢话，接不上就不接。"
-    "不许给建议、不许列点、不许澄清反问、不许解释自己怎么做。"
+    "别列点、别解释自己怎么做；不确定可以问一句，但别盘问。"
 )
 
 SAFETY = (
@@ -103,7 +103,8 @@ class ContextBuilder:
             return "最近你的话常没人接，少说两句" if rate < 0.3 else ""
         if name == "defect":
             max_len = self.style.get("max_len")
-            return "这一句别超过 {} 字".format(max_len) if max_len else ""
+            # 4000 是 QQ 上限，不是有效约束；只有小值才值得提醒。
+            return "这一句别超过 {} 字".format(max_len) if max_len and max_len < 200 else ""
         if name == "usage":
             return self._usage_block(history)
         if name == "safety":

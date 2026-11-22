@@ -605,6 +605,16 @@ class Brain:
                 self.memory.add_point(group, category, content)
         for name, category, content in persons:
             self.memory.upsert_person(group, name, category, content)
+            if self.persons:
+                user_id = self.persons.resolve(group, name)
+                if user_id:
+                    field = {
+                        "person": "traits",
+                        "preference": "preferences",
+                        "event": "events",
+                        "relation": "relation",
+                    }.get(category, "traits")
+                    self.persons.upsert_profile(group, user_id, **{field: content})
         for a, b, relation in relations:
             self.memory.add_relation(group, a, b, relation)
         self.memory.prune(group)
