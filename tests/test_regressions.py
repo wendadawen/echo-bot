@@ -112,8 +112,9 @@ class TestIncidentRegressions(unittest.TestCase):
         info = mentions.detect("今天看到一条肥鱼", self_names=("大肥鱼", "肥鱼"))
         self.assertFalse(info.mentioned)
 
-    def test_action_prompt_warns_multi_user(self):
-        self.assertIn("多人", ACTION_PROMPT)
+    def test_action_prompt_answers_all_questions_in_batch(self):
+        self.assertIn("分别接住", ACTION_PROMPT)
+        self.assertNotIn("只回最后一条", ACTION_PROMPT)
 
     def test_action_prompt_prefers_subagent_when_unsure(self):
         self.assertIn("怕答错就用 subagent", ACTION_PROMPT)
