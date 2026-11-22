@@ -185,23 +185,6 @@ class TestTaskRouting(unittest.TestCase):
         )
         self.assertEqual("task", brain.handle_batch(batch)["reason"])
 
-    def test_expression_request_uses_bank(self):
-        class FakeBank:
-            def pick(self, group, keyword="", model=None):
-                return "face:475"
-
-        brain = Brain(Store(":memory:"), MockModel(), emoji_bank=FakeBank())
-        now = time.time()
-        batch = Batch(
-            "g1",
-            items=[Item("发个表情包", "1001", "阿伟", True, "demo:group-1", now)],
-            started=now,
-            deadline=now,
-        )
-        result = brain.handle_batch(batch)
-        self.assertEqual("face", result["reason"])
-        self.assertEqual("475", result["face"])
-
     def test_view_rate_for_question(self):
         now = time.time()
         batch = Batch(

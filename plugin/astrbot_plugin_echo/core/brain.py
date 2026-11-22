@@ -125,8 +125,6 @@ HELP = "\n".join("/{}  {}".format(name, desc) for name, desc in COMMANDS)
 
 # 第一层：只放常见、明确的任务词，避免「今天天气不错」也被当成任务。
 TASK_HINTS = ("查询", "查一下", "搜一下", "搜索", "帮我查", "实时", "最新")
-# 明确要表情包时直接走库存，避免模型用 emoji 文字代替。
-EXPRESSION_HINTS = ("表情包", "发个表情", "来个表情", "发张表情")
 # 交给 Codex 的固定前缀：一句人设 + 口吻和格式约束，内容不变，不影响缓存前缀。
 TASK_PREFIX = (
     "你是群里的「大肥鱼」：蓝色小鲸鱼娘，嘴硬心软，爱面子，有点懒，说话短，自称肥鱼。"
@@ -266,17 +264,6 @@ class Brain:
         text = batch.text.strip()
         if not text:
             return {"replied": False, "text": "", "reason": "empty"}
-
-        # 明确要表情包时，直接用库存，不经过模型自由发挥。
-        if any(hint in text for hint in EXPRESSION_HINTS):
-            picked = self.emoji_bank.pick(group, "", None) if self.emoji_bank else None
-            if picked and str(picked).startswith("face:"):
-                return {"replied": True, "text": "",
-                        "face": str(picked).split(":", 1)[1], "reason": "face"}
-            if picked:
-                return {"replied": True, "text": "", "image": str(picked),
-                        "reason": "face"}
-            return {"replied": True, "text": "还没存着表情", "reason": "face"}
 
         # 第一层：明确的任务请求（查询、搜索、实时信息）直接进后台。
         if self._is_direct_task(text):
