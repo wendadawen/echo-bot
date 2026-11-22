@@ -84,7 +84,7 @@ class CodexHarness:
     def _command(task):
         """降权到 nobody 再启动 Codex，避免群聊输入把容器 root 拿去做事。"""
         return [
-            "setpriv",
+            "/usr/bin/setpriv",
             "--reuid={}".format(NOBODY_UID),
             "--regid={}".format(NOBODY_GID),
             "--clear-groups",

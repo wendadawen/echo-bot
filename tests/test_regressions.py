@@ -10,13 +10,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugin"))
 
 from astrbot_plugin_echo.core import display, mentions, vision  # noqa: E402
-from astrbot_plugin_echo.core.actions import ACTION_PROMPT  # noqa: E402
+from astrbot_plugin_echo.core.actions import ACTION_PROMPT, parse_full  # noqa: E402
 from astrbot_plugin_echo.core.brain import Brain, HELP, is_unsafe  # noqa: E402
 from astrbot_plugin_echo.core.expression import decorate  # noqa: E402
+from astrbot_plugin_echo.core.harness import CodexHarness  # noqa: E402
 from astrbot_plugin_echo.core.memory import Memory  # noqa: E402
 from astrbot_plugin_echo.core.messages import Message  # noqa: E402
 from astrbot_plugin_echo.core.models import MockModel  # noqa: E402
-from astrbot_plugin_echo.core.rhythm import Batch, Item  # noqa: E402
+from astrbot_plugin_echo.core.rhythm import Batch, Item, Rhythm  # noqa: E402
 from astrbot_plugin_echo.core.schedule import Schedule  # noqa: E402
 from astrbot_plugin_echo.core.store import Store  # noqa: E402
 from astrbot_plugin_echo.core.subagent import SubAgentManager  # noqa: E402
@@ -115,6 +116,73 @@ class TestIncidentRegressions(unittest.TestCase):
 
     def test_empty_batch_is_silent(self):
         self.assertEqual("empty", make_brain().handle_batch(make_batch(""))["reason"])
+
+
+class TestRhythm(unittest.TestCase):
+    def test_carry_into_next_batch(self):
+        rhythm = Rhythm()
+        now = time.time()
+        rhythm.add("g1", Item("在吗", "1", "阿伟", True, "umo", now), now=now)
+        first = rhythm._batches["g1"]
+        rhythm.due(now + 100)
+        rhythm.carry("g1", first)
+        rhythm.add("g1", Item("你好", "2", "小美", False, "umo", now + 101), now=now + 101)
+        batches = rhythm.due(now + 200)
+        texts = [item.text for batch in batches for item in batch.items]
+        self.assertIn("在吗", texts)
+        self.assertIn("你好", texts)
+
+    def test_quota_borrows_debt(self):
+        rhythm = Rhythm(view_rate=0.2)
+        quota = rhythm.start_turn("g1")
+        for _ in range(quota + 1):
+            rhythm.use_round("g1", quota)
+        self.assertEqual(1, rhythm.debt("g1"))
+
+    def test_mention_deadline_is_short(self):
+        rhythm = Rhythm()
+        now = time.time()
+        rhythm.add("g1", Item("@bot", "1", "阿伟", True, "umo", now), now=now)
+        self.assertLessEqual(rhythm._batches["g1"].deadline, now + 2.5)
+
+
+class TestStore(unittest.TestCase):
+    def test_daily_reminder_is_due(self):
+        store = Store(":memory:")
+        store.add_reminder("g1", "1", "阿伟", "交周报", time.time() - 1,
+                           "umo", "daily:22:00")
+        self.assertEqual(1, len(store.due_reminders(time.time())))
+
+
+class TestHarness(unittest.TestCase):
+    def test_command_uses_nobody_and_full_access(self):
+        harness = CodexHarness(binary="/usr/local/bin/codex", home="/tmp/h",
+                               workdir_root="/tmp/w")
+        cmd = harness._command("查天气")
+        self.assertIn("/usr/bin/setpriv", cmd)
+        self.assertIn("--reuid=65534", cmd)
+        self.assertIn("danger-full-access", cmd)
+
+    def test_workdir_shared_between_groups(self):
+        with tempfile.TemporaryDirectory() as folder:
+            harness = CodexHarness(
+                binary="/bin/true",
+                home=str(Path(folder) / "h"),
+                workdir_root=str(Path(folder) / "w"),
+            )
+            self.assertEqual(harness._workdir("g1"), harness._workdir("g2"))
+
+
+class TestActions(unittest.TestCase):
+    def test_parse_full_valid(self):
+        self.assertEqual("reply", parse_full('{"action":"reply","text":"hi"}')["action"])
+
+    def test_parse_full_plain_text(self):
+        self.assertIsNone(parse_full("普通文本"))
+
+    def test_parse_full_code_block(self):
+        parsed = parse_full('```json\n{"action":"silent"}\n```')
+        self.assertEqual("silent", parsed["action"])
 
 
 if __name__ == "__main__":
