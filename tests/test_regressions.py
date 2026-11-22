@@ -192,6 +192,16 @@ class TestIncidentRegressions(unittest.TestCase):
         memory.upsert_person("g1", "阿伟", "person", "在学归并排序")
         self.assertTrue(memory.person("g1", "阿伟"))
 
+    def test_normal_refusal_is_not_silenced(self):
+        class Refuse:
+            def reply(self, system, history, user_text):
+                return "我无法证明黎曼猜想，这是未解决问题。"
+
+        brain = Brain(Store(":memory:"), Refuse())
+        result = brain.handle_batch(make_batch("证明一下黎曼猜想"))
+        self.assertTrue(result["replied"])
+        self.assertIn("黎曼", result["text"])
+
     def test_empty_batch_is_silent(self):
         self.assertEqual("empty", make_brain().handle_batch(make_batch(""))["reason"])
 
