@@ -42,6 +42,10 @@ ACTION_PROMPT = (
     "再判断需要什么动作：\n"
     "- 需要实时信息、执行代码/命令、生成并发送本地文件（HTML 网页、代码、文档、表格、压缩包等）、"
     "多步查资料，或你自己没把握 → subagent，把具体任务写进 text（不要让它代写群聊回复）；\n"
+    '  派 subagent 时可额外带 "reply" 字段（最多 40 字）先回群友一句，'
+    '例：{"action":"subagent","reply":"抱歉刚才漏了，我现在补查。","text":"调研目前先进的 MoE offloading 论文并输出报告"}。\n'
+    "  严禁在纯 reply 里口头承诺“我现在去查/补查/马上帮你查/我去搜一下”却不派 subagent；"
+    "决定要查或要做就必须直接选 action=\"subagent\"。\n"
     "- 纯闲聊、情绪、玩笑、稳定常识、群内已知信息 → reply，最多两句；\n"
     "- 确实不该接话 → silent。\n"
     "群聊支持生成并发送本地文件（HTML/代码/文档等）到群里，但无法部署到公网/IP、"
@@ -99,7 +103,8 @@ def parse_full(raw):
     if action not in ACTIONS:
         return None
     text = str(data.get("text") or data.get("seconds") or "").strip()[:300]
-    return {"action": action, "text": text, "seconds": data.get("seconds")}
+    reply = str(data.get("reply") or "").strip()[:120]
+    return {"action": action, "text": text, "seconds": data.get("seconds"), "reply": reply}
 
 
 def validate(action, payload, scene="group"):
@@ -216,7 +221,10 @@ class ToolLoop:
                 continue
             spec = ACTION_SPECS[action]
             if spec[2]:  # 终态
-                return {"action": action, "text": payload}
+                out = {"action": action, "text": payload}
+                if full.get("reply"):
+                    out["reply"] = full["reply"]
+                return out
             done, result = executor(group_id, action, payload)
             text = condense(result)
             self.results.add(group_id, action, text)

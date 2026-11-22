@@ -15,15 +15,17 @@ KEEP_FINISHED = 20
 
 
 class SubTask:
-    __slots__ = ("id", "kind", "prompt", "status", "result", "files", "error",
-                 "created", "finished")
+    __slots__ = ("id", "kind", "prompt", "status", "reason", "result",
+                 "partial", "files", "error", "created", "finished")
 
     def __init__(self, kind, prompt, now=None):
         self.id = uuid.uuid4().hex[:10]
         self.kind = str(kind or "task")
         self.prompt = str(prompt or "")
         self.status = "running"
+        self.reason = ""
         self.result = ""
+        self.partial = ""
         self.files = []
         self.error = ""
         self.created = time.time() if now is None else now
@@ -58,27 +60,47 @@ class SubAgentManager:
 
         def work():
             result = ""
+            partial = ""
             files = []
             error = ""
+            status = "failed"
+            reason = "error"
             try:
                 out = runner(task.prompt)
                 if isinstance(out, dict):
+                    outcome = str(out.get("status") or "").strip().lower()
                     result = str(out.get("text") or "").strip()[:800]
+                    partial = str(out.get("partial") or "").strip()[:400]
                     raw_files = out.get("files") or []
                     files = [f for f in raw_files if isinstance(f, dict) and f.get("path")]
+                    raw_err = str(out.get("error") or "").strip()[:200]
+                    if outcome == "timeout":
+                        status, reason, error = "failed", "timeout", (raw_err or "执行超时")
+                    elif outcome == "error":
+                        status, reason, error = "failed", "error", (raw_err or "执行失败")
+                    elif result or files:
+                        status, reason, error = "completed", "ok", ""
+                    else:
+                        status, reason, error = "failed", "empty", (raw_err or "空结果")
                 else:
                     result = str(out or "").strip()[:800]
-                if not result and not files:
-                    error = "空结果"
+                    if result:
+                        status, reason, error = "completed", "ok", ""
+                    else:
+                        status, reason, error = "failed", "empty", "空结果"
             except Exception as exc:  # 后台线程不能把异常抛给主循环
+                status = "failed"
+                reason = "error"
                 error = "{}: {}".format(type(exc).__name__, exc)[:200]
             with self._lock:
                 if task.status == "stopped":
                     return
                 task.result = result
+                task.partial = partial
                 task.files = files
                 task.error = error
-                task.status = "completed" if (result or files) else "failed"
+                task.reason = reason
+                task.status = status
                 task.finished = time.time()
             self._trim()
 

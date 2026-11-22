@@ -70,6 +70,9 @@ class Echo(Star):
         self.subagent = SubAgentManager()
         self.schedule = Schedule(str(directory / "schedules.sqlite3"))
         self.heartbeat = Heartbeat()
+        raw_timeout = self.config.get("task_timeout")
+        if raw_timeout is None or raw_timeout == "":
+            raw_timeout = os.environ.get("BOT_TASK_TIMEOUT")
         self.harness = CodexHarness(
             home=str(directory / "codex"),
             workdir_root=str(directory / "harness"),
@@ -77,7 +80,7 @@ class Echo(Star):
             api_base=str(self.config.get("api_base") or ""),
             api_key=str(self.config.get("api_key") or ""),
             model=str(self.config.get("model") or ""),
-            timeout=150,
+            timeout=raw_timeout,
         )
         cleanup_outbox(self.harness.outbox_root)
         self.limiter = MessageLimiter(per_minute=8, per_burst=3)

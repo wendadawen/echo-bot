@@ -178,9 +178,10 @@ TASK_PREFIX = (
     "禁止启动 HTTP/端口监听服务或常驻后台进程，禁止读取配置或环境变量密钥，"
     "禁止在结果中输出容器本地路径或内网 IP。"
     "如果需要向群友交付文件（如 HTML 网页、脚本、文档、表格等），"
-    "请直接把最终文件写入当前工作目录的 ./outbox/ 下（不要在 ./outbox/ 内建子目录；"
+    "或者任务属于深度调研、论文梳理、多方案对比，请把完整详细的中文报告直接写成"
+    "./outbox/ 下文件名清晰的 Markdown（如 report.md）或 HTML 文件（不要在 ./outbox/ 内建子目录；"
     "单次最多 3 个文件，每个不超过 20MB，严禁放入配置或密钥文件），"
-    "并在文字结论中简述生成的文件名和用途。"
+    "并在文字结论中只交 3 到 5 句核心摘要与文件名。"
     "直接给简洁、客观的事实结论；需要给代码或步骤时直接给原文，"
     "不要贴命令过程、日志或内部配置。任务："
 )
@@ -610,7 +611,10 @@ class Brain:
                         "reason": "face"}
             return {"replied": True, "text": "没存着表情", "reason": "face"}
         if action == "subagent":
-            dispatched = self._dispatch_task(group, reply, getattr(batch, "umo", ""))
+            dispatched = self._dispatch_task(
+                group, reply, getattr(batch, "umo", ""),
+                ack_text=decision.get("reply", ""),
+            )
             if dispatched:
                 return dispatched
             return {"replied": True, "text": "后台正忙", "reason": "subagent_busy",
@@ -729,7 +733,17 @@ class Brain:
     def _is_direct_task(text):
         return any(hint in str(text or "") for hint in TASK_HINTS)
 
-    def _dispatch_task(self, group, text, umo=""):
+    def _build_codex_task(self, prompt):
+        """拼装 Codex 任务指令并显式注入当前超时预算与调研交卷线。"""
+        timeout = getattr(self.harness, "timeout", 180)
+        wrap_up = max(15, int(timeout) - 25)
+        budget_hint = (
+            "（本次任务总限时 {} 秒，请务必在 {} 秒前结束检索并整理交卷，"
+            "不要无限追加核查导致超时；深度调研把完整报告写入 ./outbox/ 并在结论给简短摘要。）"
+        ).format(timeout, wrap_up)
+        return TASK_PREFIX + budget_hint + str(prompt or "").strip()
+
+    def _dispatch_task(self, group, text, umo="", ack_text=""):
         """把任务交给后台 Codex；返回可直接发群的提示，失败返回空。"""
         task = str(text or "").strip()
         if not task:
@@ -741,24 +755,41 @@ class Brain:
 
         def runner(prompt):
             if self.harness and self.harness.available():
-                full_task = TASK_PREFIX + prompt
+                full_task = self._build_codex_task(prompt)
                 if hasattr(self.harness, "run_with_files"):
-                    result = self.harness.run_with_files(group, full_task)
-                    if result and (result.get("text") or result.get("files")):
-                        return result
-                else:
-                    result = self.harness.run(group, full_task)
-                    if result:
-                        return result
+                    out = self.harness.run_with_files(group, full_task)
+                    if isinstance(out, dict):
+                        return out
+                    return {
+                        "status": "error",
+                        "text": "",
+                        "files": [],
+                        "error": "后台执行无输出",
+                    }
+                result = self.harness.run(group, full_task)
+                if result:
+                    return result
+                # 已接管 Codex 时绝不再静默降级给无联网的裸聊天模型。
+                return {
+                    "status": "error",
+                    "text": "",
+                    "files": [],
+                    "error": "后台执行无输出",
+                }
             return self.model.reply(TASK_PREFIX, [], prompt)[:600]
+
+        pre_history = self.store.recent(group, min(3, self.history_limit))
+        ack = _sanitize_meta_reply(_unwrap_reply_text(ack_text)) if ack_text else ""
+        if not ack or any(word in ack for word in FILTER_WORDS):
+            ack = "我瞅瞅，等会儿"
 
         task_id = self.subagent.submit("chat", task, runner)
         if not task_id:
             return {}
-        self._task_targets[task_id] = (group, umo)
-        self.store.add_message(group, "bot", "大肥鱼", "bot", "我瞅瞅，等会儿")
+        self._task_targets[task_id] = (group, umo, pre_history)
+        self.store.add_message(group, "bot", "大肥鱼", "bot", ack)
         self._last_reply_at[group] = time.time()
-        return {"replied": True, "text": "我瞅瞅，等会儿", "reason": "task"}
+        return {"replied": True, "text": ack, "reason": "task"}
 
     def spontaneous(self, group, umo=""):
         """群安静太久时主动开一句；失败或像客服就保持沉默。"""
@@ -805,7 +836,7 @@ class Brain:
                 parts.append(name)
         return "、".join(parts)
 
-    def _present_subagent_result(self, group, task):
+    def _present_subagent_result(self, group, task, pre_history=None):
         """把后台子代理的客观结果交给主模型，按群人格转成直接发群的话。"""
         raw = str(task.get("result") or "").strip()
         files = list(task.get("files") or [])
@@ -820,9 +851,14 @@ class Brain:
         if self.model is not None:
             instruction = SUBAGENT_CODE_INTRO_PROMPT if blocks else SUBAGENT_REPLY_PROMPT
             system = self._resolve_persona(group) + "\n\n" + instruction
+            raw_history = (
+                pre_history
+                if pre_history is not None
+                else self.store.recent(group, min(6, self.history_limit))
+            )
             clipped_history = [
                 {**item, "text": _clip(item.get("text"), SUBAGENT_HISTORY_ITEM_LIMIT)}
-                for item in self.store.recent(group, min(6, self.history_limit))
+                for item in raw_history
             ]
             history, _ = compaction.compact(
                 clipped_history,
@@ -871,11 +907,12 @@ class Brain:
         return "查完了，不过这会儿没组织好词，你再问我一句。"
 
     def poll_subagents(self):
-        """后台任务完成后交给主模型转述再回群；失败也回一句，别让群里干等。"""
+        """后台任务完成后交给主模型转述再回群；超时或失败也如实汇报，别让群里干等。"""
         if not self.subagent:
             return []
         rows = []
         outbox_root = getattr(self.harness, "outbox_root", "") if self.harness else ""
+        timeout_s = getattr(self.harness, "timeout", 180)
         for task in self.subagent.poll():
             target = self._task_targets.pop(task["id"], None)
             files = list(task.get("files") or [])
@@ -883,6 +920,9 @@ class Brain:
                 for item in files:
                     cleanup_file_entry(item.get("path", ""), outbox_root)
                 continue
+            group = target[0]
+            umo = target[1]
+            pre_history = target[2] if len(target) >= 3 else None
             ok = task.get("status") == "completed" and (
                 bool(task.get("result")) or bool(files)
             )
@@ -891,7 +931,24 @@ class Brain:
                 "刚才「{}」没弄成，等下再试".format(short_prompt)
                 if short_prompt else "没弄成，等下再试"
             )
-            text = self._present_subagent_result(target[0], task) if ok else fail_msg
+            if ok:
+                text = self._present_subagent_result(group, task, pre_history=pre_history)
+            elif task.get("reason") == "timeout":
+                partial = _clip(_sanitize_meta_reply(task.get("partial") or ""), 220)
+                prefix = (
+                    "刚才「{}」查了 {} 秒超时了，没来得及全整理完。".format(short_prompt, timeout_s)
+                    if short_prompt
+                    else "刚才这个任务查了 {} 秒超时了，没来得及全整理完。".format(timeout_s)
+                )
+                if partial:
+                    text = (
+                        "{}目前查到一半的进展：{}\n"
+                        "你可以缩窄一点范围再问我，或者发更聚焦的关键词继续查。"
+                    ).format(prefix, partial)
+                else:
+                    text = prefix + "你可以把范围缩窄一点再让我查。"
+            else:
+                text = fail_msg
             if not text:
                 ok = False
                 text = fail_msg
@@ -899,10 +956,10 @@ class Brain:
                 for item in files:
                     cleanup_file_entry(item.get("path", ""), outbox_root)
                 files = []
-            self.store.add_message(target[0], "bot", "大肥鱼", "bot", text)
+            self.store.add_message(group, "bot", "大肥鱼", "bot", text)
             rows.append({
-                "group": target[0],
-                "umo": target[1],
+                "group": group,
+                "umo": umo,
                 "text": text,
                 "files": files,
                 "task": task["id"],

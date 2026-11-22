@@ -1,7 +1,9 @@
 """Codex harness 单测：事件解析、可用性判断、配置生成。全部离线。"""
 
+import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -12,8 +14,8 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugin"))
 
 from astrbot_plugin_echo.core.harness import (  # noqa: E402
-    CodexHarness, MAX_FILE_BYTES, MAX_OUTPUT_FILES,
-    cleanup_file_entry, cleanup_outbox, parse_events,
+    CodexHarness, DEFAULT_TIMEOUT, MAX_FILE_BYTES, MAX_OUTPUT_FILES,
+    _parse_timeout, cleanup_file_entry, cleanup_outbox, parse_events,
 )
 
 
@@ -173,6 +175,105 @@ class TestHarness(unittest.TestCase):
             cleanup_outbox(harness.outbox_root, max_age=3600)
             self.assertFalse(expired_dir.exists())
             self.assertTrue(fresh_dir.exists())
+
+    def test_streaming_stdout_ok_and_timeout_captures_partial(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            binary = root / "codex"
+            binary.write_text("", encoding="utf-8")
+            harness = CodexHarness(
+                binary=str(binary),
+                home=str(root / "home"),
+                workdir_root=str(root / "work"),
+                outbox_root=str(root / "outbox"),
+                timeout=180,
+            )
+
+            # 1) 正常流式 stdout 退出返回 status="ok" 且携带 outbox 文件
+            ok_jsonl = "\n".join([
+                json.dumps({"type": "item.completed",
+                            "item": {"type": "agent_message", "text": "阶段整理中"}}),
+                json.dumps({"type": "item.completed",
+                            "item": {"type": "agent_message", "text": "调研完成，报告已生成。"}}),
+            ]) + "\n"
+
+            class StreamingOkProc:
+                pid = 999998
+                returncode = 0
+
+                def __init__(self, cwd):
+                    self.stdout = io.StringIO(ok_jsonl)
+                    (Path(cwd) / "outbox" / "report.md").write_text("# MoE", encoding="utf-8")
+
+                def wait(self, timeout=None):
+                    return 0
+
+            with patch("subprocess.Popen", side_effect=lambda cmd, **kw: StreamingOkProc(kw["cwd"])):
+                ok_res = harness.run_with_files("g1", "调研 MoE offloading")
+
+            self.assertEqual("ok", ok_res["status"])
+            self.assertEqual("调研完成，报告已生成。", ok_res["text"])
+            self.assertEqual("", ok_res["partial"])
+            self.assertEqual(1, len(ok_res["files"]))
+            self.assertEqual("report.md", ok_res["files"][0]["name"])
+            for f in ok_res["files"]:
+                cleanup_file_entry(f["path"], harness.outbox_root)
+
+            # 2) 超时通过真实 pipe 流式截获已完成阶段进展作为 partial，并丢弃未完成 outbox 文件
+            partial_line = json.dumps({
+                "type": "item.completed",
+                "item": {"type": "agent_message", "text": "已查到两类方案：MoE-Infinity 和 Pre-gated MoE"},
+            }) + "\n"
+
+            r_fd, w_fd = os.pipe()
+            w_file = os.fdopen(w_fd, "w", encoding="utf-8")
+
+            class StreamingTimeoutProc:
+                pid = 999997
+                returncode = None
+
+                def __init__(self, cwd):
+                    self.stdout = os.fdopen(r_fd, "r", encoding="utf-8")
+                    (Path(cwd) / "outbox" / "draft.md").write_text("draft", encoding="utf-8")
+                    w_file.write(partial_line)
+                    w_file.flush()
+
+                def wait(self, timeout=None):
+                    if self.returncode is None:
+                        self.returncode = -9
+                        raise subprocess.TimeoutExpired(cmd="codex", timeout=timeout)
+                    return self.returncode
+
+                def kill(self):
+                    try:
+                        w_file.close()
+                    except OSError:
+                        pass
+
+            with patch("subprocess.Popen", side_effect=lambda cmd, **kw: StreamingTimeoutProc(kw["cwd"])):
+                to_res = harness.run_with_files("g1", "调研 MoE offloading")
+
+            try:
+                w_file.close()
+            except OSError:
+                pass
+            self.assertEqual("timeout", to_res["status"])
+            self.assertEqual("", to_res["text"])
+            self.assertEqual("已查到两类方案：MoE-Infinity 和 Pre-gated MoE", to_res["partial"])
+            self.assertEqual([], to_res["files"])
+            self.assertEqual([], list(Path(harness.outbox_root).iterdir()))
+
+    def test_parse_timeout_bounds_and_invalid_values(self):
+        self.assertEqual(180, DEFAULT_TIMEOUT)
+        self.assertEqual(180, _parse_timeout(None))
+        self.assertEqual(180, _parse_timeout(False))
+        self.assertEqual(180, _parse_timeout(""))
+        self.assertEqual(180, _parse_timeout("abc"))
+        self.assertEqual(240, _parse_timeout("240"))
+        self.assertEqual(30, _parse_timeout(5))
+        self.assertEqual(600, _parse_timeout(9999))
+        h = CodexHarness(binary="/bin/true", home="/tmp/h", workdir_root="/tmp/w", timeout="240")
+        self.assertEqual(240, h.timeout)
 
 
 if __name__ == "__main__":

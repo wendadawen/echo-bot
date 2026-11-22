@@ -1081,6 +1081,173 @@ class TestIncidentRegressions(unittest.TestCase):
                 self.assertFalse(f2.exists())
                 sys.modules.pop("astrbot_plugin_echo.main", None)
 
+    def test_codex_timeout_never_falls_back_to_bare_model_and_reports_partial(self):
+        bare_calls = []
+
+        class GuardModel:
+            def reply(self, system, history, user_text):
+                if "后台执行助手" in system:
+                    bare_calls.append(user_text)
+                    return "我没有联网检索能力"
+                return "好的"
+
+        class FakeTimeoutHarness:
+            timeout = 180
+            outbox_root = ""
+
+            def available(self):
+                return True
+
+            def run_with_files(self, group_id, task):
+                return {
+                    "status": "timeout",
+                    "text": "",
+                    "partial": "已检索到 arXiv 2411.01433 等三篇论文，尚未完成横向对比",
+                    "files": [],
+                    "elapsed": 180.0,
+                    "timeout": 180,
+                    "error": "timeout",
+                }
+
+        store = Store(":memory:")
+        brain = Brain(store, GuardModel(), harness=FakeTimeoutHarness())
+        brain.subagent = SubAgentManager()
+        dispatched = brain._dispatch_task("g1", "帮我调研下目前比较先进的moe offloading论文", "demo:group-1")
+        self.assertEqual("task", dispatched["reason"])
+
+        rows = []
+        for _ in range(50):
+            rows = brain.poll_subagents()
+            if rows:
+                break
+            time.sleep(0.05)
+
+        self.assertEqual(1, len(rows))
+        self.assertFalse(rows[0]["ok"])
+        self.assertEqual([], bare_calls)
+        self.assertIn("180 秒超时", rows[0]["text"])
+        self.assertIn("arXiv 2411.01433", rows[0]["text"])
+        self.assertNotIn("没有联网", rows[0]["text"])
+
+    def test_subagent_action_can_reply_and_dispatch_together(self):
+        dispatched_tasks = []
+
+        class AckAndDispatchModel:
+            def reply(self, system, history, user_text):
+                return json.dumps({
+                    "action": "subagent",
+                    "reply": "抱歉刚才漏了，我现在补查。",
+                    "text": "调研目前先进的 MoE offloading 论文",
+                }, ensure_ascii=False)
+
+        class FakeOkHarness:
+            timeout = 180
+            outbox_root = ""
+
+            def available(self):
+                return True
+
+            def run_with_files(self, group_id, task):
+                dispatched_tasks.append(task)
+                return {
+                    "status": "ok",
+                    "text": "调研整理完成，详情见报告。",
+                    "partial": "",
+                    "files": [],
+                    "elapsed": 12.3,
+                    "timeout": 180,
+                    "error": "",
+                }
+
+        store = Store(":memory:")
+        brain = Brain(store, AckAndDispatchModel(), harness=FakeOkHarness())
+        brain.subagent = SubAgentManager()
+        res = brain.handle_batch(make_batch("你怎么没查？"))
+        self.assertEqual("task", res["reason"])
+        self.assertEqual("抱歉刚才漏了，我现在补查。", res["text"])
+        self.assertEqual("抱歉刚才漏了，我现在补查。", store.recent("g1", 5)[-1]["text"])
+
+        rows = []
+        for _ in range(50):
+            rows = brain.poll_subagents()
+            if rows:
+                break
+            time.sleep(0.05)
+        self.assertEqual(1, len(rows))
+        self.assertTrue(rows[0]["ok"])
+        self.assertTrue(dispatched_tasks and "180 秒" in dispatched_tasks[0])
+
+    def test_subagent_presentation_isolates_mid_task_chat_interruptions(self):
+        import threading
+
+        gate = threading.Event()
+        seen_histories = []
+
+        class PresentModel:
+            def reply(self, system, history, user_text):
+                seen_histories.append(list(history))
+                return "调研搞定了，关键结论在下面。"
+
+        class GatedHarness:
+            timeout = 180
+            outbox_root = ""
+
+            def available(self):
+                return True
+
+            def run_with_files(self, group_id, task):
+                gate.wait(timeout=2.0)
+                return {
+                    "status": "ok",
+                    "text": "整理了三篇核心 MoE offloading 论文。",
+                    "partial": "",
+                    "files": [],
+                }
+
+        store = Store(":memory:")
+        store.add_message("g1", "u1", "迷鹿", "user", "帮我调研下目前比较先进的moe offloading论文")
+        brain = Brain(store, PresentModel(), harness=GatedHarness())
+        brain.subagent = SubAgentManager()
+        brain._dispatch_task("g1", "调研 MoE offloading 论文", "demo:group-1")
+
+        # 任务运行期间群友发来一条无关超时提醒，不能混进转述模型上下文
+        store.add_message("g1", "u2", "和", "user", "任务有150s超时设置，注意咯")
+        store.add_message("g1", "bot", "大肥鱼", "bot", "收到啦")
+        gate.set()
+
+        rows = []
+        for _ in range(50):
+            rows = brain.poll_subagents()
+            if rows:
+                break
+            time.sleep(0.05)
+
+        self.assertEqual(1, len(rows))
+        self.assertTrue(seen_histories)
+        joined = "\n".join(h.get("text", "") for h in seen_histories[0])
+        self.assertNotIn("150s超时设置", joined)
+        self.assertNotIn("收到啦", joined)
+
+    def test_timeout_budget_prompt_and_task_timeout_schema(self):
+        h = CodexHarness(binary="/bin/true", home="/tmp/h", workdir_root="/tmp/w", timeout=180)
+        brain = Brain(Store(":memory:"), MockModel(), harness=h)
+        built = brain._build_codex_task("调研 MoE offloading")
+        self.assertIn("180 秒", built)
+        self.assertIn("155 秒", built)
+        self.assertIn("./outbox/", built)
+
+        schema_path = (
+            Path(__file__).resolve().parents[1]
+            / "plugin" / "astrbot_plugin_echo" / "_conf_schema.json"
+        )
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        self.assertIn("task_timeout", schema)
+        self.assertEqual("int", schema["task_timeout"]["type"])
+        self.assertEqual(180, schema["task_timeout"]["default"])
+
+        self.assertIn("严禁在纯 reply 里口头承诺", ACTION_PROMPT)
+        self.assertIn('"reply"', ACTION_PROMPT)
+
 
 class TestRhythm(unittest.TestCase):
     def test_carry_into_next_batch(self):

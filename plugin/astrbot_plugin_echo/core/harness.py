@@ -12,12 +12,31 @@ import shutil
 import signal
 import stat
 import subprocess
+import threading
 import time
 import uuid
 from pathlib import Path
 
 MAX_OUTPUT = 800
-DEFAULT_TIMEOUT = 150
+DEFAULT_TIMEOUT = 180
+MIN_TIMEOUT = 30
+MAX_TIMEOUT = 600
+
+
+def _parse_timeout(value, default=DEFAULT_TIMEOUT):
+    """解析后台任务超时（秒），支持数字与数字字符串并限制在 [30, 600]。"""
+    if value is None or isinstance(value, bool):
+        return default
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return default
+        value = stripped
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(MIN_TIMEOUT, min(MAX_TIMEOUT, parsed))
 # 容器本身就是隔离边界，容器内再套 bwrap 会因 user namespace 限制直接失败。
 # 所以用 danger-full-access，靠外层容器的目录权限和降权进程收边界。
 SANDBOX = "danger-full-access"
@@ -127,7 +146,7 @@ class CodexHarness:
         self.api_base = str(api_base or "")
         self.api_key = str(api_key or "")
         self.model = str(model or "")
-        self.timeout = int(timeout)
+        self.timeout = _parse_timeout(timeout)
 
     def available(self):
         return bool(self.binary and self.home and os.path.exists(self.binary))
@@ -270,16 +289,27 @@ class CodexHarness:
         return collected
 
     def run_with_files(self, group_id, task):
-        """在独立临时目录跑 Codex，并收集 ./outbox/ 中安全合规的文件供回群发送。"""
+        """在独立临时目录跑 Codex，流式捕获进度并返回结构化状态与 ./outbox/ 文件。"""
+        def _empty_result(status="empty", partial="", error="", elapsed=0.0):
+            return {
+                "status": status,
+                "text": "",
+                "partial": partial,
+                "files": [],
+                "elapsed": elapsed,
+                "timeout": self.timeout,
+                "error": error,
+            }
+
         task = str(task or "").strip()
         if not task or not self.available():
-            return {"text": "", "files": []}
+            return _empty_result(status="empty")
         self._prepare_dirs()
         self._ensure_config()
         try:
             workdir = self._workdir(group_id)
-        except OSError:
-            return {"text": "", "files": []}
+        except OSError as exc:
+            return _empty_result(status="error", error=str(exc))
 
         task_id = "task-" + uuid.uuid4().hex[:10]
         task_dir = workdir / task_id
@@ -292,9 +322,9 @@ class CodexHarness:
                     os.chmod(path, 0o700)
                 except OSError:
                     pass
-        except OSError:
+        except OSError as exc:
             shutil.rmtree(task_dir, ignore_errors=True)
-            return {"text": "", "files": []}
+            return _empty_result(status="error", error=str(exc))
 
         env = dict(os.environ)
         env["CODEX_HOME"] = self.home
@@ -303,29 +333,73 @@ class CodexHarness:
         if self.api_key:
             env["ECHO_API_KEY"] = self.api_key
         cmd = self._command(task)
+        started = time.monotonic()
         try:
             proc = subprocess.Popen(
                 cmd, cwd=str(task_dir), env=env, stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 text=True, start_new_session=True,
             )
-        except OSError:
+        except OSError as exc:
             shutil.rmtree(task_dir, ignore_errors=True)
-            return {"text": "", "files": []}
+            return _empty_result(status="error", error=str(exc))
 
         timed_out = False
         stdout = ""
         collected = []
+        proc_stdout = getattr(proc, "stdout", None)
         try:
-            stdout, _ = proc.communicate(timeout=self.timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            # Codex 还会起 bwrap / shell，必须杀整个进程组，避免遗留子进程。
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except (ProcessLookupError, PermissionError, OSError):
-                proc.kill()
-            proc.communicate()
+            if proc_stdout is not None:
+                lines = []
+
+                def _drain():
+                    try:
+                        for line in proc_stdout:
+                            lines.append(line)
+                    except Exception:
+                        pass
+
+                reader = threading.Thread(
+                    target=_drain, name="echo-codex-stdout", daemon=True
+                )
+                reader.start()
+                try:
+                    proc.wait(timeout=self.timeout)
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+                    # Codex 还会起 bwrap / shell，必须杀整个进程组，避免遗留子进程。
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError, OSError):
+                        proc.kill()
+                    try:
+                        proc.wait(timeout=5)
+                    except (subprocess.TimeoutExpired, OSError):
+                        pass
+                finally:
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError, OSError):
+                        try:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        except (ProcessLookupError, PermissionError, OSError):
+                            pass
+                    reader.join(timeout=2)
+                    try:
+                        proc_stdout.close()
+                    except OSError:
+                        pass
+                stdout = "".join(lines)
+            else:
+                try:
+                    stdout, _ = proc.communicate(timeout=self.timeout)
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError, OSError):
+                        proc.kill()
+                    proc.communicate()
         finally:
             # 无论正常退出还是超时，都杀掉残余进程组并清空本次任务目录；仅在未超时时回收 outbox 文件。
             try:
@@ -340,9 +414,35 @@ class CodexHarness:
             shutil.rmtree(task_dir, ignore_errors=True)
             cleanup_outbox(self.outbox_root)
 
+        elapsed = round(time.monotonic() - started, 1)
         if timed_out:
-            return {"text": "", "files": []}
-        return {"text": parse_events(stdout, MAX_OUTPUT), "files": collected}
+            partial = parse_events(stdout, limit=400)
+            return {
+                "status": "timeout",
+                "text": "",
+                "partial": partial,
+                "files": [],
+                "elapsed": elapsed,
+                "timeout": self.timeout,
+                "error": "timeout",
+            }
+        answer = parse_events(stdout, MAX_OUTPUT)
+        rc = getattr(proc, "returncode", 0)
+        if answer or collected:
+            status, err_msg = "ok", ""
+        elif rc not in (0, None):
+            status, err_msg = "error", "exit {}".format(rc)
+        else:
+            status, err_msg = "empty", "empty output"
+        return {
+            "status": status,
+            "text": answer,
+            "partial": "",
+            "files": collected,
+            "elapsed": elapsed,
+            "timeout": self.timeout,
+            "error": err_msg,
+        }
 
     def run(self, group_id, task):
         result = self.run_with_files(group_id, task)
