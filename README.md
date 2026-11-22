@@ -6,7 +6,7 @@
 
 ## 装起来
 
-需要 Docker（Docker Desktop 或 Colima 都行）和 Compose V2。clone 之后：
+需要 Docker（Docker Desktop 或 Colima 都行），以及 `docker compose` 命令（V2 及以上）。clone 之后：
 
 ```bash
 ./scripts/up.sh
