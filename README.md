@@ -2,8 +2,6 @@
 
 基于 AstrBot 的中文群聊机器人插件，提供 @ 唤醒、按概率接话与定时提醒。消息历史与提醒按群隔离。
 
-项目以单一容器镜像交付：AstrBot、echo-bot 插件，以及首次启动时按 CPU 架构补齐的 QQ 客户端与 NapCat。镜像由 GitHub Actions 构建并发布至 GHCR。
-
 ## 部署
 
 环境要求：Docker、`docker compose` V2 及以上。
