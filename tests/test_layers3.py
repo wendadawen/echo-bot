@@ -159,8 +159,10 @@ class TestTaskRouting(unittest.TestCase):
 
     def test_keyword_hits(self):
         self.assertTrue(self.brain._is_direct_task("查询苏州天气"))
-        self.assertTrue(self.brain._is_direct_task("今天天气怎么样"))
+        self.assertTrue(self.brain._is_direct_task("帮我查一下这个链接"))
         self.assertFalse(self.brain._is_direct_task("今天好累"))
+        # 「天气」不在关键词里，靠模型自己判断要不要调工具。
+        self.assertFalse(self.brain._is_direct_task("今天天气怎么样"))
 
     def test_dispatch_returns_task(self):
         result = self.brain._dispatch_task("g1", "查询苏州天气", "demo:group-1")
