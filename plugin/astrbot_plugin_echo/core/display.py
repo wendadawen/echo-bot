@@ -5,11 +5,23 @@
 带不带引用和表情。纯函数与进程内状态，不依赖框架。
 """
 
+import re
 import time
 from dataclasses import dataclass, field
 
 from .expression import delay as expression_delay
 from .expression import split as expression_split
+
+MARK_PATTERN = re.compile(r"^#+\s*")
+
+
+def clean(part):
+    """去掉模型偶尔带出的反引号、粗体和标题记号。"""
+    text = str(part or "").strip()
+    text = text.strip("`").strip()
+    text = text.replace("**", "")
+    text = MARK_PATTERN.sub("", text)
+    return text.strip()
 
 
 @dataclass
@@ -33,7 +45,7 @@ def merge_burst(parts, min_len=6, max_merge=2):
     rows = []
     merged = 0
     for part in parts or []:
-        text = str(part or "").strip()
+        text = clean(part)
         if not text:
             continue
         if rows and len(text) < min_len and merged < max_merge:

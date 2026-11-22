@@ -218,6 +218,11 @@ class TestDisplay(unittest.TestCase):
                          display.merge_burst(["这是一句完整的话", "嗯", "行"]))
         self.assertEqual(["嗯行"], display.merge_burst(["嗯", "行"]))
 
+    def test_clean_removes_markdown_marks(self):
+        self.assertEqual("不告诉你", display.clean("`不告诉你`"))
+        self.assertEqual("结论", display.clean("## 结论"))
+        self.assertEqual("别加花活", display.clean("**别加花活**"))
+
     def test_plan_splits_and_delays(self):
         out = display.plan("第一句。第二句！第三句？第四句。", max_parts=3)
         self.assertLessEqual(len(out.parts), 3)
