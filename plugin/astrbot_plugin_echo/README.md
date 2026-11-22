@@ -1,30 +1,11 @@
-# 大肥鱼
+# echo-bot
 
 群聊机器人 echo-bot。
 
-## 命令
+## 使用
 
-| 命令 | 说明 |
-| --- | --- |
-| `/帮助` | 命令列表 |
-| `/待办` | 列出本群未完成的提醒 |
-| `/提醒 内容` | 按描述的时间 @ 发起人 |
-| `/专注 话题` | 只接这个话题，别的先不接 |
-| `/随便` | 退出专注或静默 |
-| `/闭嘴` | 该群不再说话，@ 也不回 |
-| `/忘掉` | 清空本群聊天记录 |
-
-群里 @ 它一定回，平时偶尔接话。只处理群消息。
-
-## 配置
-
-| 配置项 | 默认值 | 说明 |
-| --- | --- | --- |
-| `api_key` | 空 | 模型凭据；留空使用内置模拟回复 |
-| `api_base` | `https://api.openai.com/v1` | OpenAI 兼容接口地址 |
-| `model` | `gpt-4o-mini` | 模型 ID |
-| `reminder_enabled` | `true` | 定时提醒开关 |
+群里 `@` 机器人即可对话，发送 `/帮助` 查看命令。
 
 ## 许可
 
-MIT。仓库：https://github.com/wendadawen/echo-bot
+MIT，见 [LICENSE](https://github.com/wendadawen/echo-bot/blob/main/LICENSE)。
