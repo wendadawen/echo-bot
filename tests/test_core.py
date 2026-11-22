@@ -191,6 +191,14 @@ class TestBrain(unittest.TestCase):
         self.assertNotIn("说中", result["text"])
         self.assertTrue(result["text"])
 
+    def test_soft_words_cover_main_categories(self):
+        from astrbot_plugin_echo.core.brain import HARD_REPLIES, SOFT_WORDS
+
+        for word in ("抱歉", "能力有限", "谢谢", "平心而论", "怕说过头", "作为 AI"):
+            self.assertIn(word, SOFT_WORDS)
+        self.assertGreaterEqual(len(SOFT_WORDS), 100)
+        self.assertGreaterEqual(len(HARD_REPLIES), 5)
+
     def test_model_parse_extracts_json_from_prose(self):
         model = ScriptedModel('好的，结果是 {"kind":"once","minutes":10,"text":"开会"}')
         brain = Brain(Store(":memory:"), model, 0.0)
