@@ -118,7 +118,8 @@ def learn_style(messages, profile=None):
     if lengths:
         avg = sum(lengths) / len(lengths)
         profile["avg_len"] = round(avg, 1)
-        profile["max_len"] = max(40, min(120, int(avg * 3)))
+        # 只作提示参考；上限按 QQ 单条消息上限给足，不再按群聊平均长度压短。
+        profile["max_len"] = 4000
         profile["punctuation"] = round(marks / len(lengths), 2)
     profile["catchphrases"] = [w for w, n in
                                sorted(words.items(), key=lambda kv: (-kv[1], kv[0]))
