@@ -102,6 +102,27 @@ class TestBrain(unittest.TestCase):
         self.assertEqual("command", result["reason"])
         self.assertIn("/说话", result["text"])
 
+    def test_focus_command_sets_topic_and_resume(self):
+        from astrbot_plugin_echo.core.modes import ModePolicy
+
+        store, brain = make_brain(0.0)
+        brain.modes = ModePolicy()
+        self.assertIn("只聊归并排序", brain.handle(msg("/专注 归并排序"))["text"])
+        self.assertEqual("focus", brain.modes.mode("g1"))
+        self.assertTrue(brain.modes.focus_hit("g1", "归并排序怎么拆"))
+        self.assertFalse(brain.modes.focus_hit("g1", "今晚吃什么"))
+        self.assertIn("随便聊", brain.handle(msg("/随便"))["text"])
+        self.assertEqual("normal", brain.modes.mode("g1"))
+
+    def test_mode_command_reports_state(self):
+        from astrbot_plugin_echo.core.modes import ModePolicy
+
+        store, brain = make_brain(0.0)
+        brain.modes = ModePolicy()
+        self.assertIn("正常", brain.handle(msg("/模式"))["text"])
+        brain.handle(msg("/闭嘴"))
+        self.assertIn("闭嘴", brain.handle(msg("/模式"))["text"])
+
     def test_reply_is_written_to_history(self):
         store, brain = make_brain()
         brain.handle(msg("你好"))

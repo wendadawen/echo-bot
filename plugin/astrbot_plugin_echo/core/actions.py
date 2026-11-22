@@ -21,6 +21,7 @@ ACTION_SPECS = {
     "send_face": ("发一个表情", "text", True, "group"),
     "view_image": ("看这张图", "text", False, "any"),
     "schedule": ("设一个提醒", "text", False, "any"),
+    "subagent": ("把耗时的活丢到后台去做", "text", True, "any"),
     "read_result": ("读取上一轮工具结果", "text", False, "any"),
 }
 

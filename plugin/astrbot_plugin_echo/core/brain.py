@@ -8,10 +8,12 @@ from datetime import datetime, timedelta
 
 from .actions import ToolLoop
 from .context import ContextBuilder
+from .display import plan as display_plan
 from .expression import (apply_jargon, decorate, learn_expressions, learn_style,
                          load_char_frequency, mine_jargon, typo)
 from .memory import MEMORY_PROMPT, parse_memory_full
 from .messages import Message
+from . import compaction, mentions
 from .rhythm import Batch
 
 PERSONA = (
@@ -137,7 +139,8 @@ class Brain:
                  window=WINDOW_SECONDS, cooldown=COOLDOWN_SECONDS,
                  window_cooldown=WINDOW_COOLDOWN_SECONDS,
                  memory=None, emoji_bank=None, char_frequency=None,
-                 capabilities=None):
+                 capabilities=None, modes=None, attention=None, persons=None,
+                 monitor=None, prompt_store=None, personas=None, subagent=None):
         self.store = store
         self.model = model
         self.chance = chance
@@ -154,7 +157,18 @@ class Brain:
         self.frequency = load_char_frequency(char_frequency)
         self.style = {}
         self.expressions = {}
-        self.context_builder = ContextBuilder(self.persona, memory, self.style)
+        self.modes = modes
+        self.attention = attention
+        self.persons = persons
+        self.monitor = monitor
+        self.prompt_store = prompt_store
+        self.personas = personas
+        self.subagent = subagent
+        self._task_targets = {}
+        self.context_builder = ContextBuilder(
+            self.persona, memory, self.style, attention=attention,
+            modes=modes, persons=persons,
+        )
         self.tool_loop = ToolLoop(model, capabilities=self.capabilities)
         self._batch_count = 0
 
@@ -206,14 +220,62 @@ class Brain:
         return result
 
     def handle_batch(self, batch):
-        """一批消息进入决策层：分层上下文 → 有限动作集 → 工具循环 → 一条回复。"""
+        """一批消息进入决策层：模式与提及判定 → 分层上下文 → 动作集 → 回复。"""
         group = batch.group_id
         text = batch.text.strip()
         if not text:
             return {"replied": False, "text": "", "reason": "empty"}
-        user_name = batch.items[-1].user_name if batch.items else ""
-        self.store.add_message(group, "bot", user_name, "user", text)
+        items = getattr(batch, "items", None) or []
+        last = items[-1] if items else None
+        user_name = getattr(last, "user_name", "") if last else ""
+        user_id = getattr(last, "user_id", "") if last else ""
+
+        # 人物档案先落库：即使这轮沉默，叫法与活跃度也要留下。
+        if self.persons:
+            for item in items[-8:]:
+                self.persons.observe(
+                    group, getattr(item, "user_id", ""),
+                    getattr(item, "user_name", ""),
+                    now=getattr(item, "ts", None),
+                )
+
+        info = mentions.detect(
+            text, at=bool(getattr(batch, "mentioned", False)),
+            self_names=("回声",), quoted=getattr(batch, "quote", "") or "",
+        )
+        batch.mention_info = info
+
+        # 模式：静默只让 @ 穿透，专注只接话题内的消息。
+        if self.modes:
+            if not self.modes.allows(group, mentioned=info.mentioned):
+                return {"replied": False, "text": "", "reason": "mode_quiet"}
+            if not self.modes.focus_hit(group, text):
+                return {"replied": False, "text": "", "reason": "off_topic"}
+
+        # 注意力：记录这批文本；活跃漂移消耗一次预算。
+        if self.attention:
+            self.attention.observe(group, text)
+            if self.attention.level(group, text) == "active":
+                self.attention.consume(group)
+
+        self.store.add_message(group, user_id or "unknown", user_name, "user", text)
         history = self.store.recent(group, 12)
+
+        # 上下文压缩：超预算时保留最近与点名消息，其余压成摘要。
+        history, summary = compaction.compact(
+            history, budget_tokens=900, keep_recent=5, self_names=("回声",)
+        )
+        batch.history_summary = summary
+
+        # 人格：按群启用的优先，其次提示词覆盖，最后内置。
+        persona = self.persona
+        if self.personas:
+            active = self.personas.active(group)
+            if active:
+                persona = active.compose(getattr(batch, "scene", "group"))
+        if self.prompt_store:
+            persona = self.prompt_store.get("persona", group, persona)
+        self.context_builder.persona = persona
 
         # 回复效果反馈：有人接了自己上一句话，就记一次正反馈。
         if self.memory and history and history[-1].get("role") == "bot":
@@ -262,6 +324,18 @@ class Brain:
                 return True, ("__FACE__" + str(path)) if path else "没存着表情"
             if action == "read_result":
                 return False, self.tool_loop.results.get(group_id, payload)
+            if action == "subagent":
+                if not self.subagent:
+                    return False, "后台没开"
+
+                def runner(prompt):
+                    return self.model.reply(self.persona, [], prompt)[:600]
+
+                task_id = self.subagent.submit("chat", payload, runner)
+                if not task_id:
+                    return False, "后台正忙"
+                self._task_targets[task_id] = (group_id, getattr(batch, "umo", ""))
+                return True, "放后台了"
             return False, "这个动作还没接上"
 
         started = time.time()
@@ -269,15 +343,23 @@ class Brain:
                                       scene=getattr(batch, "scene", "group"))
         elapsed = time.time() - started
         if not decision:
+            if self.monitor:
+                self.monitor.record(group, "model_error", ok=False, latency=elapsed)
             return {"replied": False, "text": "", "reason": "model_error"}
         action, reply = decision["action"], decision["text"]
         if action in ("silent", "wait"):
+            if self.monitor:
+                self.monitor.record(group, action, ok=True, latency=elapsed)
             return {"replied": False, "text": "", "reason": action,
                     "wait_seconds": reply if action == "wait" else 0}
         if reply.startswith("__FACE__"):
+            if self.monitor:
+                self.monitor.record(group, "face", ok=True, latency=elapsed)
             return {"replied": True, "text": "", "image": reply[len("__FACE__"):],
                     "reason": "face", "elapsed": elapsed}
         if not reply:
+            if self.monitor:
+                self.monitor.record(group, "empty_reply", ok=False, latency=elapsed)
             return {"replied": False, "text": "", "reason": "silent"}
         if any(word in reply for word in SOFT_WORDS):
             reply = random.choice(HARD_REPLIES)
@@ -293,7 +375,33 @@ class Brain:
         self._batch_count += 1
         if self.memory and self._batch_count % 4 == 0:
             self._summarize(group, text)
-        return {"replied": True, "text": reply, "reason": action, "elapsed": elapsed}
+        planned = display_plan(reply, elapsed=elapsed)
+        if self.monitor:
+            tokens = (compaction.estimate_tokens(system)
+                      + compaction.estimate_tokens(text)
+                      + compaction.estimate_tokens(reply))
+            self.monitor.record(group, "reply", ok=True, latency=elapsed,
+                                tokens=tokens, detail=action)
+        return {"replied": True, "text": reply, "reason": action,
+                "elapsed": elapsed, "parts": planned.parts,
+                "delays": planned.delays}
+
+    def poll_subagents(self):
+        """后台任务完成后取回结论，交给平台层发回原群。"""
+        if not self.subagent:
+            return []
+        rows = []
+        for task in self.subagent.poll():
+            target = self._task_targets.pop(task["id"], None)
+            if not target or not task.get("result"):
+                continue
+            rows.append({
+                "group": target[0],
+                "umo": target[1],
+                "text": task["result"],
+                "task": task["id"],
+            })
+        return rows
 
     def _summarize(self, group, text):
         """每隔几批把对话压成 Episode / 记忆点 / 人物档案 / 关系。"""
@@ -369,10 +477,36 @@ class Brain:
             return HELP
         if cmd in ("闭嘴", "shutup"):
             self._muted.add(msg.group_id)
+            if self.modes:
+                self.modes.set(msg.group_id, "quiet")
             return "行，闭嘴。"
         if cmd in ("说话", "开麦", "speak"):
             self._muted.discard(msg.group_id)
+            if self.modes:
+                self.modes.reset(msg.group_id)
             return "行，说吧。"
+        if cmd.startswith("专注"):
+            topic = cmd[2:].strip()
+            if not topic:
+                return "专注什么？"
+            self._muted.discard(msg.group_id)
+            if self.modes:
+                self.modes.set(msg.group_id, "focus", topic=topic)
+            return "行，只聊{}。".format(topic[:20])
+        if cmd in ("随便", "正常", "normal"):
+            self._muted.discard(msg.group_id)
+            if self.modes:
+                self.modes.reset(msg.group_id)
+            return "行，随便聊。"
+        if cmd == "模式":
+            if not self.modes:
+                return "正常。"
+            state = self.modes.state(msg.group_id)
+            if state.get("mode") == "quiet":
+                return "现在闭嘴。"
+            if state.get("mode") == "focus":
+                return "只聊{}。".format(state.get("topic") or "")
+            return "正常。"
         if cmd == "待办":
             items = self.store.pending_reminders(msg.group_id)
             if not items:

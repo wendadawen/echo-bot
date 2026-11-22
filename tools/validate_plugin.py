@@ -25,6 +25,15 @@ REQUIRED = [
     "core/memory.py",
     "core/vision.py",
     "core/context.py",
+    "core/prompts.py",
+    "core/modes.py",
+    "core/attention.py",
+    "core/person_info.py",
+    "core/mentions.py",
+    "core/compaction.py",
+    "core/display.py",
+    "core/monitor.py",
+    "core/subagent.py",
 ]
 
 META_FIELDS = ["name", "display_name", "desc", "version", "author", "repo", "astrbot_version"]

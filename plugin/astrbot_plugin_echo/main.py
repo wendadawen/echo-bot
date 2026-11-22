@@ -14,13 +14,20 @@ from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.message_components import At, Image, Plain
 from astrbot.api.star import Context, Star, StarTools
 
+from .core.attention import AttentionTracker
 from .core.brain import PERSONA, Brain
+from .core.display import MessageLimiter
 from .core.expression import delay, split
 from .core.memory import Memory
 from .core.messages import Message
 from .core.models import build_model
+from .core.modes import ModePolicy
+from .core.monitor import Monitor
+from .core.person_info import PersonStore
+from .core.prompts import PersonaLibrary, PromptStore
 from .core.rhythm import Item, Rhythm
 from .core.store import Store
+from .core.subagent import SubAgentManager
 from .core.vision import EmojiBank
 
 PLUGIN_NAME = "astrbot_plugin_echo"
@@ -45,6 +52,14 @@ class Echo(Star):
         self.memory = Memory(str(directory / "memory.sqlite3"))
         self.emoji_bank = EmojiBank(directory / "emojis")
         self.rhythm = Rhythm()
+        self.persons = PersonStore(str(directory / "persons.sqlite3"))
+        self.monitor = Monitor(str(directory / "monitor.sqlite3"))
+        self.attention = AttentionTracker()
+        self.modes = ModePolicy()
+        self.prompts = PromptStore(directory / "prompts")
+        self.personas = PersonaLibrary(directory / "personas")
+        self.subagent = SubAgentManager()
+        self.limiter = MessageLimiter(per_minute=8, per_burst=3)
         self.brain = Brain(
             self.store,
             self.model,
@@ -53,7 +68,14 @@ class Echo(Star):
             emoji_bank=self.emoji_bank,
             char_frequency=str(directory / "char_frequency.json"),
             capabilities={"view_image": True, "send_face": True,
-                          "schedule": True, "wait": True},
+                          "schedule": True, "wait": True, "subagent": True},
+            modes=self.modes,
+            attention=self.attention,
+            persons=self.persons,
+            monitor=self.monitor,
+            prompt_store=self.prompts,
+            personas=self.personas,
+            subagent=self.subagent,
         )
         self.reminders_enabled = bool(self.config.get("reminder_enabled", True))
         self._reminder_task = None
@@ -196,11 +218,27 @@ class Echo(Star):
                     if result.get("image"):
                         await self._send_image(group, batch.umo, result["image"])
                     else:
-                        for part in split(result.get("text", "")):
+                        parts = result.get("parts") or split(result.get("text", ""))
+                        delays = result.get("delays") or []
+                        parts = self.limiter.cap_parts(parts)
+                        for index, part in enumerate(parts):
+                            if not self.limiter.allow(group):
+                                break
                             await self.context.send_message(
                                 batch.umo, MessageChain([Plain(part)])
                             )
-                            await asyncio.sleep(delay(part, elapsed=elapsed))
+                            self.limiter.record(group)
+                            wait = (delays[index] if index < len(delays)
+                                    else delay(part, elapsed=elapsed))
+                            await asyncio.sleep(wait)
+                # 后台任务完成：把结论发回原群。
+                for task in self.brain.poll_subagents():
+                    if not task.get("umo"):
+                        continue
+                    for part in split(task.get("text", ""))[:2]:
+                        await self.context.send_message(
+                            task["umo"], MessageChain([Plain(part)])
+                        )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
