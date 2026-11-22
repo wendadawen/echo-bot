@@ -67,7 +67,8 @@ HARD_REPLIES = (
 HELP = (
     "/帮助  显示本说明\n"
     "/待办  看本群待办\n"
-    "/提醒  时间跟事儿一起发，像「每天22:00 交周报」"
+    "/提醒  时间跟事儿一起发，像「每天22:00 交周报」\n"
+    "/闭嘴  不说话，/说话 恢复"
 )
 
 FORMAT_HINT = "没懂，发 /帮助"
@@ -111,6 +112,7 @@ class Brain:
         self.window_cooldown = window_cooldown
         self._windows = {}
         self._last_reply = {}
+        self._muted = set()
 
     def handle(self, msg):
         """处理一条群消息；返回回复文本，由平台层负责真正发送。"""
@@ -153,6 +155,8 @@ class Brain:
 
     def _should_reply(self, msg, text, now):
         """按对话节奏决定是否开口；返回原因，None 表示保持沉默。"""
+        if msg.group_id in self._muted:
+            return None
         if msg.mentioned:
             return "mention"
         in_window = now < self._windows.get(msg.group_id, 0)
@@ -199,6 +203,12 @@ class Brain:
         cmd = text.lstrip("/").strip()
         if cmd in ("帮助", "help"):
             return HELP
+        if cmd in ("闭嘴", "shutup"):
+            self._muted.add(msg.group_id)
+            return "行，闭嘴。"
+        if cmd in ("说话", "开麦", "speak"):
+            self._muted.discard(msg.group_id)
+            return "行，说吧。"
         if cmd == "待办":
             items = self.store.pending_reminders(msg.group_id)
             if not items:

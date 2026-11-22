@@ -87,6 +87,21 @@ class TestBrain(unittest.TestCase):
         self.assertEqual("question", brain.handle(msg("怎么了", mentioned=False))["reason"])
         self.assertFalse(brain.handle(msg("在吗", mentioned=False))["replied"])
 
+    def test_mute_silences_until_unmute(self):
+        store, brain = make_brain(0.0)
+        self.assertIn("闭嘴", brain.handle(msg("/闭嘴"))["text"])
+        self.assertFalse(brain.handle(msg("随便聊聊"))["replied"])
+        self.assertFalse(brain.handle(msg("在吗", mentioned=False))["replied"])
+        self.assertIn("说", brain.handle(msg("/说话"))["text"])
+        self.assertTrue(brain.handle(msg("在吗"))["replied"])
+
+    def test_commands_still_work_while_muted(self):
+        store, brain = make_brain(0.0)
+        brain.handle(msg("/闭嘴"))
+        result = brain.handle(msg("/帮助"))
+        self.assertEqual("command", result["reason"])
+        self.assertIn("/说话", result["text"])
+
     def test_reply_is_written_to_history(self):
         store, brain = make_brain()
         brain.handle(msg("你好"))
