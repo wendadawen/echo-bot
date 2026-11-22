@@ -13,6 +13,7 @@ REQUIRED = [
     "metadata.yaml",
     "_conf_schema.json",
     "requirements.txt",
+    "README.md",
     "core/__init__.py",
     "core/brain.py",
     "core/messages.py",

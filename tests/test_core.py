@@ -175,6 +175,7 @@ class TestBrain(unittest.TestCase):
         brain = Brain(Store(":memory:"), model, 1.0)
         brain.handle(msg("随便聊聊"))
         self.assertIn("不要编造", model.systems[0])
+        self.assertIn("多人群聊", model.systems[0])
 
     def test_model_parse_extracts_json_from_prose(self):
         model = ScriptedModel('好的，结果是 {"kind":"once","minutes":10,"text":"开会"}')
