@@ -99,8 +99,8 @@ class ContextBuilder:
             state, until = self.activity.get(group_id, ("", 0))
             return "当前状态：" + state if state and time.time() < until else ""
         if name == "effect":
-            rate = self.memory.effect_rate(group_id) if self.memory else 0.5
-            return "最近你的话常没人接，少说两句" if rate < 0.3 else ""
+            # 不再因为「回复率低」自我抑制；测试期这种提示只会让它更沉默。
+            return ""
         if name == "defect":
             max_len = self.style.get("max_len")
             # 4000 是 QQ 上限，不是有效约束；只有小值才值得提醒。

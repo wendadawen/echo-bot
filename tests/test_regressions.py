@@ -202,6 +202,11 @@ class TestIncidentRegressions(unittest.TestCase):
         self.assertTrue(result["replied"])
         self.assertIn("黎曼", result["text"])
 
+    def test_context_has_no_effect_suppression(self):
+        from astrbot_plugin_echo.core.context import ContextBuilder
+        builder = ContextBuilder("persona", None)
+        self.assertEqual("", builder._section("effect", "g1", "", "", None))
+
     def test_empty_batch_is_silent(self):
         self.assertEqual("empty", make_brain().handle_batch(make_batch(""))["reason"])
 
