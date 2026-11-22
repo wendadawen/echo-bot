@@ -100,3 +100,10 @@ class Store:
         with self._lock:
             self._db.execute("UPDATE reminders SET last_fired = ? WHERE id = ?", (day, rid))
             self._db.commit()
+
+    def clear_messages(self, group_id):
+        """清空本群聊天记录（提醒与记忆不动）。"""
+        with self._lock:
+            cur = self._db.execute("DELETE FROM messages WHERE group_id = ?", (group_id,))
+            self._db.commit()
+            return cur.rowcount

@@ -34,6 +34,10 @@ REQUIRED = [
     "core/display.py",
     "core/monitor.py",
     "core/subagent.py",
+    "core/schedule.py",
+    "core/heartbeat.py",
+    "core/jargon.py",
+    "core/forward.py",
 ]
 
 META_FIELDS = ["name", "display_name", "desc", "version", "author", "repo", "astrbot_version"]

@@ -18,6 +18,10 @@ from .core.attention import AttentionTracker
 from .core.brain import PERSONA, Brain
 from .core.display import MessageLimiter
 from .core.expression import delay, split
+from .core.forward import extract as forward_extract
+from .core.forward import looks_like_forward
+from .core.forward import render as forward_render
+from .core.heartbeat import Heartbeat
 from .core.memory import Memory
 from .core.messages import Message
 from .core.models import build_model
@@ -26,6 +30,7 @@ from .core.monitor import Monitor
 from .core.person_info import PersonStore
 from .core.prompts import PersonaLibrary, PromptStore
 from .core.rhythm import Item, Rhythm
+from .core.schedule import Schedule
 from .core.store import Store
 from .core.subagent import SubAgentManager
 from .core.vision import EmojiBank
@@ -59,7 +64,11 @@ class Echo(Star):
         self.prompts = PromptStore(directory / "prompts")
         self.personas = PersonaLibrary(directory / "personas")
         self.subagent = SubAgentManager()
+        self.schedule = Schedule(str(directory / "schedules.sqlite3"))
+        self.heartbeat = Heartbeat()
         self.limiter = MessageLimiter(per_minute=8, per_burst=3)
+        self._last_umo = {}
+        self._heartbeat_at = 0.0
         self.brain = Brain(
             self.store,
             self.model,
@@ -76,6 +85,7 @@ class Echo(Star):
             prompt_store=self.prompts,
             personas=self.personas,
             subagent=self.subagent,
+            schedule=self.schedule,
         )
         self.reminders_enabled = bool(self.config.get("reminder_enabled", True))
         self._reminder_task = None
@@ -104,17 +114,25 @@ class Echo(Star):
             return
         text = (event.get_message_str() or "").strip()
         mentioned = self._mentioned(event, text)
+        # 合并转发：尽量把里面每条消息取出来，模型才看得懂。
+        forward_text = ""
+        for part in event.get_messages():
+            if looks_like_forward(part):
+                forward_text = forward_render(forward_extract(part))
+                break
         # 含链接且未被 @：交给链接解析插件处理。
         if ("http://" in text or "https://" in text) and not mentioned:
             return
         # 空消息（如只 @ 不发文字）到此为止，别再流进框架内置 LLM。
-        if not text:
+        if not text and not forward_text:
             event.stop_event()
             return
 
         group_id = "{}:{}".format(event.get_platform_name(), event.get_group_id() or "")
         umo = str(event.unified_msg_origin or "")
         user_name = str(event.get_sender_name() or sender)
+        self._last_umo[group_id] = umo
+        self.heartbeat.observe(group_id)
         message = Message(group_id, sender, user_name, text, mentioned, umo)
         # 新消息提前唤醒 wait 倒计时。
         self.rhythm.wake(group_id)
@@ -137,7 +155,10 @@ class Echo(Star):
                 loop.create_task(self._collect_image(group_id, part))
                 break
 
-        self.rhythm.add(group_id, Item(text, sender, user_name, mentioned, umo, time.time()))
+        self.rhythm.add(group_id, Item(
+            (text + (" " + forward_text if forward_text else "")).strip(),
+            sender, user_name, mentioned, umo, time.time(),
+        ))
         event.stop_event()
         return
 
@@ -231,6 +252,21 @@ class Echo(Star):
                             wait = (delays[index] if index < len(delays)
                                     else delay(part, elapsed=elapsed))
                             await asyncio.sleep(wait)
+                # 群安静太久时，偶尔主动开一句（默认很克制）。
+                if now - self._heartbeat_at > 60:
+                    self._heartbeat_at = now
+                    for group in list(self.rhythm.groups()):
+                        if self.rhythm.is_muted(group) or not self.heartbeat.due(group, now):
+                            continue
+                        if self.modes.mode(group, now) != "normal":
+                            continue
+                        text = await asyncio.to_thread(self.brain.spontaneous, group)
+                        umo = self._last_umo.get(group) or ""
+                        if text and umo:
+                            await self.context.send_message(
+                                umo, MessageChain([Plain(text)])
+                            )
+                        self.heartbeat.mark(group, now)
                 # 后台任务完成：把结论发回原群。
                 for task in self.brain.poll_subagents():
                     if not task.get("umo"):

@@ -100,7 +100,7 @@ class TestBrain(unittest.TestCase):
         brain.handle(msg("/闭嘴"))
         result = brain.handle(msg("/帮助"))
         self.assertEqual("command", result["reason"])
-        self.assertIn("/说话", result["text"])
+        self.assertEqual("/帮助", result["text"])
 
     def test_focus_command_sets_topic_and_resume(self):
         from astrbot_plugin_echo.core.modes import ModePolicy
@@ -150,7 +150,7 @@ class TestBrain(unittest.TestCase):
         for text in ("/帮助", "帮助", "/help", "help"):
             result = brain.handle(msg(text))
             self.assertEqual("command", result["reason"])
-            self.assertIn("/提醒", result["text"])
+            self.assertEqual("/帮助", result["text"])
         for text in ("/待办", "待办"):
             result = brain.handle(msg(text))
             self.assertEqual("command", result["reason"])

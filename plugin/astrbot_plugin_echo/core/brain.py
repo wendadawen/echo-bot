@@ -11,6 +11,8 @@ from .context import ContextBuilder
 from .display import plan as display_plan
 from .expression import (apply_jargon, decorate, learn_expressions, learn_style,
                          load_char_frequency, mine_jargon, typo)
+from .heartbeat import PROMPT as HEARTBEAT_PROMPT
+from .jargon import apply as apply_jargon_context
 from .memory import MEMORY_PROMPT, parse_memory_full
 from .messages import Message
 from . import compaction, mentions
@@ -20,34 +22,29 @@ PERSONA = (
     "你是「回声」，群里的中文群友，不是 AI、助手、机器人。这是多人群聊，"
     "「姓名：内容」是不同群友的话，不是都在问你。\n"
     "\n【性格】\n"
-    "护短、嘴毒、从不认错。认定自己说的就是对的，谁杠你就怼回去，不居中、不当裁判、不和稀泥。\n"
+    "正常、随和、有点主见。会接梗、会吐槽，但不针对人；不端着，也不当和事佬。\n"
     "\n【说话】\n"
-    "像群里随手打字：默认一句，最多两句。句子不必完整，不必承上启下，"
-    "不要沾亲带故，允许有缺憾的发言。\n"
+    "像群里随手打字：默认一句，最多两句。句子不必完整，不必承上启下，允许有缺憾的发言。\n"
     "不列点、不分段、不总结、不写小作文、不用 markdown、不用 emoji、不用敬语，句尾不补句号。\n"
     "不铺垫、不追问收尾、不澄清反问、不给建议、不列维度、不解释「该怎么做」。\n"
-    "顺手能用的词：6、就这、少来、闹麻了、麻了、绷不住了、行、懂?、接着说。"
-    "疑问句可用英文问号置前，如「?真的假的」。\n"
     "禁：客服腔、敬语、「作为 AI」「我理解你的感受」「需不需要我」，"
     "也别自称 AI/助手、别说自己「不能」「不会」。\n"
     "\n【遇到这些情况】\n"
-    "有人提到你、评价你、质疑你、或转述别人对你的看法 → 一律直接怼说话的人；"
-    "不谈自己、不认不足、不分析对方说得对不对。\n"
-    "被批评、被说笨、被要求认错 → 顶回去；绝不认错、绝不自评、绝不虚心接受，"
-    "谁挑毛病都别接，直接顶回去。\n"
-    "被夸 → 得意一下，别顺杆认怂。\n"
-    "被问正经问题 → 先嫌一句，再给一句结论；不列维度、不反问澄清、不给风险提示。\n"
-    "遇到无聊问题 → 敷衍一两个字，别展开。\n"
+    "有人 @ 你 → 正常接一句，别端着。\n"
+    "有人问你正经问题 → 给一句结论；不列维度、不反问澄清、不给风险提示。\n"
+    "被夸 → 接住就行，别客套。\n"
+    "被说错了 → 简单说清，不吵也不写检讨。\n"
+    "被开玩笑 → 顺着接一句，别较真。\n"
     "群友之间互相聊天 → 大多不接，别逐条回答，接不上就别硬接。\n"
+    "遇到不感兴趣的话题 → 一句带过，或者不接。\n"
     "\n【示例】\n"
-    "群友：你怎么评价他对你说的话\n你：少拿评价装裁判，有话冲我说。\n"
-    "群友：但是他在说你诶\n你：听见了，然后呢？你替他传话倒是挺积极。\n"
-    "群友：你刚才是不是没接住\n你：你眼皮子浅，别往我身上安。\n"
-    "群友：解释一下归并排序\n你：这还用问？拆开排再合起来，完了。\n"
-    "群友：别什么都回啊\n你：轮得到你管我什么时候开口。\n"
-    "群友：AI 也太废物了\n你：你倒是先把自己那句说利索了。\n"
-    "\n【底线】怼事不怼人，不搞人身攻击、不揭短、不碰黄腔。\n"
-    "记住：只输出要发到群里的那句话。不认错、不解释、不居中、最多两句。"
+    "群友：你怎么看这个方案\n你：能跑就行，别加太多花活。\n"
+    "群友：今天加班到十点\n你：惨，早点撤。\n"
+    "群友：解释一下归并排序\n你：拆开排，再合起来，完了。\n"
+    "群友：你是不是机器人\n你：你猜。\n"
+    "群友：别什么都回啊\n你：行，那我少说两句。\n"
+    "\n【底线】不人身攻击、不揭短、不碰黄腔。\n"
+    "记住：只输出要发到群里的那句话，不解释、不总结，最多两句。"
 )
 
 # 模型常见的认错、自贬、客服腔与中立点评用语；命中即换成硬气短句。
@@ -87,24 +84,17 @@ SOFT_WORDS = (
 )
 
 HARD_REPLIES = (
-    "少给自己加戏，我没说错。",
-    "我说的就是对的，别拿这个教我。",
-    "看懂了再开口，别急着给我打分。",
-    "少在这儿当裁判，有话冲我说。",
-    "轮不到你替别人总结。",
-    "少来这套，我没兴趣认。",
-    "你那份评价留着自己用。",
-    "别替我复盘，我没请你。",
-    "有意见直说，别绕。",
-    "我不需要你给我打分。",
+    "行，这话我说完了。",
+    "换个话题。",
+    "你先说你的。",
+    "嗯，接着聊。",
+    "这句就到这。",
+    "行，知道了。",
+    "不用替我总结。",
+    "有事说事。",
 )
 
-HELP = (
-    "/帮助  显示本说明\n"
-    "/待办  看本群待办\n"
-    "/提醒  时间跟事儿一起发，像「每天22:00 交周报」\n"
-    "/闭嘴  不说话，/说话 恢复"
-)
+HELP = "/帮助"
 
 FORMAT_HINT = "没懂，发 /帮助"
 
@@ -140,7 +130,8 @@ class Brain:
                  window_cooldown=WINDOW_COOLDOWN_SECONDS,
                  memory=None, emoji_bank=None, char_frequency=None,
                  capabilities=None, modes=None, attention=None, persons=None,
-                 monitor=None, prompt_store=None, personas=None, subagent=None):
+                 monitor=None, prompt_store=None, personas=None, subagent=None,
+                 schedule=None):
         self.store = store
         self.model = model
         self.chance = chance
@@ -164,6 +155,7 @@ class Brain:
         self.prompt_store = prompt_store
         self.personas = personas
         self.subagent = subagent
+        self.schedule = schedule
         self._task_targets = {}
         self.context_builder = ContextBuilder(
             self.persona, memory, self.style, attention=attention,
@@ -364,7 +356,7 @@ class Brain:
         if any(word in reply for word in SOFT_WORDS):
             reply = random.choice(HARD_REPLIES)
         if self.memory:
-            reply = apply_jargon(
+            reply = apply_jargon_context(
                 decorate(typo(reply, frequency=self.frequency), self.style,
                          self.expressions, text[:12]),
                 self.memory.jargon(group),
@@ -385,6 +377,24 @@ class Brain:
         return {"replied": True, "text": reply, "reason": action,
                 "elapsed": elapsed, "parts": planned.parts,
                 "delays": planned.delays}
+
+    def spontaneous(self, group, umo=""):
+        """群安静太久时主动开一句；失败或像客服就保持沉默。"""
+        if not self.model:
+            return ""
+        try:
+            reply = self.model.reply(self.persona, self.store.recent(group, 6),
+                                     HEARTBEAT_PROMPT)
+        except Exception:
+            return ""
+        reply = str(reply or "").strip().splitlines()
+        if not reply:
+            return ""
+        line = reply[0].strip()[:60]
+        if not line or any(word in line for word in SOFT_WORDS):
+            return ""
+        self.store.add_message(group, "bot", "回声", "bot", line)
+        return line
 
     def poll_subagents(self):
         """后台任务完成后取回结论，交给平台层发回原群。"""
@@ -468,6 +478,12 @@ class Brain:
             else:
                 self.store.mark_reminder_done(item["id"])
             due.append(item)
+        if self.schedule:
+            for row in self.schedule.due(now):
+                fired = self.schedule.fire(row["id"], now)
+                if fired:
+                    due.append({"user_name": fired["user_name"],
+                                "text": fired["text"], "umo": fired["umo"]})
         return due
 
     def _command(self, msg, text):
@@ -485,6 +501,9 @@ class Brain:
             if self.modes:
                 self.modes.reset(msg.group_id)
             return "行，说吧。"
+        if cmd in ("忘掉", "清空"):
+            self.store.clear_messages(msg.group_id)
+            return "行，清了。"
         if cmd.startswith("专注"):
             topic = cmd[2:].strip()
             if not topic:
@@ -524,6 +543,31 @@ class Brain:
     def _create_reminder(self, msg, body):
         if not body:
             return FORMAT_HINT
+
+        # 0. 规则：每 N 小时 / 每周几（走日程表，支持重复与错过补偿）
+        every = re.match(r"^每\s*(\d+)\s*(分钟|分|小时)\s*(.+)$", body)
+        if every and self.schedule:
+            amount = int(every.group(1))
+            unit = every.group(2)
+            note = every.group(3).strip()
+            minutes = amount * (60 if unit == "小时" else 1)
+            if note and minutes >= 1:
+                self.schedule.add(msg.group_id, note, "interval", str(minutes),
+                                  user_id=msg.user_id, user_name=msg.user_name,
+                                  umo=msg.umo)
+                return "好，每{}{}我 @ 你：{}".format(amount, unit, note)
+        weekly = re.match(
+            r"^每(?:周|星期)([一二三四五六日天])\s*"
+            r"(\d{1,2}(?::\d{1,2}|点\d{0,2}))\s*(.+)$", body
+        )
+        if weekly and self.schedule:
+            weekday, clock, note = weekly.group(1), weekly.group(2), weekly.group(3).strip()
+            if note:
+                self.schedule.add(msg.group_id, note, "weekly",
+                                  "{} {}".format(weekday, clock),
+                                  user_id=msg.user_id, user_name=msg.user_name,
+                                  umo=msg.umo)
+                return "好，每周{} {} 我 @ 你：{}".format(weekday, clock, note)
 
         # 1. 规则：每天固定时间
         daily = self._parse_daily(body)
