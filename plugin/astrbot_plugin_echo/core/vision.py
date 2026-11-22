@@ -1,26 +1,37 @@
-"""视觉层：图片转描述、表情仓库（收集 / 语义标注 / 挑选 / 清理）。
+"""视觉层（完整版）：图片转描述、表情仓库、语义网格挑选、内容过滤、
+图片记忆、缓存清理。
 
-参考 MaiBot 的 emoji_system 与 image_system：素材来自群里，落在 data/，
-不进仓库也不进镜像；描述与挑选都复用配置里指定的模型。
+对齐 MaiBot `src/emoji_system`（manager / semantic_match / cache_cleanup）与
+`image_system`：素材全部来自群里、落在 data/，不进仓库也不进镜像；
+描述、打标签、网格挑选都复用配置里指定的模型。只用标准库。
 """
 
 import base64
 import json
+import random
 import re
 import time
 from pathlib import Path
 
 DESCRIBE_PROMPT = "用一句话说清这张图/表情在表达什么，不要解释、不要标点堆砌。"
 TAG_PROMPT = "给这个表情一个两到四字的情绪标签，只输出标签。"
+GRID_PROMPT = (
+    "下面给你几张候选表情，按出现顺序编号。只输出最适合的一个编号数字，"
+    "不要解释。要表达的情绪是：{}"
+)
+FILTER_WORDS = ("二维码", "付款码", "身份证", "验证码", "密码", "银行卡号")
+
+
+def _data_uri(image_bytes):
+    return "data:image/png;base64," + base64.b64encode(image_bytes).decode("ascii")
 
 
 def describe(model, image_bytes, hint=DESCRIBE_PROMPT):
     """调用模型视觉能力；失败返回空串，不抛到群里。"""
     if not image_bytes:
         return ""
-    encoded = base64.b64encode(image_bytes).decode("ascii")
     try:
-        return model.vision_reply(hint, "data:image/png;base64," + encoded)
+        return model.vision_reply(hint, _data_uri(image_bytes))
     except Exception:
         return ""
 
@@ -28,73 +39,134 @@ def describe(model, image_bytes, hint=DESCRIBE_PROMPT):
 def tag(model, image_bytes):
     if not image_bytes:
         return "随手"
-    encoded = base64.b64encode(image_bytes).decode("ascii")
     try:
-        value = model.vision_reply(TAG_PROMPT, "data:image/png;base64," + encoded)
+        value = model.vision_reply(TAG_PROMPT, _data_uri(image_bytes))
     except Exception:
         return "随手"
     return (value or "随手").strip()[:8]
 
 
-class EmojiBank:
-    """按群收集团友发的表情，做语义标注，之后按标签挑一张发回。"""
+def acceptable(description, image_bytes=None):
+    """内容过滤：明显不该留存/转发的内容直接拦下。"""
+    text = str(description or "")
+    if any(word in text for word in FILTER_WORDS):
+        return False
+    if image_bytes and len(image_bytes) > 2 * 1024 * 1024:
+        return False
+    return True
 
-    def __init__(self, root):
+
+def grid_pick(model, candidates, mood="随手"):
+    """语义网格挑选：把多张候选一次性交给模型选编号，等价于 VLM 网格选择，
+    但不需要拼图库。candidates 为 [(path, bytes), ...]，返回下标或 None。"""
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return 0
+    try:
+        content = [{"type": "text", "text": GRID_PROMPT.format(mood)}]
+        for _, data in candidates[:6]:
+            content.append({"type": "image_url", "image_url": {"url": _data_uri(data)}})
+        raw = model.vision_reply_json(content)
+    except Exception:
+        return random.randrange(len(candidates[:6]))
+    match = re.search(r"\d+", str(raw or ""))
+    if not match:
+        return random.randrange(len(candidates[:6]))
+    return min(int(match.group(0)) - 1, len(candidates[:6]) - 1)
+
+
+class EmojiBank:
+    """按群收集团友发的表情，做语义标注，之后按标签/语义挑一张发回。"""
+
+    def __init__(self, root, limit=64, max_age_days=30):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self.index_path = self.root / "index.json"
+        self.limit = limit
+        self.max_age_days = max_age_days
         self._index = {}
         if self.index_path.exists():
             try:
                 self._index = json.loads(self.index_path.read_text(encoding="utf-8"))
             except (ValueError, OSError):
                 self._index = {}
+        self._tag_cache = {}
 
     def _save(self):
         self.index_path.write_text(
             json.dumps(self._index, ensure_ascii=False, indent=2), encoding="utf-8"
         )
 
-    def collect(self, group_id, image_bytes, model, limit=64):
-        if not image_bytes:
-            return ""
-        label = tag(model, image_bytes)
+    def _folder(self, group_id):
         folder = self.root / re.sub(r"[^\w-]", "_", group_id)[:60]
         folder.mkdir(parents=True, exist_ok=True)
-        name = "{:.0f}.png".format(time.time() * 1000)
-        path = folder / name
+        return folder
+
+    def collect(self, group_id, image_bytes, model, limit=None):
+        """收一张表情：先描述、过滤，再打标签、落盘、写索引。"""
+        if not image_bytes:
+            return ""
+        digest = hash(image_bytes) & 0xFFFFFFFF
+        if digest in self._tag_cache:
+            return self._tag_cache[digest]
+        description = describe(model, image_bytes)
+        if not acceptable(description, image_bytes):
+            return ""
+        label = tag(model, image_bytes)
+        path = self._folder(group_id) / "{:.0f}.png".format(time.time() * 1000)
         path.write_bytes(image_bytes)
         entries = self._index.setdefault(group_id, [])
-        entries.append({"path": str(path), "tag": label, "ts": time.time()})
-        if len(entries) > limit:
+        entries.append({
+            "path": str(path), "tag": label, "description": description[:80],
+            "ts": time.time(),
+        })
+        cap = limit or self.limit
+        while len(entries) > cap:
             old = entries.pop(0)
             Path(old["path"]).unlink(missing_ok=True)
+        self._tag_cache[digest] = label
         self._save()
         return label
 
-    def pick(self, group_id, keyword=""):
+    def candidates(self, group_id, keyword=""):
         entries = self._index.get(group_id) or []
-        if not entries:
-            return None
-        scored = []
+        rows = []
         for item in entries:
             path = Path(item["path"])
             if not path.exists():
                 continue
-            score = 1.0
-            if keyword and keyword in item.get("tag", ""):
-                score += 2.0
-            scored.append((score + item.get("ts", 0) / 1e12, path))
-        if not scored:
+            score = 0.0
+            text = "{} {}".format(item.get("tag", ""), item.get("description", ""))
+            if keyword:
+                for word in re.findall(r"[\u4e00-\u9fff]{2,}|[a-z0-9]{3,}", keyword):
+                    if word in text:
+                        score += 1.0
+            rows.append((score + item.get("ts", 0) / 1e12, path))
+        rows.sort(key=lambda pair: pair[0], reverse=True)
+        return [(path, path.read_bytes()) for _, path in rows[:6]
+                if path.stat().st_size <= 2 * 1024 * 1024]
+
+    def pick(self, group_id, keyword="", model=None):
+        """有模型时做语义网格挑选，否则在较新的候选里随机挑一张。"""
+        candidates = self.candidates(group_id, keyword)
+        if not candidates:
             return None
-        scored.sort(key=lambda pair: pair[0])
-        # 在较新的若干张里随机挑，避免每次同一张
-        import random
+        if model is not None and len(candidates) > 1:
+            index = grid_pick(model, candidates, keyword or "随手")
+            if index is not None and 0 <= index < len(candidates):
+                return candidates[index][0]
+        return random.choice([path for path, _ in candidates[-8:]])
 
-        return random.choice([p for _, p in scored[-8:]])
+    def remember(self, group_id, image_bytes, model, memory):
+        """图片记忆：把描述写成一条记忆点，供之后 recall。"""
+        description = describe(model, image_bytes)
+        if description and acceptable(description):
+            memory.add_point(group_id, "event", "图里是：" + description[:50])
+        return description
 
-    def cleanup(self, max_age_days=30):
-        cutoff = time.time() - max_age_days * 86400
+    def cleanup(self, max_age_days=None):
+        cutoff = time.time() - (max_age_days or self.max_age_days) * 86400
         for group_id, entries in list(self._index.items()):
             kept = []
             for item in entries:
@@ -104,3 +176,8 @@ class EmojiBank:
                     kept.append(item)
             self._index[group_id] = kept
         self._save()
+
+    def stats(self, group_id=None):
+        if group_id:
+            return {group_id: len(self._index.get(group_id, []))}
+        return {key: len(value) for key, value in self._index.items()}

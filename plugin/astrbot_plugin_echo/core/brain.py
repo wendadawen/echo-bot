@@ -7,8 +7,10 @@ import time
 from datetime import datetime, timedelta
 
 from .actions import ToolLoop
-from .expression import apply_jargon, typo
-from .memory import MEMORY_PROMPT, parse_memory
+from .context import ContextBuilder
+from .expression import (apply_jargon, decorate, learn_expressions, learn_style,
+                         load_char_frequency, mine_jargon, typo)
+from .memory import MEMORY_PROMPT, parse_memory_full
 from .messages import Message
 from .rhythm import Batch
 
@@ -109,7 +111,8 @@ class Brain:
     def __init__(self, store, model, chance=0.0, persona=PERSONA,
                  window=WINDOW_SECONDS, cooldown=COOLDOWN_SECONDS,
                  window_cooldown=WINDOW_COOLDOWN_SECONDS,
-                 memory=None, emoji_bank=None):
+                 memory=None, emoji_bank=None, char_frequency=None,
+                 capabilities=None):
         self.store = store
         self.model = model
         self.chance = chance
@@ -122,7 +125,12 @@ class Brain:
         self._muted = set()
         self.memory = memory
         self.emoji_bank = emoji_bank
-        self.tool_loop = ToolLoop(model)
+        self.capabilities = capabilities or {}
+        self.frequency = load_char_frequency(char_frequency)
+        self.style = {}
+        self.expressions = {}
+        self.context_builder = ContextBuilder(self.persona, memory, self.style)
+        self.tool_loop = ToolLoop(model, capabilities=self.capabilities)
         self._batch_count = 0
 
     def handle(self, msg):
@@ -182,14 +190,29 @@ class Brain:
         self.store.add_message(group, "bot", user_name, "user", text)
         history = self.store.recent(group, 12)
 
-        context = self.memory.context(group, text, user_name) if self.memory else ""
-        system = self.persona + ("\n\n" + context if context else "")
+        # 回复效果反馈：有人接了自己上一句话，就记一次正反馈。
+        if self.memory and history and history[-1].get("role") == "bot":
+            self.memory.mark_followup(group)
+        # 群风格与黑话随聊天更新，供输出层使用。
+        self.style = learn_style([h.get("text", "") for h in history], self.style)
+        self.context_builder.style = self.style
+        if self.memory:
+            for word in mine_jargon([i.text for i in batch.items],
+                                    self.memory.jargon(group)):
+                self.memory.add_jargon(group, word, word)
+
+        system = self.context_builder.build(group, text, user_name, batch, history)
+        capabilities = dict(self.capabilities)
+        capabilities["view_image"] = bool(getattr(batch, "images", None))
+        self.tool_loop.capabilities = capabilities
 
         def executor(group_id, action, payload):
             if action == "recall":
                 return False, (self.memory.context(group_id, payload) if self.memory else "没有记忆")
             if action == "query_person":
                 rows = self.memory.person(group_id, payload) if self.memory else []
+                if not rows and self.memory:
+                    rows = self.memory.relations(group_id, payload)
                 return False, "；".join(rows) if rows else "没记着这人"
             if action == "note":
                 if self.memory:
@@ -197,51 +220,76 @@ class Brain:
                 return False, "记下了：{}".format(payload)
             if action == "schedule":
                 fake = Message(group, "", user_name, "提醒 " + payload, False, batch.umo)
-                return True, self._command(fake, "提醒 " + payload) or "没懂，发 /帮助"
+                reply = self._command(fake, "提醒 " + payload) or "没懂，发 /帮助"
+                self.context_builder.add_schedule(group_id, reply)
+                return True, reply
             if action == "view_image":
-                return False, "这批消息里没有可看的图"
+                images = getattr(batch, "images", None) or []
+                if not images:
+                    return False, "这批消息里没有可看的图"
+                from .vision import describe
+
+                lines = [describe(self.model, data) for data in images[:2]]
+                return False, "；".join(line for line in lines if line) or "图里没看出什么"
             if action == "send_face":
-                path = self.emoji_bank.pick(group_id, payload) if self.emoji_bank else None
+                path = (self.emoji_bank.pick(group_id, payload, self.model)
+                        if self.emoji_bank else None)
                 return True, ("__FACE__" + str(path)) if path else "没存着表情"
+            if action == "read_result":
+                return False, self.tool_loop.results.get(group_id, payload)
             return False, "这个动作还没接上"
 
-        decision = self.tool_loop.run(system, history, text, executor, group)
+        started = time.time()
+        decision = self.tool_loop.run(system, history, text, executor, group,
+                                      scene=getattr(batch, "scene", "group"))
+        elapsed = time.time() - started
         if not decision:
             return {"replied": False, "text": "", "reason": "model_error"}
         action, reply = decision["action"], decision["text"]
         if action in ("silent", "wait"):
-            return {"replied": False, "text": "", "reason": action}
+            return {"replied": False, "text": "", "reason": action,
+                    "wait_seconds": reply if action == "wait" else 0}
         if reply.startswith("__FACE__"):
             return {"replied": True, "text": "", "image": reply[len("__FACE__"):],
-                    "reason": "face"}
+                    "reason": "face", "elapsed": elapsed}
         if not reply:
             return {"replied": False, "text": "", "reason": "silent"}
         if any(word in reply for word in SOFT_WORDS):
             reply = random.choice(HARD_REPLIES)
         if self.memory:
-            reply = apply_jargon(typo(reply), self.memory.jargon(group))
+            reply = apply_jargon(
+                decorate(typo(reply, frequency=self.frequency), self.style,
+                         self.expressions, text[:12]),
+                self.memory.jargon(group),
+            )
+            self.memory.record_reply(group, reply)
+        learn_expressions(text[:12], reply, self.expressions)
         self.store.add_message(group, "bot", "回声", "bot", reply)
         self._batch_count += 1
         if self.memory and self._batch_count % 4 == 0:
             self._summarize(group, text)
-        return {"replied": True, "text": reply, "reason": action}
+        return {"replied": True, "text": reply, "reason": action, "elapsed": elapsed}
 
     def _summarize(self, group, text):
-        """每隔几批把对话压成 Episode 与记忆点，复用配置里指定的模型。"""
+        """每隔几批把对话压成 Episode / 记忆点 / 人物档案 / 关系。"""
         try:
             raw = self.model.reply(MEMORY_PROMPT, [], text)
         except Exception:
             return
-        parsed = parse_memory(raw)
+        parsed = parse_memory_full(raw)
         if not parsed:
             return
-        episode, points = parsed
-        self.memory.add_episode(group, episode)
+        episode, points, persons, relations = parsed
+        self.memory.add_episode(group, episode, source="chat")
         for category, content in points:
             if category == "jargon":
                 self.memory.add_jargon(group, content, content)
             else:
                 self.memory.add_point(group, category, content)
+        for name, category, content in persons:
+            self.memory.upsert_person(group, name, category, content)
+        for a, b, relation in relations:
+            self.memory.add_relation(group, a, b, relation)
         self.memory.prune(group)
 
     def _should_reply(self, msg, text, now):

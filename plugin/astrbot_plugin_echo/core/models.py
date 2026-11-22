@@ -84,13 +84,14 @@ class OpenAIModel(BaseModel):
 
     def vision_reply(self, text, image_url, timeout=None):
         """多模态调用：图片用 data URI 或可下载的 URL，模型仍取配置里的 self.model。"""
-        messages = [{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": text},
-                {"type": "image_url", "image_url": {"url": image_url}},
-            ],
-        }]
+        return self.vision_reply_json([
+            {"type": "text", "text": text},
+            {"type": "image_url", "image_url": {"url": image_url}},
+        ], timeout=timeout)
+
+    def vision_reply_json(self, content, timeout=None):
+        """通用多模态入口：content 为 OpenAI 格式的内容块列表。"""
+        messages = [{"role": "user", "content": content}]
         payload = {"model": self.model, "messages": messages, "max_tokens": 120}
         req = urllib.request.Request(
             self.url,

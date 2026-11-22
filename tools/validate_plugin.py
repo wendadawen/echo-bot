@@ -24,6 +24,7 @@ REQUIRED = [
     "core/expression.py",
     "core/memory.py",
     "core/vision.py",
+    "core/context.py",
 ]
 
 META_FIELDS = ["name", "display_name", "desc", "version", "author", "repo", "astrbot_version"]

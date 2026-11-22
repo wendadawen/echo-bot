@@ -51,6 +51,9 @@ class Echo(Star):
             persona=PERSONA,
             memory=self.memory,
             emoji_bank=self.emoji_bank,
+            char_frequency=str(directory / "char_frequency.json"),
+            capabilities={"view_image": True, "send_face": True,
+                          "schedule": True, "wait": True},
         )
         self.reminders_enabled = bool(self.config.get("reminder_enabled", True))
         self._reminder_task = None
@@ -91,6 +94,8 @@ class Echo(Star):
         umo = str(event.unified_msg_origin or "")
         user_name = str(event.get_sender_name() or sender)
         message = Message(group_id, sender, user_name, text, mentioned, umo)
+        # 新消息提前唤醒 wait 倒计时。
+        self.rhythm.wake(group_id)
 
         # 命令不走防抖，立刻回。
         direct = await asyncio.to_thread(self.brain.command, message, text)
@@ -120,6 +125,7 @@ class Echo(Star):
             return
         try:
             data = await asyncio.to_thread(self._download, str(url))
+            self.rhythm.attach_image(group_id, data)
             await asyncio.to_thread(self.emoji_bank.collect, group_id, data, self.model)
         except Exception as exc:
             logger.debug("表情收集失败：%s", exc)
@@ -146,20 +152,47 @@ class Echo(Star):
         self._chat_task = loop.create_task(self._chat_loop(), name="echo-chat")
 
     async def _chat_loop(self):
-        """防抖到期 → 查看概率 → 动作集决策 → 拆条拟人发送。"""
+        """防抖到期 → 查看概率与欠债 → 动作集决策 → 拆条拟人发送。
+
+        另外处理 wait 到期唤醒、静默查看（复用上一批上下文）与轮数额度。
+        """
         while True:
             try:
-                for batch in self.rhythm.due():
+                now = time.time()
+                pending = list(self.rhythm.due(now))
+                # wait 到期：按当时概率抽签，复用上一批上下文。
+                for group in list(self.rhythm.groups()):
+                    if self.rhythm.wait_due(group, now):
+                        last = self.rhythm.last_batch(group)
+                        if last is not None:
+                            pending.append(self.rhythm.requeue(last, now))
+                # 静默查看：安静太久且防抖已完成时抽签看一眼。
+                for group in list(self.rhythm.groups()):
+                    if self.rhythm.silent_due(group, now) and self.rhythm.consume_silent(group, now):
+                        last = self.rhythm.last_batch(group)
+                        if last is not None:
+                            pending.append(self.rhythm.requeue(last, now))
+                for batch in pending:
                     group = batch.group_id
                     if self.rhythm.is_muted(group):
                         continue
-                    if not self.rhythm.should_view(group, forced=batch.mentioned):
+                    if not batch.approved and not self.rhythm.should_view(
+                            group, now, forced=batch.mentioned):
+                        # 未通过查看的消息留到下一批，不丢。
+                        self.rhythm.carry(group, batch)
                         continue
+                    quota = self.rhythm.start_turn(group)
                     result = await asyncio.to_thread(self.brain.handle_batch, batch)
+                    self.rhythm.use_round(group, quota)
                     if result.get("reason") == "model_error":
                         logger.error("模型调用失败：%s", result.get("error"))
+                    if result.get("reason") == "wait":
+                        seconds = result.get("wait_seconds") or 0
+                        self.rhythm.wait(group, seconds, now)
+                        continue
                     if not result.get("replied"):
                         continue
+                    elapsed = float(result.get("elapsed") or 0.0)
                     if result.get("image"):
                         await self._send_image(group, batch.umo, result["image"])
                     else:
@@ -167,9 +200,7 @@ class Echo(Star):
                             await self.context.send_message(
                                 batch.umo, MessageChain([Plain(part)])
                             )
-                            await asyncio.sleep(delay(part))
-                    if self.rhythm.debt(group) == 0 and batch.mentioned:
-                        self.rhythm.borrow(group, 0)
+                            await asyncio.sleep(delay(part, elapsed=elapsed))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
