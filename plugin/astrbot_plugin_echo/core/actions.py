@@ -37,6 +37,7 @@ ACTION_PROMPT = (
     '格式：{"action":"动作名","text":"内容或参数"}；wait 可用 seconds 代替 text。\n'
     "{actions}\n"
     "拿不准就 silent。text 最多两句，别写 markdown、别列点、别解释。\n"
+    "一批里有多人说话时，只回最后一条，其他人一句带过或忽略。\n"
     '例：{"action":"reply","text":"少来这套"}'
 )
 

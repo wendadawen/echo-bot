@@ -76,8 +76,8 @@ def typing_delay(part, elapsed=0.0, chars_per_second=9.0, cap=2.4):
     return max(0.15, base - max(0.0, float(elapsed or 0.0)) * 0.6)
 
 
-def plan(text, *, quote="", at="", face="", image="", max_parts=3,
-         elapsed=0.0, soft_limit=70):
+def plan(text, *, quote="", at="", face="", image="", max_parts=1,
+         elapsed=0.0, soft_limit=4000):
     """生成发送计划：长句按句拆，短碎片合并，附加引用 / @ / 表情。"""
     clean = str(text or "").strip()
     parts = []

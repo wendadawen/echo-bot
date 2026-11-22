@@ -205,6 +205,7 @@ class Brain:
         self._summary_lock = threading.Lock()
         self._last_reply_at = {}
         self._last_reply_user = {}
+        self._last_bot_reply = {}
         self.context_builder = ContextBuilder(
             self.persona, memory, self.style, attention=attention,
             modes=modes, persons=persons,
@@ -445,6 +446,14 @@ class Brain:
                 self.memory.jargon(group),
             )
             self.memory.record_reply(group, reply)
+        # 同一群、同一人、同一句问题得到同一句回复，30 秒内只发一次。
+        reply_key = (_repeat_key(group, "bot", reply),
+                     _repeat_key(group, user_id, text))
+        last_bot = self._last_bot_reply.get(group)
+        if last_bot and last_bot[0] == reply_key and time.time() - last_bot[1] < REPEAT_WINDOW:
+            return {"replied": False, "text": "", "reason": "repeat_reply",
+                    "elapsed": elapsed}
+        self._last_bot_reply[group] = (reply_key, time.time())
         learn_expressions(text[:12], reply, self.expressions)
         self.store.add_message(group, "bot", "大肥鱼", "bot", reply)
         self._last_reply_at[group] = time.time()

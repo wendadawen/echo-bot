@@ -334,7 +334,7 @@ class Echo(Star):
                 for task in self.brain.poll_subagents():
                     if not task.get("umo"):
                         continue
-                    for part in split(clean(task.get("text", "")))[:2]:
+                    for part in [clean(task.get("text", ""))]:
                         await self.context.send_message(
                             task["umo"], MessageChain([Plain(part)])
                         )
