@@ -10,10 +10,11 @@ import re
 import time
 import urllib.request
 from pathlib import Path
+from typing import Optional
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
-from astrbot.api.message_components import At, Face, Image, Plain, Reply
+from astrbot.api.message_components import At, Face, File, Image, Plain, Reply
 from astrbot.api.star import Context, Star, StarTools
 
 from .core.attention import AttentionTracker
@@ -24,7 +25,7 @@ from .core.forward import extract as forward_extract
 from .core.forward import looks_like_forward
 from .core.forward import render as forward_render
 from .core.heartbeat import Heartbeat
-from .core.harness import CodexHarness
+from .core.harness import CodexHarness, cleanup_file_entry, cleanup_outbox
 from .core.memory import Memory
 from .core.messages import Message, format_speaker_message
 from .core.models import build_model
@@ -50,7 +51,7 @@ def _data_dir() -> Path:
 
 
 class Echo(Star):
-    def __init__(self, context: Context, config: dict | None = None):
+    def __init__(self, context: Context, config: Optional[dict] = None):
         super().__init__(context)
         self.config = config or {}
         directory = _data_dir()
@@ -72,11 +73,13 @@ class Echo(Star):
         self.harness = CodexHarness(
             home=str(directory / "codex"),
             workdir_root=str(directory / "harness"),
+            outbox_root=str(directory / "outbox"),
             api_base=str(self.config.get("api_base") or ""),
             api_key=str(self.config.get("api_key") or ""),
             model=str(self.config.get("model") or ""),
             timeout=150,
         )
+        cleanup_outbox(self.harness.outbox_root)
         self.limiter = MessageLimiter(per_minute=8, per_burst=3)
         self._last_umo = {}
         self._heartbeat_at = 0.0
@@ -318,8 +321,8 @@ class Echo(Star):
                     if not batch.approved and not self.rhythm.should_view(
                             group, now, forced=batch.mentioned,
                             rate=self.brain.view_rate(batch)):
-                        # 未通过查看的消息留到下一批，不丢。
-                        self.rhythm.carry(group, batch)
+                        # 未通过查看的消息只写入历史库，不再无限滞留并与后续他人的话混成同一批。
+                        await asyncio.to_thread(self.brain.observe_skipped, batch)
                         continue
                     quota = self.rhythm.start_turn(group)
                     result = await asyncio.to_thread(self.brain.handle_batch, batch)
@@ -376,15 +379,26 @@ class Echo(Star):
                                 umo, MessageChain([Plain(text)])
                             )
                         self.heartbeat.mark(group, now)
-                # 后台任务完成：把结论发回原群（内部会调主模型转述，放线程避免阻塞事件循环）。
+                # 后台任务完成：把结论及生成的群文件发回原群（内部会调主模型转述，放线程避免阻塞事件循环）。
                 for task in await asyncio.to_thread(self.brain.poll_subagents):
-                    if not task.get("umo"):
+                    umo = task.get("umo") or ""
+                    files = task.get("files") or []
+                    if not umo:
+                        for item in files:
+                            cleanup_file_entry(item.get("path", ""), self.harness.outbox_root)
                         continue
                     for part in [clean(task.get("text", ""))]:
                         if not part:
                             continue
                         await self.context.send_message(
-                            task["umo"], MessageChain([Plain(part)])
+                            umo, MessageChain([Plain(part)])
+                        )
+                    for item in files:
+                        await self._send_file(
+                            task.get("group", ""),
+                            umo,
+                            item.get("path", ""),
+                            item.get("name", ""),
                         )
             except asyncio.CancelledError:
                 raise
@@ -401,6 +415,29 @@ class Echo(Star):
             )
         except Exception as exc:
             logger.error("表情发送失败：%s", exc)
+
+    async def _send_file(self, group, umo, path, name=""):
+        target = Path(path) if path else None
+        display_name = name or (target.name if target else "")
+        try:
+            if not umo or not target or not target.is_file():
+                return
+            await self.context.send_message(
+                umo, MessageChain([File(name=display_name, file=str(target.resolve()))])
+            )
+        except Exception as exc:
+            logger.error("文件发送失败（%s）：%s", display_name or path, exc)
+            if umo:
+                try:
+                    await self.context.send_message(
+                        umo,
+                        MessageChain([Plain("文件「{}」没发出去，稍后再试试。".format(display_name or "附件"))]),
+                    )
+                except Exception:
+                    pass
+        finally:
+            if path:
+                cleanup_file_entry(path, self.harness.outbox_root)
 
     def _ensure_reminder_task(self):
         if not self.reminders_enabled:

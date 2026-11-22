@@ -15,7 +15,7 @@ KEEP_FINISHED = 20
 
 
 class SubTask:
-    __slots__ = ("id", "kind", "prompt", "status", "result", "error",
+    __slots__ = ("id", "kind", "prompt", "status", "result", "files", "error",
                  "created", "finished")
 
     def __init__(self, kind, prompt, now=None):
@@ -24,6 +24,7 @@ class SubTask:
         self.prompt = str(prompt or "")
         self.status = "running"
         self.result = ""
+        self.files = []
         self.error = ""
         self.created = time.time() if now is None else now
         self.finished = 0.0
@@ -57,10 +58,17 @@ class SubAgentManager:
 
         def work():
             result = ""
+            files = []
             error = ""
             try:
-                result = str(runner(task.prompt) or "").strip()[:800]
-                if not result:
+                out = runner(task.prompt)
+                if isinstance(out, dict):
+                    result = str(out.get("text") or "").strip()[:800]
+                    raw_files = out.get("files") or []
+                    files = [f for f in raw_files if isinstance(f, dict) and f.get("path")]
+                else:
+                    result = str(out or "").strip()[:800]
+                if not result and not files:
                     error = "空结果"
             except Exception as exc:  # 后台线程不能把异常抛给主循环
                 error = "{}: {}".format(type(exc).__name__, exc)[:200]
@@ -68,8 +76,9 @@ class SubAgentManager:
                 if task.status == "stopped":
                     return
                 task.result = result
+                task.files = files
                 task.error = error
-                task.status = "completed" if result else "failed"
+                task.status = "completed" if (result or files) else "failed"
                 task.finished = time.time()
             self._trim()
 

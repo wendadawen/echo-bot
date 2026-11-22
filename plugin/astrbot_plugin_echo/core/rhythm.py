@@ -193,7 +193,7 @@ class Rhythm:
             carried = self._carry.pop(group_id, [])
             if carried:
                 batch.items.extend(carried)
-                batch.started = carried[0].ts
+                # 不倒拨 batch.started，防止防抖截止时间立刻过期。
             self._batches[group_id] = batch
             self._earliest_mention.pop(group_id, None)
         else:

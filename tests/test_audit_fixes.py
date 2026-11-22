@@ -318,7 +318,10 @@ class TestAuditFixes(unittest.TestCase):
             with patch("subprocess.Popen", side_effect=fake_popen):
                 out = harness.run("g1", "hello")
             self.assertEqual("ok", out)
-            self.assertEqual(str(root / "work"), captured_env.get("TMPDIR"))
+            tmpdir = Path(captured_env.get("TMPDIR", ""))
+            self.assertEqual(root / "work", tmpdir.parent)
+            self.assertTrue(tmpdir.name.startswith("task-"))
+            self.assertFalse(tmpdir.exists())
 
             # spontaneous 使用当前群启用的人格
             lib = PersonaLibrary(root / "personas")
