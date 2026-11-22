@@ -61,17 +61,20 @@ class Brain:
         return due
 
     def _command(self, msg, text):
-        if text in ("/帮助", "/help"):
+        # AstrBot 分发前会剥掉命令前缀「/」，这里统一归一化，
+        # 带斜杠与不带斜杠两种形式都能命中。
+        cmd = text.lstrip("/").strip()
+        if cmd in ("帮助", "help"):
             return HELP
-        if text == "/待办":
+        if cmd == "待办":
             items = self.store.pending_reminders(msg.group_id)
             if not items:
                 return "本群暂时没有待提醒的事。"
             return "本群待办：\n" + "\n".join(
                 "- {}：{}".format(it["user_name"], it["text"]) for it in items
             )
-        if text.startswith("/提醒"):
-            m = re.match(r"^/提醒\s*(\d+)\s*(分钟|分|秒|小时)?\s*(.+)$", text)
+        if cmd.startswith("提醒"):
+            m = re.match(r"^提醒\s*(\d+)\s*(分钟|分|秒|小时)?\s*(.+)$", cmd)
             if not m:
                 return "格式：/提醒 5分钟 交周报"
             amount = int(m.group(1))

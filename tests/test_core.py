@@ -56,8 +56,22 @@ class TestBrain(unittest.TestCase):
 
     def test_help_and_pending_commands(self):
         store, brain = make_brain()
-        self.assertIn("/提醒", brain.handle(msg("/帮助"))["text"])
-        self.assertIn("暂时没有", brain.handle(msg("/待办"))["text"])
+        for text in ("/帮助", "帮助", "/help", "help"):
+            result = brain.handle(msg(text))
+            self.assertEqual("command", result["reason"])
+            self.assertIn("/提醒", result["text"])
+        for text in ("/待办", "待办"):
+            result = brain.handle(msg(text))
+            self.assertEqual("command", result["reason"])
+            self.assertIn("暂时没有", result["text"])
+
+    def test_reminder_command_accepts_both_forms(self):
+        store, brain = make_brain()
+        for text in ("提醒 5分钟 交周报", "/提醒 1小时 开会"):
+            result = brain.handle(msg(text))
+            self.assertEqual("command", result["reason"])
+            self.assertIn("后我 @ 你", result["text"])
+        self.assertEqual(2, len(store.pending_reminders("g1")))
 
     def test_memory_commands_are_gone(self):
         store, brain = make_brain()
