@@ -109,8 +109,6 @@ class Memory:
                     source TEXT NOT NULL DEFAULT '', external_id TEXT NOT NULL DEFAULT '',
                     state TEXT NOT NULL DEFAULT 'ready'
                 );
-                CREATE UNIQUE INDEX IF NOT EXISTS episodes_external
-                    ON episodes(group_id, external_id) WHERE external_id <> '';
                 CREATE TABLE IF NOT EXISTS memory_points (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     group_id TEXT NOT NULL, category TEXT NOT NULL,
@@ -118,8 +116,6 @@ class Memory:
                     last_hit REAL NOT NULL, state TEXT NOT NULL DEFAULT 'active',
                     protected INTEGER NOT NULL DEFAULT 0
                 );
-                CREATE INDEX IF NOT EXISTS points_lookup
-                    ON memory_points(group_id, content);
                 CREATE TABLE IF NOT EXISTS person_profiles (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     group_id TEXT NOT NULL, user_name TEXT NOT NULL,
@@ -144,6 +140,16 @@ class Memory:
                 );
                 """
             )
+            # 兼容旧库：早期版本没有 source / external_id / state 等列。
+            self._migrate()
+            self._db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS episodes_external "
+                "ON episodes(group_id, external_id) WHERE external_id <> ''"
+            )
+            self._db.execute(
+                "CREATE INDEX IF NOT EXISTS points_lookup ON memory_points(group_id, content)"
+            )
+            self._db.commit()
             try:
                 self._db.execute(
                     "CREATE VIRTUAL TABLE IF NOT EXISTS points_fts USING fts5(content, content='memory_points', content_rowid='id')"
@@ -166,6 +172,24 @@ class Memory:
             except sqlite3.OperationalError:
                 self._fts = False
             self._db.commit()
+
+    def _migrate(self):
+        """给旧库补列；SQLite 的 CREATE TABLE IF NOT EXISTS 不会新增字段。"""
+        wanted = {
+            "episodes": (("source", "TEXT NOT NULL DEFAULT ''"),
+                         ("external_id", "TEXT NOT NULL DEFAULT ''"),
+                         ("state", "TEXT NOT NULL DEFAULT 'ready'")),
+            "memory_points": (("state", "TEXT NOT NULL DEFAULT 'active'"),
+                              ("protected", "INTEGER NOT NULL DEFAULT 0")),
+            "person_profiles": (("source", "TEXT NOT NULL DEFAULT 'auto'"),),
+        }
+        for table, columns in wanted.items():
+            existing = {row["name"] for row in
+                        self._db.execute("PRAGMA table_info({})".format(table))}
+            for name, ddl in columns:
+                if name not in existing:
+                    self._db.execute("ALTER TABLE {} ADD COLUMN {} {}".format(
+                        table, name, ddl))
 
     # ---- Episode ----
     def add_episode(self, group_id, text, now=None, source="", external_id=""):
