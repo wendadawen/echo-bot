@@ -12,6 +12,8 @@ import re
 
 # name -> (说明, 参数名, 是否终态, 需要的场景)
 ACTION_SPECS = {
+    "subagent": ("能执行命令、跑代码、读写文件、联网查资料，给真实结果",
+                 "text", True, "any"),
     "reply": ("说一句话", "text", True, "any"),
     "silent": ("这次不说话", "", True, "any"),
     "wait": ("等下一批，可带秒数", "seconds", True, "group"),
@@ -21,7 +23,6 @@ ACTION_SPECS = {
     "send_face": ("发一个表情", "text", True, "group"),
     "view_image": ("看这张图", "text", False, "any"),
     "schedule": ("设一个提醒", "text", False, "any"),
-    "subagent": ("需要多步分析、写代码或整理长材料时，交给后台 Codex 执行", "text", True, "any"),
     "read_result": ("读取上一轮工具结果", "text", False, "any"),
 }
 
@@ -36,7 +37,11 @@ ACTION_PROMPT = (
     "你只输出一行 JSON，不要解释、不要代码块。\n"
     '格式：{"action":"动作名","text":"内容或参数"}；wait 可用 seconds 代替 text。\n'
     "{actions}\n"
-    "拿不准就 silent。text 最多两句，别写 markdown、别列点、别解释。\n"
+    "先判断：需要实时信息、执行代码/命令、读写文件、多步查资料，"
+    "或者你自己没把握 → subagent，把完整任务写进 text；"
+    "纯闲聊、情绪、玩笑、稳定常识、群内已知信息 → reply，最多两句；"
+    "确实不该接话 → silent。\n"
+    "不要因为怕答错就 silent，怕答错就用 subagent。\n"
     "一批里有多人说话时，只回最后一条，其他人一句带过或忽略。\n"
     '例：{"action":"reply","text":"少来这套"}'
 )

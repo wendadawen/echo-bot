@@ -114,6 +114,22 @@ class TestIncidentRegressions(unittest.TestCase):
     def test_action_prompt_warns_multi_user(self):
         self.assertIn("多人", ACTION_PROMPT)
 
+    def test_action_prompt_prefers_subagent_when_unsure(self):
+        self.assertIn("怕答错就用 subagent", ACTION_PROMPT)
+
+    def test_subagent_description_is_concrete(self):
+        from astrbot_plugin_echo.core.actions import available
+        self.assertIn("执行命令", available())
+
+    def test_subagent_is_listed_first(self):
+        from astrbot_plugin_echo.core.actions import ACTIONS
+        self.assertEqual("subagent", ACTIONS[0])
+
+    def test_task_prefix_allows_code(self):
+        from astrbot_plugin_echo.core.brain import TASK_PREFIX
+        self.assertIn("代码", TASK_PREFIX)
+        self.assertNotIn("不要 markdown", TASK_PREFIX)
+
     def test_empty_batch_is_silent(self):
         self.assertEqual("empty", make_brain().handle_batch(make_batch(""))["reason"])
 
