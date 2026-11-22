@@ -418,11 +418,16 @@ class Brain:
             if not self.modes.focus_hit(group, text):
                 return {"replied": False, "text": "", "reason": "off_topic"}
 
-        # 注意力：记录这批文本；活跃漂移消耗一次预算。
+        # 注意力：先按尚未入窗的新词比例判定漂移并写到 batch，再观测本批文本。
         if self.attention:
-            self.attention.observe(group, text)
-            if self.attention.level(group, text) == "active":
+            drift_lvl = self.attention.level(group, text)
+            batch.drift_level = drift_lvl
+            if drift_lvl == "active":
                 self.attention.consume(group)
+            self.attention.observe(group, text)
+
+        # 先看上一条落库消息是不是自己发的，才能准确给上一条回复记正反馈。
+        prev_last = self.store.recent(group, 1) if self.memory else []
 
         # 批内每条非空消息都按原始文本逐条落库，避免同批前几条提问丢失。
         stored = False
@@ -476,8 +481,8 @@ class Brain:
         persona = self._resolve_persona(group, getattr(batch, "scene", "group"))
         self.context_builder.persona = persona
 
-        # 回复效果反馈：有人接了自己上一句话，就记一次正反馈。
-        if self.memory and history and history[-1].get("role") == "bot":
+        # 回复效果反馈：上一条消息是自己发的、现在群友接话了，就记一次正反馈。
+        if self.memory and prev_last and prev_last[-1].get("role") == "bot":
             self.memory.mark_followup(group)
         # 群风格与黑话随聊天更新，供输出层使用。
         self.style = learn_style([h.get("text", "") for h in history], self.style)
@@ -677,8 +682,9 @@ class Brain:
         """群安静太久时主动开一句；失败或像客服就保持沉默。"""
         if not self.model:
             return ""
+        persona = self._resolve_persona(group)
         try:
-            reply = self.model.reply(self.persona, self.store.recent(group, 6),
+            reply = self.model.reply(persona, self.store.recent(group, 6),
                                      HEARTBEAT_PROMPT)
         except Exception:
             return ""
@@ -907,13 +913,29 @@ class Brain:
             return "正常。"
         if cmd == "待办":
             items = self.store.pending_reminders(msg.group_id)
-            if not items:
+            scheds = self.schedule.list(msg.group_id) if self.schedule else []
+            if not items and not scheds:
                 return "本群暂时没有待提醒的事。"
             lines = []
             for item in items:
                 repeat = item.get("repeat") or ""
                 suffix = "（每天 {}）".format(repeat.split(":", 1)[1]) if repeat.startswith("daily:") else ""
                 lines.append("- {}：{}{}".format(item["user_name"], item["text"], suffix))
+            for item in scheds:
+                kind = item.get("kind") or ""
+                spec = item.get("spec") or ""
+                if kind == "interval":
+                    suffix = "（每 {} 分钟）".format(spec)
+                elif kind == "weekly":
+                    suffix = "（每周 {}）".format(spec)
+                elif kind == "daily":
+                    suffix = "（每天 {}）".format(spec)
+                else:
+                    suffix = "（{}）".format(
+                        datetime.fromtimestamp(item["next_at"]).strftime("%m-%d %H:%M")
+                    )
+                who = item.get("user_name") or "群友"
+                lines.append("- {}：{}{}".format(who, item["text"], suffix))
             return "还记着这几件：\n" + "\n".join(lines)
         if not cmd.startswith("提醒"):
             return None
@@ -941,35 +963,45 @@ class Brain:
         )
         if weekly and self.schedule:
             weekday, clock, note = weekly.group(1), weekly.group(2), weekly.group(3).strip()
-            if note:
-                self.schedule.add(msg.group_id, note, "weekly",
-                                  "{} {}".format(weekday, clock),
-                                  user_id=msg.user_id, user_name=msg.user_name,
-                                  umo=msg.umo)
-                return "行，每周{} {} 叫你：{}".format(weekday, clock, note)
+            if not note or parse_clock(clock) is None:
+                return FORMAT_HINT
+            self.schedule.add(msg.group_id, note, "weekly",
+                              "{} {}".format(weekday, clock),
+                              user_id=msg.user_id, user_name=msg.user_name,
+                              umo=msg.umo)
+            return "行，每周{} {} 叫你：{}".format(weekday, clock, note)
 
         # 0b. 规则：下周几（一次性，默认早上 9 点）
         next_week = re.match(r"^下(?:周|星期)([一二三四五六日天])\s*(.*)$", body)
-        if next_week and self.schedule:
+        if next_week:
             weekday_char, rest = next_week.group(1), next_week.group(2).strip()
             clock_match = re.match(
                 r"^(\d{1,2}(?::\d{1,2}|点\d{0,2}))\s*(.*)$", rest
             )
             if clock_match:
                 clock_text, note = clock_match.group(1), clock_match.group(2).strip()
+                parsed_clock = parse_clock(clock_text)
+                if parsed_clock is None:
+                    return FORMAT_HINT
+                clock = parsed_clock
             else:
-                clock_text, note = "9:00", rest
+                clock, note = (9, 0), rest
             if note:
-                clock = parse_clock(clock_text) or (9, 0)
                 target = WEEKDAYS.get(weekday_char, 0)
                 today = datetime.now()
                 days = 7 - today.weekday() + target
                 due = datetime(today.year, today.month, today.day,
                                clock[0], clock[1]) + timedelta(days=days)
-                self.schedule.add(msg.group_id, note, "once",
-                                  due_at=due.timestamp(),
-                                  user_id=msg.user_id, user_name=msg.user_name,
-                                  umo=msg.umo)
+                if self.schedule:
+                    self.schedule.add(msg.group_id, note, "once",
+                                      due_at=due.timestamp(),
+                                      user_id=msg.user_id, user_name=msg.user_name,
+                                      umo=msg.umo)
+                else:
+                    self.store.add_reminder(
+                        msg.group_id, msg.user_id, msg.user_name, note,
+                        due.timestamp(), msg.umo,
+                    )
                 return "行，{} 叫你：{}".format(
                     due.strftime("%m-%d %H:%M"), note)
 
@@ -984,7 +1016,7 @@ class Brain:
             amount = int(m.group(1))
             unit = m.group(2) or "分钟"
             note = m.group(3).strip()
-            if not note:
+            if not note or amount < 1:
                 return FORMAT_HINT
             scale = 1 if unit == "秒" else 3600 if unit == "小时" else 60
             self.store.add_reminder(

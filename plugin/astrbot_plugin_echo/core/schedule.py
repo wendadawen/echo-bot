@@ -168,6 +168,8 @@ class Schedule:
                     (now, row["id"]),
                 )
                 self._db.commit()
+                if late > 6 * 3600 and row["missed"] == "skip":
+                    return None
                 return dict(row)
             # 错过太久：skip 策略只在长期没开机时避免补发；fire_once 仍补一次。
             send = True
@@ -178,6 +180,8 @@ class Schedule:
             while next_at <= now and guard < 500:
                 next_at = next_time(kind, row["spec"], next_at, row["tz"])
                 guard += 1
+            if next_at <= now:
+                next_at = next_time(kind, row["spec"], now, row["tz"])
             self._db.execute(
                 "UPDATE schedules SET next_at = ?, last_fired = ? WHERE id = ?",
                 (next_at, now, row["id"]),

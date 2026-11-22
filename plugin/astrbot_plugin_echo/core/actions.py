@@ -143,7 +143,7 @@ class ToolResultStore:
 
     def get(self, group_id, index=None):
         rows = [r for r in self._rows if r[0] == group_id]
-        if index is None:
+        if index is None or str(index).strip() == "":
             return rows[-1][2] if rows else ""
         try:
             return rows[int(index)][2]
@@ -164,8 +164,8 @@ def judge(action, payload, history, last_action):
             return "silent", ""
         if history and payload.strip() == str(history[-1]).strip():
             return "silent", ""
-        if len(payload) > 160:
-            return "reply", payload[:160]
+        if len(payload) > 300:
+            return "reply", payload[:300]
     return action, payload
 
 

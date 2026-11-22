@@ -56,18 +56,22 @@ class SubAgentManager:
             self._order.append(task.id)
 
         def work():
+            result = ""
+            error = ""
             try:
-                result = runner(task.prompt)
-                task.result = str(result or "").strip()[:800]
-                task.status = "completed" if task.result else "failed"
-                if not task.result:
-                    task.error = "空结果"
+                result = str(runner(task.prompt) or "").strip()[:800]
+                if not result:
+                    error = "空结果"
             except Exception as exc:  # 后台线程不能把异常抛给主循环
-                task.status = "failed"
-                task.error = "{}: {}".format(type(exc).__name__, exc)[:200]
-            finally:
+                error = "{}: {}".format(type(exc).__name__, exc)[:200]
+            with self._lock:
+                if task.status == "stopped":
+                    return
+                task.result = result
+                task.error = error
+                task.status = "completed" if result else "failed"
                 task.finished = time.time()
-                self._trim()
+            self._trim()
 
         threading.Thread(target=work, name="echo-subagent", daemon=True).start()
         return task.id

@@ -39,11 +39,25 @@ def similarity(left, right):
     return 1.0 - levenshtein(left, right) / float(longest)
 
 
+def _merge_field(existing, incoming, limit):
+    left = str(existing or "").strip()
+    right = str(incoming or "").strip()
+    if not right:
+        return left[:limit]
+    if not left:
+        return right[:limit]
+    if right in left:
+        return left[:limit]
+    if left in right:
+        return right[:limit]
+    return "{}；{}".format(left, right)[:limit]
+
+
 class PersonStore:
     """按群隔离的人物档案；写操作加锁，可多线程调用。"""
 
     def __init__(self, path=":memory:"):
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._db = sqlite3.connect(path, check_same_thread=False)
         self._db.row_factory = sqlite3.Row
         self._db.executescript(
@@ -175,15 +189,15 @@ class PersonStore:
         if not user_id:
             return {}
         now = time.time() if now is None else now
-        current = self.profile(group_id, user_id)
-        merged = {
-            "traits": fields.get("traits", current.get("traits", "")),
-            "preferences": fields.get("preferences", current.get("preferences", "")),
-            "events": fields.get("events", current.get("events", "")),
-            "relation": fields.get("relation", current.get("relation", "")),
-            "intimacy": float(fields.get("intimacy", current.get("intimacy", 0.5))),
-        }
         with self._lock:
+            current = self.profile(group_id, user_id)
+            merged = {
+                "traits": fields.get("traits", current.get("traits", "")),
+                "preferences": fields.get("preferences", current.get("preferences", "")),
+                "events": fields.get("events", current.get("events", "")),
+                "relation": fields.get("relation", current.get("relation", "")),
+                "intimacy": float(fields.get("intimacy", current.get("intimacy", 0.5))),
+            }
             self._db.execute(
                 "INSERT INTO profiles(group_id, user_id, traits, preferences, events, "
                 "relation, intimacy, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
@@ -199,12 +213,13 @@ class PersonStore:
         return merged
 
     def adjust_intimacy(self, group_id, user_id, delta):
-        current = self.profile(group_id, user_id)
-        base = float(current.get("intimacy", 0.5))
-        return self.upsert_profile(group_id, user_id, intimacy=base + float(delta))
+        with self._lock:
+            current = self.profile(group_id, user_id)
+            base = float(current.get("intimacy", 0.5))
+            return self.upsert_profile(group_id, user_id, intimacy=base + float(delta))
 
     def merge(self, old_id, new_id):
-        """同一个人的两个号合并：别名与画像都挪到新号上。"""
+        """同一个人的两个号合并：别名、画像与跨群记录都迁移合并到新号上。"""
         old_id, new_id = str(old_id), str(new_id)
         if not old_id or not new_id or old_id == new_id:
             return 0
@@ -223,6 +238,72 @@ class PersonStore:
                      time.time()),
                 )
                 moved += 1
+
+            old_profiles = self._db.execute(
+                "SELECT group_id, traits, preferences, events, relation, intimacy, updated_at "
+                "FROM profiles WHERE user_id = ?",
+                (old_id,),
+            ).fetchall()
+            limits = (("traits", 600), ("preferences", 400), ("events", 600), ("relation", 200))
+            for op in old_profiles:
+                np = self._db.execute(
+                    "SELECT traits, preferences, events, relation, intimacy, updated_at "
+                    "FROM profiles WHERE group_id = ? AND user_id = ?",
+                    (op["group_id"], new_id),
+                ).fetchone()
+                if np is None:
+                    self._db.execute(
+                        "INSERT INTO profiles(group_id, user_id, traits, preferences, events, "
+                        "relation, intimacy, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (op["group_id"], new_id, op["traits"][:600], op["preferences"][:400],
+                         op["events"][:600], op["relation"][:200], op["intimacy"],
+                         op["updated_at"]),
+                    )
+                else:
+                    merged = {
+                        field: _merge_field(np[field], op[field], cap)
+                        for field, cap in limits
+                    }
+                    self._db.execute(
+                        "UPDATE profiles SET traits = ?, preferences = ?, events = ?, "
+                        "relation = ?, intimacy = ?, updated_at = ? "
+                        "WHERE group_id = ? AND user_id = ?",
+                        (merged["traits"], merged["preferences"], merged["events"],
+                         merged["relation"], max(float(np["intimacy"]), float(op["intimacy"])),
+                         max(float(np["updated_at"]), float(op["updated_at"])),
+                         op["group_id"], new_id),
+                    )
+
+            old_ind = self._db.execute(
+                "SELECT first_seen, last_seen, msg_count, groups FROM individuals WHERE user_id = ?",
+                (old_id,),
+            ).fetchone()
+            if old_ind is not None:
+                new_ind = self._db.execute(
+                    "SELECT first_seen, last_seen, msg_count, groups FROM individuals WHERE user_id = ?",
+                    (new_id,),
+                ).fetchone()
+                if new_ind is None:
+                    self._db.execute(
+                        "INSERT INTO individuals(user_id, first_seen, last_seen, msg_count, groups) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (new_id, old_ind["first_seen"], old_ind["last_seen"],
+                         old_ind["msg_count"], old_ind["groups"]),
+                    )
+                else:
+                    old_groups = [g for g in (old_ind["groups"] or "").split(",") if g]
+                    new_groups = [g for g in (new_ind["groups"] or "").split(",") if g]
+                    groups = list(dict.fromkeys(new_groups + old_groups))
+                    self._db.execute(
+                        "UPDATE individuals SET first_seen = ?, last_seen = ?, "
+                        "msg_count = ?, groups = ? WHERE user_id = ?",
+                        (min(old_ind["first_seen"], new_ind["first_seen"]),
+                         max(old_ind["last_seen"], new_ind["last_seen"]),
+                         old_ind["msg_count"] + new_ind["msg_count"],
+                         ",".join(groups), new_id),
+                    )
+                self._db.execute("DELETE FROM individuals WHERE user_id = ?", (old_id,))
+
             self._db.execute("DELETE FROM identities WHERE user_id = ?", (old_id,))
             self._db.execute("DELETE FROM profiles WHERE user_id = ?", (old_id,))
             self._db.commit()

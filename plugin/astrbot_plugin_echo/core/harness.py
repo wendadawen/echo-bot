@@ -121,6 +121,7 @@ class CodexHarness:
         env = dict(os.environ)
         env["CODEX_HOME"] = self.home
         env["HOME"] = self.home
+        env["TMPDIR"] = str(workdir)
         if self.api_key:
             env["ECHO_API_KEY"] = self.api_key
         cmd = self._command(task)

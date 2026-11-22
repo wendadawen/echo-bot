@@ -21,23 +21,28 @@ def _get(node, *names, default=None):
 
 def looks_like_forward(component):
     name = type(component).__name__.lower()
-    if "forward" in name:
+    if "forward" in name or name in ("nodes", "node"):
         return True
     if isinstance(component, dict):
         kind = str(component.get("type") or "").lower()
-        return "forward" in kind
+        return "forward" in kind or kind in ("nodes", "node")
     return False
 
 
 def extract(component):
     """取出转发里的每条消息文本；结构不认识时返回空列表。"""
-    content = _get(component, "content", "messages", "nodes", "message", default=None)
-    if content is None:
-        return []
-    if isinstance(content, dict):
-        content = _get(content, "messages", "content", "nodes", default=[])
-    if not isinstance(content, (list, tuple)):
-        return []
+    name = type(component).__name__.lower()
+    dict_kind = str(component.get("type") or "").lower() if isinstance(component, dict) else ""
+    if name == "node" or dict_kind == "node":
+        content = [component]
+    else:
+        content = _get(component, "content", "messages", "nodes", "message", default=None)
+        if content is None:
+            return []
+        if isinstance(content, dict):
+            content = _get(content, "messages", "content", "nodes", default=[])
+        if not isinstance(content, (list, tuple)):
+            return []
     lines = []
     for node in list(content)[:MAX_ITEMS]:
         sender = _get(node, "sender", "name", "nickname", "user_name", default="")

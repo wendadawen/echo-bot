@@ -91,7 +91,7 @@ class ContextBuilder:
             rows = self.quoting.get(group_id) or []
             return "刚被引用：" + "；".join(rows) if rows else ""
         if name == "drift":
-            return self._drift_block(group_id, query)
+            return self._drift_block(group_id, query, batch)
         if name == "schedule":
             rows = self.schedule.get(group_id) or []
             return "群里待办：" + "；".join(rows) if rows else ""
@@ -134,10 +134,12 @@ class ContextBuilder:
         name = getattr(items[-1], "user_name", "") or "这个人"
         return "{}的印象：{}".format(name, summary)
 
-    def _drift_block(self, group_id, query):
+    def _drift_block(self, group_id, query, batch=None):
         if not self.attention:
             return ""
-        level = self.attention.level(group_id, query)
+        level = getattr(batch, "drift_level", None) if batch is not None else None
+        if not level:
+            level = self.attention.level(group_id, query)
         return attention_layer.render_block(level, self.attention.topic(group_id))
 
     @staticmethod

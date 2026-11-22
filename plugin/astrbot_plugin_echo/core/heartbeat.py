@@ -44,8 +44,12 @@ class Heartbeat:
             return False
         start, end = self.active_hours
         hour = time.localtime(now).tm_hour
-        if not (start <= hour < end):
-            return False
+        if start <= end:
+            if not (start <= hour < end):
+                return False
+        else:
+            if not (hour >= start or hour < end):
+                return False
         day = self._today(now)
         if self._day.get(group_id) == day and self._count.get(group_id, 0) >= self.daily_cap:
             return False

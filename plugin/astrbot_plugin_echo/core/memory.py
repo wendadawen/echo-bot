@@ -194,10 +194,11 @@ class Memory:
     # ---- Episode ----
     def last_episode_at(self, group_id):
         """最近一条情节的时间，用来判断摘要间隔，重启后仍然有效。"""
-        row = self._db.execute(
-            "SELECT MAX(created_at) FROM episodes WHERE group_id = ?",
-            (str(group_id),),
-        ).fetchone()
+        with self._lock:
+            row = self._db.execute(
+                "SELECT MAX(created_at) FROM episodes WHERE group_id = ?",
+                (str(group_id),),
+            ).fetchone()
         return float(row[0] or 0.0)
 
     def add_episode(self, group_id, text, now=None, source="", external_id=""):
@@ -279,7 +280,7 @@ class Memory:
     def maintain_point(self, group_id, point_id, action):
         with self._lock:
             row = self._db.execute(
-                "SELECT weight FROM memory_points WHERE id=? AND group_id=?",
+                "SELECT weight, protected FROM memory_points WHERE id=? AND group_id=?",
                 (point_id, group_id),
             ).fetchone()
             if not row:
@@ -287,7 +288,12 @@ class Memory:
             weight = maintain(action, row["weight"])
             state = "forgotten" if action == "recycle_bin" else (
                 "frozen" if action == "freeze" else "active")
-            protected = 1 if action == "protect" else 0
+            if action == "protect":
+                protected = 1
+            elif action == "recycle_bin":
+                protected = 0
+            else:
+                protected = row["protected"]
             self._db.execute(
                 "UPDATE memory_points SET weight=?, state=?, protected=? WHERE id=?",
                 (weight, state, protected, point_id),
@@ -300,10 +306,11 @@ class Memory:
             return []
         match = " OR ".join('"{}"'.format(t.replace('"', "")) for t in tokens)
         try:
-            rows = self._db.execute(
-                "SELECT rowid FROM points_fts WHERE points_fts MATCH ? LIMIT ?",
-                (match, limit * 4),
-            ).fetchall()
+            with self._lock:
+                rows = self._db.execute(
+                    "SELECT rowid FROM points_fts WHERE points_fts MATCH ? LIMIT ?",
+                    (match, limit * 4),
+                ).fetchall()
             return [r["rowid"] for r in rows]
         except sqlite3.OperationalError:
             return []
@@ -311,11 +318,14 @@ class Memory:
     def recall(self, group_id, query, limit=4, now=None):
         """混合检索：FTS5 命中 + 关键词命中 + 时间衰减权重；命中即再激活。"""
         now = time.time() if now is None else now
-        words = [w for w in re.findall(r"[\u4e00-\u9fff]{2,}|[a-z0-9]{3,}", query or "")][:6]
+        words = [
+            w.lower()
+            for w in re.findall(r"[\u4e00-\u9fff]{2,}|[a-zA-Z0-9]{3,}", query or "")
+        ][:6]
         # 情节也要参与召回；只查记忆点会漏掉整段对话。
         episodes = [
             text for text in self.recent_episodes(group_id, limit=10)
-            if not words or any(word in text for word in words)
+            if not words or any(word in text.lower() for word in words)
         ][-2:]
         fts_ids = set(self._fts_hits(group_id, query, limit))
         with self._lock:
@@ -328,19 +338,21 @@ class Memory:
             weight = decay(row["weight"], row["last_hit"], now)
             if weight < 0.15 and not row["protected"]:
                 continue
-            hit = sum(1 for w in words if w in row["content"])
+            content_lower = row["content"].lower()
+            hit = sum(1 for w in words if w in content_lower)
             fts = 1.0 if row["id"] in fts_ids else 0.0
-            scored.append((weight + hit * 0.5 + fts, row["content"], row["id"]))
+            scored.append((weight + hit * 0.5 + fts, row["content"], row["id"], row["weight"]))
         scored.sort(key=lambda item: item[0], reverse=True)
         chosen = scored[:max(0, limit - len(episodes))]
-        for _, _, rid in chosen:
+        if chosen:
             with self._lock:
-                self._db.execute(
-                    "UPDATE memory_points SET last_hit=?, weight=? WHERE id=?",
-                    (now, min(5.0, maintain("reinforce", 1.0) * 0.5 + 0.7), rid),
-                )
+                for _, _, rid, orig_weight in chosen:
+                    self._db.execute(
+                        "UPDATE memory_points SET last_hit=?, weight=? WHERE id=?",
+                        (now, min(5.0, float(orig_weight) + 0.3), rid),
+                    )
                 self._db.commit()
-        return (episodes + [content for _, content, _ in chosen])[:limit]
+        return (episodes + [content for _, content, _, _ in chosen])[:limit]
 
     # ---- 人物画像与关系 ----
     def upsert_person(self, group_id, user_name, category, content, now=None, source="auto"):
@@ -519,7 +531,4 @@ class Memory:
         relations = self.relations(group_id, user_name) if user_name else []
         if relations:
             parts.append("关系：" + "；".join(relations))
-        rate = self.effect_rate(group_id)
-        if rate < 0.3:
-            parts.append("最近你的话常没人接，少说两句")
         return "\n".join(parts)

@@ -139,6 +139,7 @@ class Echo(Star):
                 break
         group_id = "{}:{}".format(event.get_platform_name(), event.get_group_id() or "")
         # 表情/图片先收进仓库；纯图片消息没有文字，也要收。
+        has_image = False
         for part in event.get_messages():
             if isinstance(part, Face):
                 if self.emoji_bank:
@@ -147,16 +148,19 @@ class Echo(Star):
                         getattr(part, "id", ""), getattr(part, "name", ""),
                     )
             elif isinstance(part, Image):
+                has_image = True
                 loop = asyncio.get_running_loop()
                 loop.create_task(self._collect_image(group_id, part))
                 break
         # 含链接且未被 @：交给链接解析插件处理。
         if ("http://" in text or "https://" in text) and not mentioned:
             return
-        # 空消息（如只 @ 不发文字）到此为止，别再流进框架内置 LLM。
+        # 空消息：只有被 @ 且带图时当作看图入批，其余到此为止，别再流进框架内置 LLM。
         if not text and not forward_text:
-            event.stop_event()
-            return
+            if not (mentioned and has_image):
+                event.stop_event()
+                return
+            text = "[图片]"
 
         umo = str(event.unified_msg_origin or "")
         user_name = str(event.get_sender_name() or sender)
@@ -173,7 +177,7 @@ class Echo(Star):
             cmd = text.lstrip("/").strip()
             if cmd in ("闭嘴", "shutup"):
                 self.rhythm.mute(group_id, True)
-            elif cmd in ("说话", "开麦", "speak"):
+            elif cmd in ("说话", "开麦", "speak", "随便", "正常", "normal"):
                 self.rhythm.mute(group_id, False)
             event.stop_event()
             yield event.plain_result(direct)
@@ -183,7 +187,8 @@ class Echo(Star):
         quote_text = self._extract_quote(event)
         self.rhythm.add(group_id, Item(
             (text + (" " + forward_text if forward_text else "")).strip(),
-            sender, user_name, mentioned, umo, time.time(), quote=quote_text,
+            sender, user_name, mentioned, umo, time.time(),
+            kind="image" if has_image else "text", quote=quote_text,
         ))
         event.stop_event()
         return
@@ -276,18 +281,23 @@ class Echo(Star):
             try:
                 now = time.time()
                 pending = list(self.rhythm.due(now))
-                # wait 到期：按当时概率抽签，复用上一批上下文。
+                # wait 到期：按当时概率抽签，复用上一批上下文（由后续 due() 统一弹出，避免留滞）。
                 for group in list(self.rhythm.groups()):
-                    if self.rhythm.wait_due(group, now):
+                    if not self.rhythm.has_batch(group) and self.rhythm.wait_due(group, now):
                         last = self.rhythm.last_batch(group)
                         if last is not None:
-                            pending.append(self.rhythm.requeue(last, now))
+                            self.rhythm.requeue(last, now)
                 # 静默查看：安静太久且防抖已完成时抽签看一眼。
                 for group in list(self.rhythm.groups()):
-                    if self.rhythm.silent_due(group, now) and self.rhythm.consume_silent(group, now):
+                    if (
+                        not self.rhythm.has_batch(group)
+                        and self.rhythm.silent_due(group, now)
+                        and self.rhythm.consume_silent(group, now)
+                    ):
                         last = self.rhythm.last_batch(group)
                         if last is not None:
-                            pending.append(self.rhythm.requeue(last, now))
+                            self.rhythm.requeue(last, now)
+                pending.extend(self.rhythm.due(now))
                 for batch in pending:
                     group = batch.group_id
                     turn = getattr(batch, "turn_id", "")
@@ -403,7 +413,7 @@ class Echo(Star):
     async def _reminder_loop(self):
         while True:
             try:
-                for item in self.brain.tick():
+                for item in await asyncio.to_thread(self.brain.tick):
                     await self._send_reminder(item)
             except asyncio.CancelledError:
                 raise

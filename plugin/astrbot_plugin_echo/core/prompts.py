@@ -125,14 +125,18 @@ class PersonaLibrary:
         self.root.mkdir(parents=True, exist_ok=True)
 
     def _file(self, persona_id):
-        safe = "".join(ch for ch in persona_id if ch.isalnum() or ch in "-_")
-        return self.root / "{}.json".format(safe or "persona")
+        safe = "".join(ch for ch in persona_id if ch.isalnum() or ch in "-_") or "persona"
+        if safe == "active":
+            safe = "persona_active"
+        return self.root / "{}.json".format(safe)
 
     def list(self):
         rows = []
         if self.builtin:
             rows.append(self.builtin)
         for path in sorted(self.root.glob("*.json")):
+            if path.name == "active.json":
+                continue
             data = self._read(path)
             if data:
                 rows.append(data)
@@ -142,6 +146,8 @@ class PersonaLibrary:
         if self.builtin and persona_id == self.builtin.id:
             return self.builtin
         for path in self.root.glob("*.json"):
+            if path.name == "active.json":
+                continue
             data = self._read(path)
             if data and data.id == persona_id:
                 return data

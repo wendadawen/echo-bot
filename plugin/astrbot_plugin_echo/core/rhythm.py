@@ -33,6 +33,7 @@ PRIVATE_PRESETS = {
 }
 
 QUIET_GAP = 30.0
+IMAGE_TTL = 60.0
 SILENT_MIN_INTERVAL = 20.0
 SILENT_MAX_INTERVAL = 300.0
 SILENT_COOLDOWN = 1800.0
@@ -204,11 +205,12 @@ class Rhythm:
             batch.deadline = min(batch.deadline, self._earliest_mention[group_id])
         self._last_seen[group_id] = (now, item.user_id)
 
-    def attach_image(self, group_id, data):
+    def attach_image(self, group_id, data, now=None):
         """把下载到的图片挂到下一批上，供 view_image 动作使用。"""
         if data:
+            stamp = time.time() if now is None else now
             rows = self._images.setdefault(group_id, [])
-            rows.append(data)
+            rows.append((stamp, data))
             del rows[:-2]
 
     def due(self, now=None):
@@ -216,9 +218,15 @@ class Rhythm:
         ready = [b for b in self._batches.values() if now >= b.deadline]
         for batch in ready:
             self._batches.pop(batch.group_id, None)
-            batch.images = self._images.pop(batch.group_id, [])
+            raw_images = self._images.pop(batch.group_id, [])
+            batch.images = [
+                data for stamp, data in raw_images if now - stamp <= IMAGE_TTL
+            ]
             self._last_batch[batch.group_id] = batch
         return ready
+
+    def has_batch(self, group_id):
+        return bool(self._batches.get(group_id))
 
     def groups(self):
         return set(self._last_view) | set(self._batches) | set(self._carry) | set(self._last_batch)
