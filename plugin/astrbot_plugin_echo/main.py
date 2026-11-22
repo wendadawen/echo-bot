@@ -136,6 +136,19 @@ class Echo(Star):
             if looks_like_forward(part):
                 forward_text = forward_render(forward_extract(part))
                 break
+        group_id = "{}:{}".format(event.get_platform_name(), event.get_group_id() or "")
+        # 表情/图片先收进仓库；纯图片消息没有文字，也要收。
+        for part in event.get_messages():
+            if isinstance(part, Face):
+                if self.emoji_bank:
+                    await asyncio.to_thread(
+                        self.emoji_bank.collect_face, group_id,
+                        getattr(part, "id", ""), getattr(part, "name", ""),
+                    )
+            elif isinstance(part, Image):
+                loop = asyncio.get_running_loop()
+                loop.create_task(self._collect_image(group_id, part))
+                break
         # 含链接且未被 @：交给链接解析插件处理。
         if ("http://" in text or "https://" in text) and not mentioned:
             return
@@ -144,7 +157,6 @@ class Echo(Star):
             event.stop_event()
             return
 
-        group_id = "{}:{}".format(event.get_platform_name(), event.get_group_id() or "")
         umo = str(event.unified_msg_origin or "")
         user_name = str(event.get_sender_name() or sender)
         self._last_umo[group_id] = umo
@@ -167,18 +179,6 @@ class Echo(Star):
             return
 
         # 群里发的表情顺手收进表情仓库。
-        for part in event.get_messages():
-            if isinstance(part, Face):
-                if self.emoji_bank:
-                    await asyncio.to_thread(
-                        self.emoji_bank.collect_face, group_id,
-                        getattr(part, "id", ""), getattr(part, "name", ""),
-                    )
-            elif isinstance(part, Image):
-                loop = asyncio.get_running_loop()
-                loop.create_task(self._collect_image(group_id, part))
-                break
-
         self.rhythm.add(group_id, Item(
             (text + (" " + forward_text if forward_text else "")).strip(),
             sender, user_name, mentioned, umo, time.time(),
