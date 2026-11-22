@@ -13,9 +13,11 @@ from pathlib import Path
 
 MAX_OUTPUT = 800
 DEFAULT_TIMEOUT = 150
-# 容器内核不允许非特权 user namespace，bwrap 的 workspace-write 用不了。
-# 默认只读：能分析、能写文本，不能执行命令或改文件。
-SANDBOX = "read-only"
+# 容器本身就是隔离边界，容器内再套 bwrap 会因 user namespace 限制直接失败。
+# 所以用 danger-full-access，靠外层容器的目录权限和降权进程收边界。
+SANDBOX = "danger-full-access"
+NOBODY_UID = 65534
+NOBODY_GID = 65534
 
 
 class CodexHarness:
@@ -31,6 +33,16 @@ class CodexHarness:
 
     def available(self):
         return bool(self.binary and self.home and os.path.exists(self.binary))
+
+    def _prepare_dirs(self):
+        """Codex 以 nobody 运行，只给它自己的配置目录和工作目录。"""
+        for path in (Path(self.home), Path(self.workdir_root)):
+            try:
+                path.mkdir(parents=True, exist_ok=True)
+                os.chown(path, NOBODY_UID, NOBODY_GID)
+                os.chmod(path, 0o700)
+            except OSError:
+                pass
 
     def _ensure_config(self):
         """按插件配置生成 Codex 的 provider 配置；key 只走环境变量，不落盘。"""
@@ -53,19 +65,38 @@ class CodexHarness:
                 return
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(text, encoding="utf-8")
+            os.chmod(path, 0o644)
         except OSError:
             pass
 
     def _workdir(self, group_id):
-        safe = "".join(ch for ch in str(group_id) if ch.isalnum() or ch in "-_")
-        path = Path(self.workdir_root) / (safe or "group")
+        """所有群共用一个目录，前缀稳定，缓存才容易命中。"""
+        path = Path(self.workdir_root)
         path.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chown(path, NOBODY_UID, NOBODY_GID)
+            os.chmod(path, 0o700)
+        except OSError:
+            pass
         return path
+
+    @staticmethod
+    def _command(task):
+        """降权到 nobody 再启动 Codex，避免群聊输入把容器 root 拿去做事。"""
+        return [
+            "setpriv",
+            "--reuid={}".format(NOBODY_UID),
+            "--regid={}".format(NOBODY_GID),
+            "--clear-groups",
+            "codex", "exec", "--json", "--skip-git-repo-check",
+            "--sandbox", SANDBOX, "--", task,
+        ]
 
     def run(self, group_id, task):
         task = str(task or "").strip()
         if not task or not self.available():
             return ""
+        self._prepare_dirs()
         self._ensure_config()
         try:
             workdir = self._workdir(group_id)
@@ -76,8 +107,7 @@ class CodexHarness:
         env["HOME"] = self.home
         if self.api_key:
             env["ECHO_API_KEY"] = self.api_key
-        cmd = [self.binary, "exec", "--json", "--skip-git-repo-check",
-               "--sandbox", SANDBOX, "--", task]
+        cmd = self._command(task)
         try:
             proc = subprocess.Popen(
                 cmd, cwd=str(workdir), env=env, stdin=subprocess.DEVNULL,

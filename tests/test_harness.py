@@ -38,6 +38,15 @@ class TestHarness(unittest.TestCase):
         self.assertFalse(harness.available())
         self.assertEqual("", harness.run("g", "任务"))
 
+    def test_workdir_is_shared(self):
+        with tempfile.TemporaryDirectory() as folder:
+            harness = CodexHarness(
+                binary="/bin/true",
+                home=str(Path(folder) / "home"),
+                workdir_root=str(Path(folder) / "work"),
+            )
+            self.assertEqual(harness._workdir("g1"), harness._workdir("g2"))
+
     def test_config_written_with_responses_api(self):
         with tempfile.TemporaryDirectory() as folder:
             binary = Path(folder) / "codex"

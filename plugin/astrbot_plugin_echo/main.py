@@ -16,7 +16,7 @@ from astrbot.api.star import Context, Star, StarTools
 
 from .core.attention import AttentionTracker
 from .core.brain import PERSONA, Brain
-from .core.display import MessageLimiter
+from .core.display import MessageLimiter, clean
 from .core.expression import delay, split
 from .core.forward import extract as forward_extract
 from .core.forward import looks_like_forward
@@ -293,7 +293,7 @@ class Echo(Star):
                 for task in self.brain.poll_subagents():
                     if not task.get("umo"):
                         continue
-                    for part in split(task.get("text", ""))[:2]:
+                    for part in split(clean(task.get("text", "")))[:2]:
                         await self.context.send_message(
                             task["umo"], MessageChain([Plain(part)])
                         )

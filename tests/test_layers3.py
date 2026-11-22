@@ -12,8 +12,10 @@ from astrbot_plugin_echo.core import forward, heartbeat, jargon  # noqa: E402
 from astrbot_plugin_echo.core.brain import Brain  # noqa: E402
 from astrbot_plugin_echo.core.messages import Message  # noqa: E402
 from astrbot_plugin_echo.core.models import MockModel  # noqa: E402
+from astrbot_plugin_echo.core.rhythm import Batch, Item  # noqa: E402
 from astrbot_plugin_echo.core.schedule import Schedule, next_time, parse_clock  # noqa: E402
 from astrbot_plugin_echo.core.store import Store  # noqa: E402
+from astrbot_plugin_echo.core.subagent import SubAgentManager  # noqa: E402
 
 
 def at(hour, minute=0, day=22):
@@ -148,6 +150,38 @@ class TestForward(unittest.TestCase):
         self.assertFalse(forward.looks_like_forward(Plain()))
         self.assertEqual([], forward.extract(Plain()))
         self.assertEqual("", forward.render([]))
+
+
+class TestTaskRouting(unittest.TestCase):
+    def setUp(self):
+        self.brain = Brain(Store(":memory:"), MockModel())
+        self.brain.subagent = SubAgentManager()
+
+    def test_keyword_hits(self):
+        self.assertTrue(self.brain._is_direct_task("查询苏州天气"))
+        self.assertTrue(self.brain._is_direct_task("今天天气怎么样"))
+        self.assertFalse(self.brain._is_direct_task("今天好累"))
+
+    def test_dispatch_returns_task(self):
+        result = self.brain._dispatch_task("g1", "查询苏州天气", "demo:group-1")
+        self.assertEqual("task", result["reason"])
+        self.assertTrue(result["text"])
+
+    def test_refusal_falls_back_to_task(self):
+        class RefuseModel:
+            def reply(self, system, history, user_text):
+                return "我这边查不了实时天气"
+
+        brain = Brain(Store(":memory:"), RefuseModel())
+        brain.subagent = SubAgentManager()
+        now = time.time()
+        batch = Batch(
+            "g1",
+            items=[Item("苏州今天热不热", "1001", "阿伟", True, "demo:group-1", now)],
+            started=now,
+            deadline=now,
+        )
+        self.assertEqual("task", brain.handle_batch(batch)["reason"])
 
 
 class TestBrainScheduleAndForget(unittest.TestCase):

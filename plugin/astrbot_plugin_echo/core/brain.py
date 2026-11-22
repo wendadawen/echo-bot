@@ -120,6 +120,16 @@ COMMANDS = (
 
 HELP = "\n".join("/{}  {}".format(name, desc) for name, desc in COMMANDS)
 
+# 第一层：代码直接拦住明确的任务请求，不给模型自由回答的机会。
+TASK_HINTS = (
+    "查询", "查一下", "查查", "搜一下", "搜索", "帮我查", "实时", "最新", "天气",
+)
+# 第三层：模型仍然说查不了时的兜底话术。
+REFUSAL_HINTS = (
+    "查不了", "无法查询", "不能查询", "没有联网", "无法联网",
+    "不能实时", "无法获取实时", "没有权限", "查不到", "无法访问",
+)
+
 FORMAT_HINT = "没懂，发 /帮助"
 
 PARSE_PROMPT = (
@@ -241,6 +251,12 @@ class Brain:
         text = batch.text.strip()
         if not text:
             return {"replied": False, "text": "", "reason": "empty"}
+
+        # 第一层：明确的任务请求（查询、搜索、实时信息）直接进后台。
+        if self._is_direct_task(text):
+            dispatched = self._dispatch_task(group, text, getattr(batch, "umo", ""))
+            if dispatched:
+                return dispatched
         items = getattr(batch, "items", None) or []
         last = items[-1] if items else None
         user_name = getattr(last, "user_name", "") if last else ""
@@ -360,19 +376,12 @@ class Brain:
             if action == "subagent":
                 if not self.subagent:
                     return False, "后台没开"
-
-                def runner(prompt):
-                    if self.harness and self.harness.available():
-                        result = self.harness.run(group_id, prompt)
-                        if result:
-                            return result
-                    return self.model.reply(self.persona, [], prompt)[:600]
-
-                task_id = self.subagent.submit("chat", payload, runner)
-                if not task_id:
+                dispatched = self._dispatch_task(
+                    group_id, payload, getattr(batch, "umo", "")
+                )
+                if not dispatched:
                     return False, "后台正忙"
-                self._task_targets[task_id] = (group_id, getattr(batch, "umo", ""))
-                return True, "放后台了"
+                return True, dispatched["text"]
             return False, "这个动作还没接上"
 
         started = time.time()
@@ -398,6 +407,11 @@ class Brain:
             if self.monitor:
                 self.monitor.record(group, "empty_reply", ok=False, latency=elapsed)
             return {"replied": False, "text": "", "reason": "silent"}
+        # 第三层：模型仍然说查不了，就替它转一次后台。
+        if any(hint in reply for hint in REFUSAL_HINTS):
+            dispatched = self._dispatch_task(group, text, getattr(batch, "umo", ""))
+            if dispatched:
+                return dispatched
         if any(word in reply for word in FILTER_WORDS):
             if self.monitor:
                 self.monitor.record(group, "filtered", ok=False, latency=elapsed)
@@ -425,6 +439,31 @@ class Brain:
         return {"replied": True, "text": reply, "reason": action,
                 "elapsed": elapsed, "parts": planned.parts,
                 "delays": planned.delays}
+
+    @staticmethod
+    def _is_direct_task(text):
+        return any(hint in str(text or "") for hint in TASK_HINTS)
+
+    def _dispatch_task(self, group, text, umo=""):
+        """把任务交给后台 Codex；返回可直接发群的提示，失败返回空。"""
+        if not self.subagent:
+            return {}
+        task = str(text or "").strip()
+        if not task:
+            return {}
+
+        def runner(prompt):
+            if self.harness and self.harness.available():
+                result = self.harness.run(group, prompt)
+                if result:
+                    return result
+            return self.model.reply(self.persona, [], prompt)[:600]
+
+        task_id = self.subagent.submit("chat", task, runner)
+        if not task_id:
+            return {}
+        self._task_targets[task_id] = (group, umo)
+        return {"replied": True, "text": "放后台了，跑完发群里", "reason": "task"}
 
     def spontaneous(self, group, umo=""):
         """群安静太久时主动开一句；失败或像客服就保持沉默。"""
