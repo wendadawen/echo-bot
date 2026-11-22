@@ -107,7 +107,18 @@ def _repeat_key(group_id, user_id, text):
     return (str(group_id), str(user_id), clean)
 
 
-HELP = "有事直接说。要提醒就说「提醒 明早9点 开会」。"
+# 命令与说明集中在这里，加命令只改这一处，帮助自动跟着变。
+COMMANDS = (
+    ("帮助", "命令列表"),
+    ("待办", "看本群待办"),
+    ("提醒", "时间跟事儿一起发，像「每天22:00 交周报」"),
+    ("专注", "只聊这个话题"),
+    ("随便", "退出专注或静默"),
+    ("闭嘴", "该群不再说话，@ 也不回"),
+    ("忘掉", "清空本群聊天记录"),
+)
+
+HELP = "\n".join("/{}  {}".format(name, desc) for name, desc in COMMANDS)
 
 FORMAT_HINT = "没懂，发 /帮助"
 
