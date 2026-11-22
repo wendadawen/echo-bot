@@ -170,6 +170,14 @@ class TestBrainScheduleAndForget(unittest.TestCase):
         rows = self.brain.schedule.list("g1")
         self.assertEqual("weekly", rows[0]["kind"])
 
+    def test_next_week_reminder(self):
+        result = self.brain.handle(message("/提醒 下周三 交方案"))
+        self.assertIn("交方案", result["text"])
+        rows = self.brain.schedule.list("g1")
+        self.assertEqual(1, len(rows))
+        self.assertEqual("once", rows[0]["kind"])
+        self.assertGreater(rows[0]["next_at"], time.time())
+
     def test_forget_clears_messages(self):
         self.brain.handle(message("随便聊聊"))
         self.assertTrue(self.store.recent("g1"))

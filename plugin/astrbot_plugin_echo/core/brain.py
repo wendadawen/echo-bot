@@ -16,6 +16,7 @@ from .memory import MEMORY_PROMPT, parse_memory_full
 from .messages import Message
 from . import compaction, mentions
 from .rhythm import Batch
+from .schedule import WEEKDAYS, parse_clock
 
 # 人设改写自 whyever77/dafeiyu-astrbot（MIT）的「大肥鱼」人格设定，
 # 按本项目的群聊能力裁剪：去掉主人私聊、虚拟手机、语音与 B 站工具部分。
@@ -261,7 +262,9 @@ class Brain:
             if self.attention.level(group, text) == "active":
                 self.attention.consume(group)
 
-        self.store.add_message(group, user_id or "unknown", user_name, "user", text)
+        # 入库用原始消息文本，不用「名字：内容」的批次拼接文本。
+        raw_text = getattr(last, "text", "") or text
+        self.store.add_message(group, user_id or "unknown", user_name, "user", raw_text)
 
         # 同一人短时间内重复同一句话：消息照记，但只回一次，避免连发刷屏。
         repeat_key = _repeat_key(group, user_id, text)
@@ -591,6 +594,31 @@ class Brain:
                                   user_id=msg.user_id, user_name=msg.user_name,
                                   umo=msg.umo)
                 return "好，每周{} {} 我 @ 你：{}".format(weekday, clock, note)
+
+        # 0b. 规则：下周几（一次性，默认早上 9 点）
+        next_week = re.match(r"^下(?:周|星期)([一二三四五六日天])\s*(.*)$", body)
+        if next_week and self.schedule:
+            weekday_char, rest = next_week.group(1), next_week.group(2).strip()
+            clock_match = re.match(
+                r"^(\d{1,2}(?::\d{1,2}|点\d{0,2}))\s*(.*)$", rest
+            )
+            if clock_match:
+                clock_text, note = clock_match.group(1), clock_match.group(2).strip()
+            else:
+                clock_text, note = "9:00", rest
+            if note:
+                clock = parse_clock(clock_text) or (9, 0)
+                target = WEEKDAYS.get(weekday_char, 0)
+                today = datetime.now()
+                days = 7 - today.weekday() + target
+                due = datetime(today.year, today.month, today.day,
+                               clock[0], clock[1]) + timedelta(days=days)
+                self.schedule.add(msg.group_id, note, "once",
+                                  due_at=due.timestamp(),
+                                  user_id=msg.user_id, user_name=msg.user_name,
+                                  umo=msg.umo)
+                return "好，{} 我 @ 你：{}".format(
+                    due.strftime("%m-%d %H:%M"), note)
 
         # 1. 规则：每天固定时间
         daily = self._parse_daily(body)

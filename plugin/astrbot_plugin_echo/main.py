@@ -69,6 +69,7 @@ class Echo(Star):
         self.limiter = MessageLimiter(per_minute=8, per_burst=3)
         self._last_umo = {}
         self._heartbeat_at = 0.0
+        self._handled_turns = set()
         self.brain = Brain(
             self.store,
             self.model,
@@ -217,6 +218,14 @@ class Echo(Star):
                             pending.append(self.rhythm.requeue(last, now))
                 for batch in pending:
                     group = batch.group_id
+                    turn = getattr(batch, "turn_id", "")
+                    # 同一批被 wait / 静默查看重新排队时，只处理一次。
+                    if turn and turn in self._handled_turns:
+                        continue
+                    if turn:
+                        self._handled_turns.add(turn)
+                        if len(self._handled_turns) > 200:
+                            self._handled_turns.clear()
                     if self.rhythm.is_muted(group):
                         continue
                     if not batch.approved and not self.rhythm.should_view(
@@ -227,6 +236,9 @@ class Echo(Star):
                     quota = self.rhythm.start_turn(group)
                     result = await asyncio.to_thread(self.brain.handle_batch, batch)
                     self.rhythm.use_round(group, quota)
+                    # wait 与沉默都要允许后续再处理；已回复的批不再重复。
+                    if turn and result.get("reason") in ("wait", "silent"):
+                        self._handled_turns.discard(turn)
                     if result.get("reason") == "model_error":
                         logger.error("模型调用失败：%s", result.get("error"))
                     if result.get("reason") == "wait":

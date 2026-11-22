@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugin"))
 from astrbot_plugin_echo.core.actions import ToolLoop, parse  # noqa: E402
 from astrbot_plugin_echo.core.expression import apply_jargon, split, typo  # noqa: E402
 from astrbot_plugin_echo.core.memory import Memory, decay, maintain, parse_memory  # noqa: E402
-from astrbot_plugin_echo.core.rhythm import Item, Rhythm  # noqa: E402
+from astrbot_plugin_echo.core.rhythm import Batch, Item, Rhythm  # noqa: E402
 from astrbot_plugin_echo.core.vision import EmojiBank  # noqa: E402
 
 
@@ -20,6 +20,13 @@ def item(text, user="u1", name="阿伟", mentioned=False, ts=None, kind="text"):
 
 
 class TestRhythm(unittest.TestCase):
+    def test_requeue_keeps_turn_id(self):
+        rhythm = Rhythm()
+        batch = Batch("g", items=[item("在吗")], started=1.0, deadline=2.0)
+        clone = rhythm.requeue(batch, now=3.0)
+        self.assertEqual(batch.turn_id, clone.turn_id)
+        self.assertTrue(clone.approved)
+
     def test_batch_merges_same_user_messages(self):
         rhythm = Rhythm()
         rhythm.group_preset = dict(rhythm.group_preset, quiet=0, active=0,

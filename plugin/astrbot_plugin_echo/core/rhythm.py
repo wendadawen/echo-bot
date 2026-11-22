@@ -14,6 +14,7 @@
 import math
 import random
 import time
+import uuid
 from dataclasses import dataclass, field
 
 DEBOUNCE_PRESETS = {
@@ -34,6 +35,7 @@ PRIVATE_PRESETS = {
 QUIET_GAP = 30.0
 SILENT_MIN_INTERVAL = 20.0
 SILENT_MAX_INTERVAL = 300.0
+SILENT_COOLDOWN = 1800.0
 
 
 @dataclass
@@ -57,6 +59,8 @@ class Batch:
     scene: str = "group"
     images: list = field(default_factory=list)
     approved: bool = False
+    # 同一批消息被 requeue 时沿用同一个 turn_id，主循环据此避免重复处理。
+    turn_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
 
     @property
     def mentioned(self):
@@ -217,9 +221,16 @@ class Rhythm:
         已经通过查看抽签，所以 approved=True，避免主循环二次抽签把概率减半。
         """
         now = time.time() if now is None else now
-        clone = Batch(batch.group_id, list(batch.items), now, now + delay,
-                      getattr(batch, "scene", "group"), list(getattr(batch, "images", [])),
-                      approved=True)
+        clone = Batch(
+            group_id=batch.group_id,
+            items=list(batch.items),
+            started=now,
+            deadline=now + delay,
+            scene=getattr(batch, "scene", "group"),
+            images=list(getattr(batch, "images", [])),
+            approved=True,
+            turn_id=getattr(batch, "turn_id", ""),
+        )
         self._batches[batch.group_id] = clone
         return clone
 
@@ -286,7 +297,8 @@ class Rhythm:
         predicted = interval or self.predict_interval(group_id)
         if now - self._last_view.get(group_id, 0.0) < predicted:
             return False
-        return self._silent_used.get(group_id, 0.0) < self._last_view.get(group_id, 0.0) + 1
+        # 静默查看要真正冷却，不能每次循环都触发。
+        return now - self._silent_used.get(group_id, 0.0) >= SILENT_COOLDOWN
 
     def consume_silent(self, group_id, now=None):
         now = time.time() if now is None else now
