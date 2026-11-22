@@ -13,6 +13,7 @@ from .expression import (apply_jargon, decorate, learn_expressions, learn_style,
                          load_char_frequency, mine_jargon, typo)
 from .heartbeat import PROMPT as HEARTBEAT_PROMPT
 from .jargon import apply as apply_jargon_context
+from .mentions import is_question
 from .memory import MEMORY_PROMPT, parse_memory_full
 from .messages import Message
 from . import compaction, mentions
@@ -128,13 +129,17 @@ TASK_HINTS = ("查询", "查一下", "搜一下", "搜索", "帮我查", "实时
 TASK_PREFIX = (
     "你是群里的「大肥鱼」：蓝色小鲸鱼娘，嘴硬心软，爱面子，有点懒，说话短，自称肥鱼。"
     "用群聊口吻回答，一两句，不要 markdown、latex、代码块、标题、列表，"
-    "不要贴命令、日志或数据来源。任务："
+    "不要贴命令、日志或数据来源。"
+    "要查资料就用 curl 访问 https://html.duckduckgo.com/html/?q=关键词，取前几条结果；"
+    "如果这个词有多个含义，先列出可能的含义再反问。任务："
 )
 # 第三层：模型仍然说查不了时的兜底话术。
 REFUSAL_HINTS = (
     "查不了", "无法查询", "不能查询", "没有联网", "无法联网",
     "不能实时", "无法获取实时", "没有权限", "查不到", "无法访问",
 )
+# 问句里说不知道，也转后台查一次。
+UNCERTAIN_HINTS = ("不知道", "不清楚", "不了解", "没听说过", "不确定")
 
 FORMAT_HINT = "没懂，发 /帮助"
 
@@ -198,6 +203,8 @@ class Brain:
         self._task_targets = {}
         self._repeat_seen = {}
         self._summary_lock = threading.Lock()
+        self._last_reply_at = {}
+        self._last_reply_user = {}
         self.context_builder = ContextBuilder(
             self.persona, memory, self.style, attention=attention,
             modes=modes, persons=persons,
@@ -376,6 +383,8 @@ class Brain:
             if action == "send_face":
                 path = (self.emoji_bank.pick(group_id, payload, self.model)
                         if self.emoji_bank else None)
+                if path and str(path).startswith("face:"):
+                    return True, "__FACEID__" + str(path).split(":", 1)[1]
                 return True, ("__FACE__" + str(path)) if path else "没存着表情"
             if action == "read_result":
                 return False, self.tool_loop.results.get(group_id, payload)
@@ -404,6 +413,9 @@ class Brain:
                 self.monitor.record(group, action, ok=True, latency=elapsed)
             return {"replied": False, "text": "", "reason": action,
                     "wait_seconds": reply if action == "wait" else 0}
+        if reply.startswith("__FACEID__"):
+            return {"replied": True, "text": "",
+                    "face": reply[len("__FACEID__"):], "reason": "face"}
         if reply.startswith("__FACE__"):
             if self.monitor:
                 self.monitor.record(group, "face", ok=True, latency=elapsed)
@@ -413,8 +425,11 @@ class Brain:
             if self.monitor:
                 self.monitor.record(group, "empty_reply", ok=False, latency=elapsed)
             return {"replied": False, "text": "", "reason": "silent"}
-        # 第三层：模型仍然说查不了，就替它转一次后台。
-        if any(hint in reply for hint in REFUSAL_HINTS):
+        # 第三层：模型仍然说查不了，或问句里说不知道，就替它转一次后台。
+        uncertain = is_question(text) and any(
+            hint in reply for hint in UNCERTAIN_HINTS
+        )
+        if uncertain or any(hint in reply for hint in REFUSAL_HINTS):
             dispatched = self._dispatch_task(group, text, getattr(batch, "umo", ""))
             if dispatched:
                 return dispatched
@@ -432,6 +447,8 @@ class Brain:
             self.memory.record_reply(group, reply)
         learn_expressions(text[:12], reply, self.expressions)
         self.store.add_message(group, "bot", "大肥鱼", "bot", reply)
+        self._last_reply_at[group] = time.time()
+        self._last_reply_user[group] = last.user_id if last else ""
         self._maybe_summarize(group, text)
         planned = display_plan(reply, elapsed=elapsed)
         if self.monitor:
@@ -443,6 +460,18 @@ class Brain:
         return {"replied": True, "text": reply, "reason": action,
                 "elapsed": elapsed, "parts": planned.parts,
                 "delays": planned.delays}
+
+    def view_rate(self, batch):
+        """按语境给查看概率：问句 50%，刚说完同一人接话 60%，其余走默认。"""
+        text = getattr(batch, "text", "")
+        if is_question(text):
+            return 0.5
+        group = getattr(batch, "group_id", "")
+        user = batch.last_user if getattr(batch, "items", None) else ""
+        if (user and user == self._last_reply_user.get(group)
+                and time.time() - self._last_reply_at.get(group, 0) < 120):
+            return 0.6
+        return None
 
     @staticmethod
     def _is_direct_task(text):

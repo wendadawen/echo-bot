@@ -129,6 +129,29 @@ class EmojiBank:
         self._save()
         return label
 
+    def collect_face(self, group_id, face_id, name=""):
+        """收 QQ 内置表情：只记 ID 和名称，不落图片。"""
+        face_id = str(face_id or "").strip()
+        if not face_id:
+            return ""
+        entries = self._index.setdefault(group_id, [])
+        for item in entries:
+            if str(item.get("face_id") or "") == face_id:
+                item["ts"] = time.time()
+                self._save()
+                return item.get("tag") or "表情"
+        label = str(name or "QQ表情")[:20]
+        entries.append({
+            "face_id": face_id, "tag": label, "description": label,
+            "ts": time.time(),
+        })
+        while len(entries) > self.limit:
+            old = entries.pop(0)
+            if old.get("path"):
+                Path(old["path"]).unlink(missing_ok=True)
+        self._save()
+        return label
+
     def candidates(self, group_id, keyword=""):
         entries = self._index.get(group_id) or []
         rows = []
@@ -148,15 +171,36 @@ class EmojiBank:
                 if path.stat().st_size <= 2 * 1024 * 1024]
 
     def pick(self, group_id, keyword="", model=None):
-        """有模型时做语义网格挑选，否则在较新的候选里随机挑一张。"""
-        candidates = self.candidates(group_id, keyword)
-        if not candidates:
+        """有模型时做语义网格挑选；没有图片时也可以挑 QQ 内置表情。"""
+        entries = [
+            item for item in (self._index.get(group_id) or [])
+            if item.get("face_id") or (item.get("path") and Path(item["path"]).exists())
+        ]
+        if not entries:
             return None
-        if model is not None and len(candidates) > 1:
+        if keyword:
+            words = re.findall(r"[\u4e00-\u9fff]{2,}|[a-z0-9]{3,}", keyword)
+            matched = [
+                item for item in entries
+                if any(word in "{} {}".format(item.get("tag", ""),
+                                               item.get("description", ""))
+                       for word in words)
+            ]
+            if matched:
+                entries = matched
+        images = [item for item in entries
+                  if item.get("path") and Path(item["path"]).exists()]
+        if model is not None and len(images) > 1:
+            candidates = [(Path(item["path"]), Path(item["path"]).read_bytes())
+                          for item in images[:6]]
             index = grid_pick(model, candidates, keyword or "随手")
             if index is not None and 0 <= index < len(candidates):
                 return candidates[index][0]
-        return random.choice([path for path, _ in candidates[-8:]])
+        pool = images + [item for item in entries if item.get("face_id")]
+        picked = random.choice(pool[-8:])
+        if picked.get("face_id"):
+            return "face:" + str(picked["face_id"])
+        return Path(picked["path"])
 
     def remember(self, group_id, image_bytes, model, memory):
         """图片记忆：把描述写成一条记忆点，供之后 recall。"""
@@ -171,7 +215,8 @@ class EmojiBank:
             kept = []
             for item in entries:
                 if item.get("ts", 0) < cutoff:
-                    Path(item["path"]).unlink(missing_ok=True)
+                    if item.get("path"):
+                        Path(item["path"]).unlink(missing_ok=True)
                 else:
                     kept.append(item)
             self._index[group_id] = kept

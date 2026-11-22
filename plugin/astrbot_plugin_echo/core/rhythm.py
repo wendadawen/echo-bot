@@ -239,7 +239,7 @@ class Rhythm:
         self._carry.setdefault(group_id, []).extend(batch.items)
         self._carry[group_id] = self._carry[group_id][-20:]
 
-    def should_view(self, group_id, now=None, forced=False):
+    def should_view(self, group_id, now=None, forced=False, rate=None):
         now = time.time() if now is None else now
         if forced:
             self.mark_view(group_id, now)
@@ -247,7 +247,8 @@ class Rhythm:
         if self._debt.get(group_id, 0) > 0:
             self._debt[group_id] -= 1
             return False
-        hit = random.random() < self.view_rate
+        threshold = self.view_rate if rate is None else max(0.0, min(1.0, float(rate)))
+        hit = random.random() < threshold
         if hit:
             self.mark_view(group_id, now)
         return hit

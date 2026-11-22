@@ -169,6 +169,32 @@ class TestTaskRouting(unittest.TestCase):
         self.assertEqual("task", result["reason"])
         self.assertTrue(result["text"])
 
+    def test_uncertain_answer_goes_to_task(self):
+        class UnknownModel:
+            def reply(self, system, history, user_text):
+                return "这个我不知道"
+
+        brain = Brain(Store(":memory:"), UnknownModel())
+        brain.subagent = SubAgentManager()
+        now = time.time()
+        batch = Batch(
+            "g1",
+            items=[Item("你知道B卡的CLC吗", "1001", "阿伟", True, "demo:group-1", now)],
+            started=now,
+            deadline=now,
+        )
+        self.assertEqual("task", brain.handle_batch(batch)["reason"])
+
+    def test_view_rate_for_question(self):
+        now = time.time()
+        batch = Batch(
+            "g1",
+            items=[Item("这个怎么弄", "1001", "阿伟", False, "demo:group-1", now)],
+            started=now,
+            deadline=now,
+        )
+        self.assertEqual(0.5, self.brain.view_rate(batch))
+
     def test_failed_task_reports_to_group(self):
         def boom(prompt):
             raise RuntimeError("炸了")

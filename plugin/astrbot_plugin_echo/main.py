@@ -11,7 +11,7 @@ from pathlib import Path
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
-from astrbot.api.message_components import At, Image, Plain, Reply
+from astrbot.api.message_components import At, Face, Image, Plain, Reply
 from astrbot.api.star import Context, Star, StarTools
 
 from .core.attention import AttentionTracker
@@ -168,7 +168,13 @@ class Echo(Star):
 
         # 群里发的表情顺手收进表情仓库。
         for part in event.get_messages():
-            if isinstance(part, Image):
+            if isinstance(part, Face):
+                if self.emoji_bank:
+                    await asyncio.to_thread(
+                        self.emoji_bank.collect_face, group_id,
+                        getattr(part, "id", ""), getattr(part, "name", ""),
+                    )
+            elif isinstance(part, Image):
                 loop = asyncio.get_running_loop()
                 loop.create_task(self._collect_image(group_id, part))
                 break
@@ -249,7 +255,8 @@ class Echo(Star):
                     if self.rhythm.is_muted(group):
                         continue
                     if not batch.approved and not self.rhythm.should_view(
-                            group, now, forced=batch.mentioned):
+                            group, now, forced=batch.mentioned,
+                            rate=self.brain.view_rate(batch)):
                         # 未通过查看的消息留到下一批，不丢。
                         self.rhythm.carry(group, batch)
                         continue
@@ -268,7 +275,12 @@ class Echo(Star):
                     if not result.get("replied"):
                         continue
                     elapsed = float(result.get("elapsed") or 0.0)
-                    if result.get("image"):
+                    if result.get("face"):
+                        await self.context.send_message(
+                            batch.umo,
+                            MessageChain([Face(id=int(result["face"]))]),
+                        )
+                    elif result.get("image"):
                         await self._send_image(group, batch.umo, result["image"])
                     else:
                         parts = result.get("parts") or split(result.get("text", ""))

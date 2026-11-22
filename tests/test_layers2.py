@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugin"))
 
 from astrbot_plugin_echo.core import attention, display, monitor, prompts  # noqa: E402
 from astrbot_plugin_echo.core import compaction, mentions, modes, person_info  # noqa: E402
+from astrbot_plugin_echo.core import vision  # noqa: E402
 from astrbot_plugin_echo.core.subagent import SubAgentManager  # noqa: E402
 
 
@@ -197,6 +198,15 @@ class TestMentions(unittest.TestCase):
     def test_name_in_plain_sentence_not_called(self):
         info = mentions.detect("今天看到一条肥鱼", self_names=("大肥鱼", "肥鱼"))
         self.assertFalse(info.mentioned)
+
+
+class TestEmojiBank(unittest.TestCase):
+    def test_collect_face_and_pick(self):
+        with tempfile.TemporaryDirectory() as folder:
+            bank = vision.EmojiBank(folder)
+            bank.collect_face("g1", "475", "干饭")
+            self.assertEqual("face:475", bank.pick("g1"))
+            self.assertEqual(1, bank.stats("g1")["g1"])
 
 
 class TestCompaction(unittest.TestCase):
