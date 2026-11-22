@@ -82,6 +82,36 @@ class OpenAIModel(BaseModel):
             raise RuntimeError("模型返回空内容")
         return text
 
+    def vision_reply(self, text, image_url, timeout=None):
+        """多模态调用：图片用 data URI 或可下载的 URL，模型仍取配置里的 self.model。"""
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": text},
+                {"type": "image_url", "image_url": {"url": image_url}},
+            ],
+        }]
+        payload = {"model": self.model, "messages": messages, "max_tokens": 120}
+        req = urllib.request.Request(
+            self.url,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "Bearer " + self.api_key,
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout or self.timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        choices = data.get("choices") or []
+        if not choices:
+            raise RuntimeError("模型未返回候选结果")
+        message = choices[0].get("message") or {}
+        content = message.get("content")
+        if not isinstance(content, str):
+            content = message.get("reasoning_content") or message.get("text") or ""
+        return (content or "").strip()
+
 
 def build_model(config=None):
     """优先读插件面板配置，其次读环境变量；都没有就用本地模拟。"""

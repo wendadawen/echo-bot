@@ -19,6 +19,11 @@ REQUIRED = [
     "core/messages.py",
     "core/models.py",
     "core/store.py",
+    "core/rhythm.py",
+    "core/actions.py",
+    "core/expression.py",
+    "core/memory.py",
+    "core/vision.py",
 ]
 
 META_FIELDS = ["name", "display_name", "desc", "version", "author", "repo", "astrbot_version"]

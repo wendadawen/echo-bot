@@ -6,6 +6,12 @@ import re
 import time
 from datetime import datetime, timedelta
 
+from .actions import ToolLoop
+from .expression import apply_jargon, typo
+from .memory import MEMORY_PROMPT, parse_memory
+from .messages import Message
+from .rhythm import Batch
+
 PERSONA = (
     "你是「回声」，群里的中文群友。嘴毒、护短、从不认错，认定自己说的就是对的。\n"
     "这是多人群聊，不是私聊；「姓名：内容」是不同群友的话，别当成都在问你。\n"
@@ -102,7 +108,8 @@ QUESTION_MARKS = (
 class Brain:
     def __init__(self, store, model, chance=0.0, persona=PERSONA,
                  window=WINDOW_SECONDS, cooldown=COOLDOWN_SECONDS,
-                 window_cooldown=WINDOW_COOLDOWN_SECONDS):
+                 window_cooldown=WINDOW_COOLDOWN_SECONDS,
+                 memory=None, emoji_bank=None):
         self.store = store
         self.model = model
         self.chance = chance
@@ -113,6 +120,10 @@ class Brain:
         self._windows = {}
         self._last_reply = {}
         self._muted = set()
+        self.memory = memory
+        self.emoji_bank = emoji_bank
+        self.tool_loop = ToolLoop(model)
+        self._batch_count = 0
 
     def handle(self, msg):
         """处理一条群消息；返回回复文本，由平台层负责真正发送。"""
@@ -152,6 +163,86 @@ class Brain:
         self.store.add_message(msg.group_id, "bot", "回声", "bot", reply)
         self._last_reply[msg.group_id] = now
         return {"replied": True, "text": reply, "reason": reason}
+
+    def command(self, msg, text=None):
+        """命令即时通道，不走防抖；返回回复文本或 None。"""
+        text = (text if text is not None else msg.text).strip()
+        result = self._command(msg, text)
+        if result is not None:
+            self.store.add_message(msg.group_id, "bot", "回声", "bot", result)
+        return result
+
+    def handle_batch(self, batch):
+        """一批消息进入决策层：分层上下文 → 有限动作集 → 工具循环 → 一条回复。"""
+        group = batch.group_id
+        text = batch.text.strip()
+        if not text:
+            return {"replied": False, "text": "", "reason": "empty"}
+        user_name = batch.items[-1].user_name if batch.items else ""
+        self.store.add_message(group, "bot", user_name, "user", text)
+        history = self.store.recent(group, 12)
+
+        context = self.memory.context(group, text, user_name) if self.memory else ""
+        system = self.persona + ("\n\n" + context if context else "")
+
+        def executor(group_id, action, payload):
+            if action == "recall":
+                return False, (self.memory.context(group_id, payload) if self.memory else "没有记忆")
+            if action == "query_person":
+                rows = self.memory.person(group_id, payload) if self.memory else []
+                return False, "；".join(rows) if rows else "没记着这人"
+            if action == "note":
+                if self.memory:
+                    self.memory.add_point(group_id, "event", payload)
+                return False, "记下了：{}".format(payload)
+            if action == "schedule":
+                fake = Message(group, "", user_name, "提醒 " + payload, False, batch.umo)
+                return True, self._command(fake, "提醒 " + payload) or "没懂，发 /帮助"
+            if action == "view_image":
+                return False, "这批消息里没有可看的图"
+            if action == "send_face":
+                path = self.emoji_bank.pick(group_id, payload) if self.emoji_bank else None
+                return True, ("__FACE__" + str(path)) if path else "没存着表情"
+            return False, "这个动作还没接上"
+
+        decision = self.tool_loop.run(system, history, text, executor, group)
+        if not decision:
+            return {"replied": False, "text": "", "reason": "model_error"}
+        action, reply = decision["action"], decision["text"]
+        if action in ("silent", "wait"):
+            return {"replied": False, "text": "", "reason": action}
+        if reply.startswith("__FACE__"):
+            return {"replied": True, "text": "", "image": reply[len("__FACE__"):],
+                    "reason": "face"}
+        if not reply:
+            return {"replied": False, "text": "", "reason": "silent"}
+        if any(word in reply for word in SOFT_WORDS):
+            reply = random.choice(HARD_REPLIES)
+        if self.memory:
+            reply = apply_jargon(typo(reply), self.memory.jargon(group))
+        self.store.add_message(group, "bot", "回声", "bot", reply)
+        self._batch_count += 1
+        if self.memory and self._batch_count % 4 == 0:
+            self._summarize(group, text)
+        return {"replied": True, "text": reply, "reason": action}
+
+    def _summarize(self, group, text):
+        """每隔几批把对话压成 Episode 与记忆点，复用配置里指定的模型。"""
+        try:
+            raw = self.model.reply(MEMORY_PROMPT, [], text)
+        except Exception:
+            return
+        parsed = parse_memory(raw)
+        if not parsed:
+            return
+        episode, points = parsed
+        self.memory.add_episode(group, episode)
+        for category, content in points:
+            if category == "jargon":
+                self.memory.add_jargon(group, content, content)
+            else:
+                self.memory.add_point(group, category, content)
+        self.memory.prune(group)
 
     def _should_reply(self, msg, text, now):
         """按对话节奏决定是否开口；返回原因，None 表示保持沉默。"""

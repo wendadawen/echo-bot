@@ -1,21 +1,27 @@
 """回声（astrbot_plugin_echo）
 
-AstrBot 插件入口：只负责把平台事件转成统一消息、把核心逻辑的结果发回去。
+AstrBot 插件入口：只负责把平台事件转成批次、把核心层的动作发回去。
 核心逻辑在 core/ 中，不 import 任何框架模块，因此可以独立测试。
 """
 
 import asyncio
+import time
+import urllib.request
 from pathlib import Path
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
-from astrbot.api.message_components import At, Plain
+from astrbot.api.message_components import At, Image, Plain
 from astrbot.api.star import Context, Star, StarTools
 
 from .core.brain import PERSONA, Brain
+from .core.expression import delay, split
+from .core.memory import Memory
 from .core.messages import Message
 from .core.models import build_model
+from .core.rhythm import Item, Rhythm
 from .core.store import Store
+from .core.vision import EmojiBank
 
 PLUGIN_NAME = "astrbot_plugin_echo"
 
@@ -36,28 +42,38 @@ class Echo(Star):
         directory.mkdir(parents=True, exist_ok=True)
         self.store = Store(str(directory / "echo.sqlite3"))
         self.model = build_model(self.config)
+        self.memory = Memory(str(directory / "memory.sqlite3"))
+        self.emoji_bank = EmojiBank(directory / "emojis")
+        self.rhythm = Rhythm()
         self.brain = Brain(
             self.store,
             self.model,
             persona=PERSONA,
+            memory=self.memory,
+            emoji_bank=self.emoji_bank,
         )
         self.reminders_enabled = bool(self.config.get("reminder_enabled", True))
         self._reminder_task = None
+        self._chat_task = None
 
     @filter.on_astrbot_loaded()
     async def on_loaded(self):
         self._ensure_reminder_task()
+        self._ensure_chat_task()
 
     async def terminate(self):
-        """插件卸载时停止后台提醒任务。"""
-        if self._reminder_task is not None:
-            self._reminder_task.cancel()
-            self._reminder_task = None
+        """插件卸载时停止后台任务。"""
+        for name in ("_reminder_task", "_chat_task"):
+            task = getattr(self, name)
+            if task is not None:
+                task.cancel()
+                setattr(self, name, None)
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=10)
     async def on_group_message(self, event: AstrMessageEvent):
-        """接管群消息：命令与接话判断都在核心层完成。"""
+        """命令即时回；闲聊进防抖缓冲，由后台循环按批决策。"""
         self._ensure_reminder_task()
+        self._ensure_chat_task()
         sender = str(event.get_sender_id() or "")
         if not sender or sender == str(event.get_self_id() or ""):
             return
@@ -70,23 +86,48 @@ class Echo(Star):
         if not text:
             event.stop_event()
             return
-        message = Message(
-            group_id="{}:{}".format(event.get_platform_name(), event.get_group_id() or ""),
-            user_id=sender,
-            user_name=str(event.get_sender_name() or sender),
-            text=text,
-            mentioned=mentioned,
-            umo=str(event.unified_msg_origin or ""),
-        )
-        # 核心层是同步的纯逻辑；模型网络请求放在线程里，避免阻塞事件循环。
-        result = await asyncio.to_thread(self.brain.handle, message)
-        if result.get("reason") == "model_error":
-            logger.error("模型调用失败：%s", result.get("error"))
-        if not result["replied"]:
+
+        group_id = "{}:{}".format(event.get_platform_name(), event.get_group_id() or "")
+        umo = str(event.unified_msg_origin or "")
+        user_name = str(event.get_sender_name() or sender)
+        message = Message(group_id, sender, user_name, text, mentioned, umo)
+
+        # 命令不走防抖，立刻回。
+        direct = await asyncio.to_thread(self.brain.command, message, text)
+        if direct is not None:
+            if direct == "行，闭嘴。":
+                self.rhythm.mute(group_id, True)
+            elif direct == "行，说吧。":
+                self.rhythm.mute(group_id, False)
             event.stop_event()
+            yield event.plain_result(direct)
             return
+
+        # 群里发的表情顺手收进表情仓库。
+        for part in event.get_messages():
+            if isinstance(part, Image):
+                loop = asyncio.get_running_loop()
+                loop.create_task(self._collect_image(group_id, part))
+                break
+
+        self.rhythm.add(group_id, Item(text, sender, user_name, mentioned, umo, time.time()))
         event.stop_event()
-        yield event.plain_result(result["text"])
+        return
+
+    async def _collect_image(self, group_id, part):
+        url = getattr(part, "url", None) or getattr(part, "file", None)
+        if not url or not str(url).startswith("http"):
+            return
+        try:
+            data = await asyncio.to_thread(self._download, str(url))
+            await asyncio.to_thread(self.emoji_bank.collect, group_id, data, self.model)
+        except Exception as exc:
+            logger.debug("表情收集失败：%s", exc)
+
+    @staticmethod
+    def _download(url):
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            return resp.read(2 * 1024 * 1024)
 
     def _mentioned(self, event: AstrMessageEvent, text: str) -> bool:
         self_id = str(event.get_self_id() or "")
@@ -94,6 +135,56 @@ class Echo(Star):
             if isinstance(part, At) and str(part.qq) == self_id:
                 return True
         return text.startswith(("@回声", "＠回声"))
+
+    def _ensure_chat_task(self):
+        if self._chat_task is not None and not self._chat_task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._chat_task = loop.create_task(self._chat_loop(), name="echo-chat")
+
+    async def _chat_loop(self):
+        """防抖到期 → 查看概率 → 动作集决策 → 拆条拟人发送。"""
+        while True:
+            try:
+                for batch in self.rhythm.due():
+                    group = batch.group_id
+                    if self.rhythm.is_muted(group):
+                        continue
+                    if not self.rhythm.should_view(group, forced=batch.mentioned):
+                        continue
+                    result = await asyncio.to_thread(self.brain.handle_batch, batch)
+                    if result.get("reason") == "model_error":
+                        logger.error("模型调用失败：%s", result.get("error"))
+                    if not result.get("replied"):
+                        continue
+                    if result.get("image"):
+                        await self._send_image(group, batch.umo, result["image"])
+                    else:
+                        for part in split(result.get("text", "")):
+                            await self.context.send_message(
+                                batch.umo, MessageChain([Plain(part)])
+                            )
+                            await asyncio.sleep(delay(part))
+                    if self.rhythm.debt(group) == 0 and batch.mentioned:
+                        self.rhythm.borrow(group, 0)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error("回声对话循环异常：%s", exc)
+            await asyncio.sleep(0.4)
+
+    async def _send_image(self, group, umo, path):
+        if not umo or not Path(path).exists():
+            return
+        try:
+            await self.context.send_message(
+                umo, MessageChain([Image(file="file://" + str(path))])
+            )
+        except Exception as exc:
+            logger.error("表情发送失败：%s", exc)
 
     def _ensure_reminder_task(self):
         if not self.reminders_enabled:
