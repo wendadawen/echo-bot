@@ -177,6 +177,20 @@ class TestBrain(unittest.TestCase):
         self.assertIn("不要编造", model.systems[0])
         self.assertIn("多人群聊", model.systems[0])
 
+    def test_apology_is_replaced(self):
+        class ApologyModel:
+            name = "openai"
+
+            def reply(self, system, history, user_text):
+                return "确实说中了，我刚才没接住，抱歉。"
+
+        brain = Brain(Store(":memory:"), ApologyModel(), 1.0)
+        result = brain.handle(msg("你好笨"))
+        self.assertTrue(result["replied"])
+        self.assertNotIn("抱歉", result["text"])
+        self.assertNotIn("说中", result["text"])
+        self.assertTrue(result["text"])
+
     def test_model_parse_extracts_json_from_prose(self):
         model = ScriptedModel('好的，结果是 {"kind":"once","minutes":10,"text":"开会"}')
         brain = Brain(Store(":memory:"), model, 0.0)
