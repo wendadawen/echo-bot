@@ -239,7 +239,7 @@ class TestBrain(unittest.TestCase):
         model = ScriptedModel("嗯嗯")
         brain = Brain(Store(":memory:"), model)
         brain.handle(msg("随便聊聊"))
-        self.assertIn("多人群聊", model.systems[0])
+        self.assertIn("群友", model.systems[0])
 
     def test_service_tone_is_filtered(self):
         class ServiceModel:

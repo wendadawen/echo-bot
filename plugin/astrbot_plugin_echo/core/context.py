@@ -158,7 +158,7 @@ class ContextBuilder:
         if history:
             lines = []
             for item in history[-6:]:
-                role = "回声" if item.get("role") == "bot" else item.get("user_name", "群友")
+                role = "大肥鱼" if item.get("role") == "bot" else item.get("user_name", "群友")
                 lines.append("{}：{}".format(role, str(item.get("text", ""))[:80]))
             if lines:
                 sections.append("最近几句：\n" + "\n".join(lines))

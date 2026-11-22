@@ -88,7 +88,7 @@ def _summarize(rows):
         return ""
     lines = []
     for row in rows[-6:]:
-        name = "回声" if _role(row) == "bot" else (
+        name = "大肥鱼" if _role(row) == "bot" else (
             row.get("user_name", "群友") if isinstance(row, dict)
             else getattr(row, "user_name", "群友")
         )

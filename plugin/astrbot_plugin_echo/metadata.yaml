@@ -1,7 +1,7 @@
 name: astrbot_plugin_echo
-display_name: 回声
-short_desc: 群里的回声，会接话，也会记事和提醒。
-desc: 回声在群里，被 @ 一定回，平时偶尔插两句。聊过的人和事它会记着，说好的时间到点会提醒。命令发 /帮助。
+display_name: 大肥鱼
+short_desc: 群里的大肥鱼，会接话，也会记事和提醒。
+desc: 大肥鱼在群里，被 @ 一定回，平时偶尔插两句。聊过的人和事它会记着，说好的时间到点会提醒。命令发 /帮助。
 version: v0.1.0
 author: wendadawen
 repo: https://github.com/wendadawen/echo-bot

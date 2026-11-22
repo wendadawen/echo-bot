@@ -183,7 +183,7 @@ class Echo(Star):
         for part in event.get_messages():
             if isinstance(part, At) and str(part.qq) == self_id:
                 return True
-        return text.startswith(("@回声", "＠回声"))
+        return text.startswith(("@大肥鱼", "@回声", "＠大肥鱼", "＠回声"))
 
     def _ensure_chat_task(self):
         if self._chat_task is not None and not self._chat_task.done():
@@ -278,7 +278,7 @@ class Echo(Star):
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.error("回声对话循环异常：%s", exc)
+                logger.error("大肥鱼对话循环异常：%s", exc)
             await asyncio.sleep(0.4)
 
     async def _send_image(self, group, umo, path):
@@ -312,7 +312,7 @@ class Echo(Star):
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.error("回声提醒任务异常：%s", exc)
+                logger.error("大肥鱼提醒任务异常：%s", exc)
             await asyncio.sleep(2)
 
     async def _send_reminder(self, item):
