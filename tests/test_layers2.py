@@ -187,6 +187,17 @@ class TestMentions(unittest.TestCase):
         self.assertIn("小明", mentions.extract_targets("@小明 你看这个"))
         self.assertIn("阿伟", mentions.extract_targets("阿伟你怎么看", known_names=("阿伟",)))
 
+    def test_self_called_by_name(self):
+        info = mentions.detect("肥鱼你怎么看", self_names=("大肥鱼", "肥鱼"))
+        self.assertTrue(info.mentioned)
+        self.assertTrue(info.self_called)
+        info = mentions.detect("大肥鱼是不是傻", self_names=("大肥鱼", "肥鱼"))
+        self.assertTrue(info.mentioned)
+
+    def test_name_in_plain_sentence_not_called(self):
+        info = mentions.detect("今天看到一条肥鱼", self_names=("大肥鱼", "肥鱼"))
+        self.assertFalse(info.mentioned)
+
 
 class TestCompaction(unittest.TestCase):
     def _rows(self, count):

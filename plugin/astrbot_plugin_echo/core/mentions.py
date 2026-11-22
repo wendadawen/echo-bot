@@ -22,10 +22,11 @@ class MentionInfo:
     """一次提及的判定结果，供上下文与决策层使用。"""
 
     __slots__ = ("at", "text_at", "reply", "quoted", "retold", "targets",
-                 "direct_question")
+                 "direct_question", "self_called")
 
     def __init__(self, at=False, text_at=False, reply=False, quoted="",
-                 retold=False, targets=None, direct_question=False):
+                 retold=False, targets=None, direct_question=False,
+                 self_called=False):
         self.at = bool(at)
         self.text_at = bool(text_at)
         self.reply = bool(reply)
@@ -33,10 +34,11 @@ class MentionInfo:
         self.retold = bool(retold)
         self.targets = list(targets or [])
         self.direct_question = bool(direct_question)
+        self.self_called = bool(self_called)
 
     @property
     def mentioned(self):
-        return self.at or self.text_at or self.reply
+        return self.at or self.text_at or self.reply or self.self_called
 
     def as_dict(self):
         return {name: getattr(self, name) for name in self.__slots__}
@@ -91,6 +93,15 @@ def detect(text, *, at=False, self_names=(), quoted="", reply=False):
             text_at = True
             break
     targets = extract_targets(clean, self_names=names)
+    self_called = False
+    head = clean.lstrip("，,。. ")
+    for name in names:
+        if not name:
+            continue
+        # 句首直呼，或句中出现名字且带问句，才算在叫自己。
+        if head.startswith(name) or (name in clean and is_question(clean)):
+            self_called = True
+            break
     return MentionInfo(
         at=at,
         text_at=text_at,
@@ -99,6 +110,7 @@ def detect(text, *, at=False, self_names=(), quoted="", reply=False):
         retold=is_retold(clean),
         targets=targets,
         direct_question=is_question(clean),
+        self_called=self_called,
     )
 
 

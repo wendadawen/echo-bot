@@ -11,7 +11,7 @@ from pathlib import Path
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
-from astrbot.api.message_components import At, Image, Plain
+from astrbot.api.message_components import At, Image, Plain, Reply
 from astrbot.api.star import Context, Star, StarTools
 
 from .core.attention import AttentionTracker
@@ -200,6 +200,9 @@ class Echo(Star):
         self_id = str(event.get_self_id() or "")
         for part in event.get_messages():
             if isinstance(part, At) and str(part.qq) == self_id:
+                return True
+            # 引用机器人的消息，视为在跟它说话。
+            if isinstance(part, Reply) and str(getattr(part, "sender_id", "")) == self_id:
                 return True
         return text.startswith(("@大肥鱼", "@回声", "＠大肥鱼", "＠回声"))
 
