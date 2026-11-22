@@ -343,10 +343,6 @@ class Brain:
                 reply = self._command(fake, "提醒 " + payload) or "没懂，发 /帮助"
                 self.context_builder.add_schedule(group_id, reply)
                 return True, reply
-            if action == "weather":
-                from .weather import lookup
-
-                return False, lookup(payload) or "没查到天气"
             if action == "view_image":
                 images = getattr(batch, "images", None) or []
                 if not images:

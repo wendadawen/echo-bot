@@ -9,7 +9,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugin"))
 
 from astrbot_plugin_echo.core import forward, heartbeat, jargon  # noqa: E402
-from astrbot_plugin_echo.core.weather import lookup, translate  # noqa: E402
 from astrbot_plugin_echo.core.brain import Brain  # noqa: E402
 from astrbot_plugin_echo.core.messages import Message  # noqa: E402
 from astrbot_plugin_echo.core.models import MockModel  # noqa: E402
@@ -149,18 +148,6 @@ class TestForward(unittest.TestCase):
         self.assertFalse(forward.looks_like_forward(Plain()))
         self.assertEqual([], forward.extract(Plain()))
         self.assertEqual("", forward.render([]))
-
-
-class TestWeather(unittest.TestCase):
-    def test_translate_known(self):
-        self.assertEqual("烟霾", translate("Smoky haze"))
-        self.assertEqual("小雨", translate("Light rain"))
-
-    def test_translate_unknown_keeps(self):
-        self.assertEqual("Blowing dust", translate("Blowing dust"))
-
-    def test_empty_city(self):
-        self.assertEqual("", lookup(""))
 
 
 class TestBrainScheduleAndForget(unittest.TestCase):

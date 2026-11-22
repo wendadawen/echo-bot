@@ -7,6 +7,7 @@
 
 import json
 import os
+import signal
 import subprocess
 from pathlib import Path
 
@@ -78,14 +79,24 @@ class CodexHarness:
         cmd = [self.binary, "exec", "--json", "--skip-git-repo-check",
                "--sandbox", SANDBOX, "--", task]
         try:
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 cmd, cwd=str(workdir), env=env, stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                timeout=self.timeout, text=True,
+                text=True, start_new_session=True,
             )
-        except (subprocess.TimeoutExpired, OSError):
+        except OSError:
             return ""
-        return parse_events(proc.stdout, MAX_OUTPUT)
+        try:
+            stdout, _ = proc.communicate(timeout=self.timeout)
+        except subprocess.TimeoutExpired:
+            # Codex 还会起 bwrap / shell，必须杀整个进程组，避免遗留子进程。
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                proc.kill()
+            proc.communicate()
+            return ""
+        return parse_events(stdout, MAX_OUTPUT)
 
 
 def parse_events(raw, limit=MAX_OUTPUT):

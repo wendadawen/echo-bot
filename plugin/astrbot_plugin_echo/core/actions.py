@@ -21,7 +21,6 @@ ACTION_SPECS = {
     "send_face": ("发一个表情", "text", True, "group"),
     "view_image": ("看这张图", "text", False, "any"),
     "schedule": ("设一个提醒", "text", False, "any"),
-    "weather": ("查实时天气，参数是城市名", "text", False, "any"),
     "subagent": ("需要多步分析、写代码或整理长材料时，交给后台 Codex 执行", "text", True, "any"),
     "read_result": ("读取上一轮工具结果", "text", False, "any"),
 }
@@ -38,7 +37,6 @@ ACTION_PROMPT = (
     '格式：{"action":"动作名","text":"内容或参数"}；wait 可用 seconds 代替 text。\n'
     "{actions}\n"
     "拿不准就 silent。text 最多两句，别写 markdown、别列点、别解释。\n"
-    "要查实时天气就用 weather，不要直接说查不了。\n"
     '例：{"action":"reply","text":"少来这套"}'
 )
 
