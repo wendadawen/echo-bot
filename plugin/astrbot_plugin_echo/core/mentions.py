@@ -126,5 +126,5 @@ def render_block(info, self_names=()):
     if info.direct_question and not info.mentioned:
         bits.append("这句话带着问句，但不一定是问你的，接不上就别硬接")
     if info.quoted:
-        bits.append("被引用的是：{}".format(info.quoted[:60]))
+        bits.append("被引用的是：{}".format(info.quoted[:100]))
     return "；".join(bits)

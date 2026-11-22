@@ -246,7 +246,8 @@ class TestDisplay(unittest.TestCase):
         self.assertEqual("12°C", display.clean("$12°C$"))
         self.assertEqual("E=mc^2", display.clean("$E=mc^2$"))
         self.assertEqual("curl x", display.clean("```bash\ncurl x\n```"))
-        self.assertEqual("链接", display.clean("[链接](http://example.com)"))
+        self.assertEqual("链接 (http://example.com)", display.clean("[链接](http://example.com)"))
+        self.assertEqual("index.html", display.clean("[index.html](/AstrBot/data/index.html)"))
 
     def test_plan_splits_and_delays(self):
         out = display.plan("第一句。第二句！第三句？第四句。", max_parts=3)

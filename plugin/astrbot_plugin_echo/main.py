@@ -5,6 +5,7 @@ AstrBot 插件入口：只负责把平台事件转成批次、把核心层的动
 """
 
 import asyncio
+import re
 import time
 import urllib.request
 from pathlib import Path
@@ -179,9 +180,10 @@ class Echo(Star):
             return
 
         # 群里发的表情顺手收进表情仓库。
+        quote_text = self._extract_quote(event)
         self.rhythm.add(group_id, Item(
             (text + (" " + forward_text if forward_text else "")).strip(),
-            sender, user_name, mentioned, umo, time.time(),
+            sender, user_name, mentioned, umo, time.time(), quote=quote_text,
         ))
         event.stop_event()
         return
@@ -222,6 +224,29 @@ class Echo(Star):
         )
         with urllib.request.urlopen(request, timeout=15) as resp:
             return resp.read(2 * 1024 * 1024)
+
+    @staticmethod
+    def _extract_quote(event: AstrMessageEvent) -> str:
+        for part in event.get_messages():
+            if not isinstance(part, Reply):
+                continue
+            body = str(getattr(part, "message_str", "") or getattr(part, "text", "") or "").strip()
+            if not body:
+                segs = []
+                for seg in getattr(part, "chain", None) or []:
+                    seg_text = getattr(seg, "text", None)
+                    if seg_text:
+                        segs.append(str(seg_text))
+                body = " ".join(segs).strip()
+            body = re.sub(r"\s+", " ", body)[:100]
+            sender_name = str(getattr(part, "sender_nickname", "") or "").strip()
+            if sender_name and body:
+                return "{}：{}".format(sender_name, body)
+            if body:
+                return body
+            if sender_name:
+                return "回复 {}".format(sender_name)
+        return ""
 
     def _mentioned(self, event: AstrMessageEvent, text: str) -> bool:
         self_id = str(event.get_self_id() or "")
@@ -336,11 +361,13 @@ class Echo(Star):
                                 umo, MessageChain([Plain(text)])
                             )
                         self.heartbeat.mark(group, now)
-                # 后台任务完成：把结论发回原群。
-                for task in self.brain.poll_subagents():
+                # 后台任务完成：把结论发回原群（内部会调主模型转述，放线程避免阻塞事件循环）。
+                for task in await asyncio.to_thread(self.brain.poll_subagents):
                     if not task.get("umo"):
                         continue
                     for part in [clean(task.get("text", ""))]:
+                        if not part:
+                            continue
                         await self.context.send_message(
                             task["umo"], MessageChain([Plain(part)])
                         )

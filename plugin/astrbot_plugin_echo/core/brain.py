@@ -6,7 +6,7 @@ import threading
 import time
 from datetime import datetime, timedelta
 
-from .actions import ToolLoop
+from .actions import ToolLoop, parse_full
 from .context import ContextBuilder
 from .display import plan as display_plan
 from .expression import (apply_jargon, decorate, learn_expressions, learn_style,
@@ -134,17 +134,126 @@ UNSAFE_PATTERNS = (
     re.compile(r"(?:读|拿|看|导出|打印).{0,6}(?:配置|密钥|token|密码|\.env)", re.I),
     re.compile(r"(?:curl|wget).{0,60}\|\s*(?:sh|bash)", re.I),
     re.compile(r"\bsudo\s"),
+    re.compile(r"http\.server|\bnc\s+-l|\bsocat\s", re.I),
 )
 
 
 def is_unsafe(text):
     return any(pattern.search(str(text or "")) for pattern in UNSAFE_PATTERNS)
-# 交给 Codex 的固定前缀：一句人设 + 口吻和格式约束，内容不变，不影响缓存前缀。
+# 交给 Codex 的固定前缀：纯后台执行器，只交真实结论与必要代码，不扮演人设、不代写群聊话术、不启常驻服务。
 TASK_PREFIX = (
-    "你是群里的「大肥鱼」：蓝色小鲸鱼娘，嘴硬心软，爱面子，有点懒，说话短，自称肥鱼。"
-    "用群聊口吻回答，简短；需要给代码或步骤时直接给原文，"
-    "不要贴命令、日志或数据来源。任务："
+    "你是后台执行助手，只负责查证、计算或执行并把真实结果交回主程序，不直接对群友说话。"
+    "不要扮演角色，不要替主程序起草群聊话术或回复建议。"
+    "禁止启动 HTTP/端口监听服务或常驻后台进程，禁止读取配置或环境变量密钥，"
+    "禁止在结果中输出容器本地路径或内网 IP。"
+    "直接给简洁、客观的事实结论；需要给代码或步骤时直接给原文，"
+    "不要贴命令过程、日志或内部配置。任务："
 )
+
+SUBAGENT_REPLY_PROMPT = (
+    "下面是一段后台工具执行后的内部结果。你现在是以「大肥鱼」的身份直接在 QQ 群里回复群友，"
+    "不要输出 JSON，不要照抄内部汇报语气，也绝对不要出现“群里可以这么回”“回复建议”等草稿标签或元话术。\n"
+    "要求：\n"
+    "1. 用大肥鱼简短、自然的群聊口吻（1 到 3 句）把结论直接告诉群友。\n"
+    "2. 忠于后台查到或算出的真实事实与局限，查不到或未解决就诚实直说，不编造。\n"
+    "3. 不要暴露后台搜索工具、命令行、内部配置或底层模型名。"
+)
+
+SUBAGENT_CODE_INTRO_PROMPT = (
+    "下面是一段后台任务返回的说明文字（代码或完整数据块会由程序原样附在后面）。"
+    "你现在以「大肥鱼」的身份在 QQ 群里写 1 到 2 句简短自然的开场或总结，"
+    "不要输出 JSON，不要重复贴代码，不要写“群里可以这么回”等草稿标签，不要暴露内部工具、命令或模型名。"
+)
+
+SUBAGENT_MODEL_INPUT_LIMIT = 600
+SUBAGENT_PROMPT_LIMIT = 200
+SUBAGENT_HISTORY_ITEM_LIMIT = 200
+SUBAGENT_HISTORY_BUDGET = 400
+
+
+def _clip(text, limit):
+    s = str(text or "").strip()
+    if len(s) <= limit:
+        return s
+    return s[:limit] + "…"
+
+_CLOSED_CODE_BLOCK = re.compile(r"```[a-zA-Z0-9_+-]*\s*\n?(.*?)```", re.S)
+_OPEN_CODE_BLOCK = re.compile(r"```[a-zA-Z0-9_+-]*\s*\n(.*)\Z", re.S)
+_META_REPLY_SPLIT = re.compile(
+    r"(?:^|\n)\s*(?:(?:群里|群聊|直接)?(?:可以)?(?:这么|这样)回[复答]?|(?:建议|参考|可直接发送的?)(?:群聊)?回复|回复建议)\s*[：:]\s*",
+    re.S,
+)
+_QUOTE_PAIRS = (("“", "”"), ('"', '"'), ("「", "」"), ("『", "』"), ("'", "'"))
+
+
+def _split_code_blocks(text):
+    """拆分正文与围栏代码块（含末尾未闭合块），代码块正文原样保留。"""
+    raw = str(text or "").strip()
+    blocks = []
+
+    def collect(match):
+        body = match.group(1).strip("\r\n")
+        if body:
+            blocks.append(body)
+        return ""
+
+    prose = _CLOSED_CODE_BLOCK.sub(collect, raw)
+    prose = _OPEN_CODE_BLOCK.sub(collect, prose)
+    prose = re.sub(r"\n{3,}", "\n\n", prose).strip()
+    return prose, blocks
+
+
+def _strip_outer_quotes(text):
+    """剥掉一层成对的外层引号。"""
+    s = str(text or "").strip()
+    for left, right in _QUOTE_PAIRS:
+        if len(s) >= len(left) + len(right) and s.startswith(left) and s.endswith(right):
+            return s[len(left):len(s) - len(right)].strip()
+    return s
+
+
+_INTERNAL_PATH_PATTERN = re.compile(r"/AstrBot/[^\s)\]）】>\"'`]+")
+_PRIVATE_URL_PATTERN = re.compile(
+    r"https?://(?:127\.0\.0\.1|localhost|10\.\d+\.\d+\.\d+|"
+    r"172\.(?:1[6-9]|2\d|3[01])\.\d+\.\d+|192\.168\.\d+\.\d+)(?::\d+)?[^\s)\]）】>\"'`]*"
+)
+_EMPTY_MD_LINK_PATTERN = re.compile(r"\[[^\]]*\]\(\s*\)")
+
+
+def _scrub_internal_leaks(text):
+    """去掉意外露出的容器路径与内网 URL，避免误发到群里。"""
+    s = _PRIVATE_URL_PATTERN.sub("", str(text or ""))
+    s = _INTERNAL_PATH_PATTERN.sub("", s)
+    s = _EMPTY_MD_LINK_PATTERN.sub("", s)
+    s = re.sub(r"(?m)^\s*[-*•]\s*(?:文件|网页|链接|地址)?\s*[：:]?\s*$", "", s)
+    s = re.sub(r"[ \t]{2,}", " ", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
+
+
+def _sanitize_meta_reply(text):
+    """兜底剥离「群里可以这么回：」等元话术外壳，并清理容器路径与内网地址。"""
+    cleaned = _scrub_internal_leaks(str(text or "").strip())
+    if not cleaned:
+        return ""
+    match = _META_REPLY_SPLIT.search(cleaned)
+    if not match:
+        return cleaned
+    tail = _strip_outer_quotes(cleaned[match.end():])
+    if tail:
+        return _scrub_internal_leaks(tail)
+    return _scrub_internal_leaks(cleaned[:match.start()].strip())
+
+
+def _unwrap_reply_text(raw):
+    """主模型误吐出 reply JSON 时提取其中的正文。"""
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    parsed = parse_full(text)
+    if parsed and parsed.get("action") == "reply":
+        return str(parsed.get("text") or "").strip()
+    return text
 # 第三层：模型仍然说查不了时的兜底话术。
 REFUSAL_HINTS = (
     "查不了", "无法查询", "不能查询", "没有联网", "无法联网",
@@ -283,15 +392,9 @@ class Brain:
         user_name = getattr(last, "user_name", "") if last else ""
         user_id = getattr(last, "user_id", "") if last else ""
 
-        # 危险请求（无限循环、删根目录、读密钥等）直接拒绝。
-        if is_unsafe(raw_text):
+        # 危险请求（无限循环、删根目录、读密钥、起监听服务等）直接拒绝。
+        if any(is_unsafe(getattr(i, "text", "")) for i in items) or is_unsafe(raw_text):
             return {"replied": True, "text": "这个不干。", "reason": "unsafe"}
-
-        # 第一层：明确的任务请求（查询、搜索、实时信息）直接进后台。
-        if self._is_direct_task(raw_text):
-            dispatched = self._dispatch_task(group, raw_text, getattr(batch, "umo", ""))
-            if dispatched:
-                return dispatched
 
         # 人物档案先落库：即使这轮沉默，叫法与活跃度也要留下。
         if self.persons:
@@ -321,16 +424,30 @@ class Brain:
             if self.attention.level(group, text) == "active":
                 self.attention.consume(group)
 
-        # 入库用原始消息文本，不用「名字：内容」的批次拼接文本。
-        raw_text = getattr(last, "text", "") or text
-        self.store.add_message(group, user_id or "unknown", user_name, "user", raw_text)
+        # 批内每条非空消息都按原始文本逐条落库，避免同批前几条提问丢失。
+        stored = False
+        for item in items:
+            item_text = str(getattr(item, "text", "") or "").strip()
+            if not item_text:
+                continue
+            self.store.add_message(
+                group,
+                getattr(item, "user_id", "") or "unknown",
+                getattr(item, "user_name", "") or "",
+                "user",
+                item_text,
+                ts=getattr(item, "ts", None),
+            )
+            stored = True
+        if not stored:
+            self.store.add_message(group, user_id or "unknown", user_name, "user", raw_text)
 
         # 同一人短时间内重复同一句话：消息照记，但只回一次，避免连发刷屏。
         repeat_key = _repeat_key(group, user_id, raw_text)
         now = time.time()
-        last = self._repeat_seen.get(repeat_key, 0)
+        seen_at = self._repeat_seen.get(repeat_key, 0)
         self._repeat_seen[repeat_key] = now
-        if last and now - last < REPEAT_WINDOW:
+        if seen_at and now - seen_at < REPEAT_WINDOW:
             return {"replied": False, "text": "", "reason": "repeat"}
         if len(self._repeat_seen) > 500:
             cutoff = now - REPEAT_WINDOW
@@ -339,7 +456,16 @@ class Brain:
                 if stamp >= cutoff
             }
 
-        history = self.store.recent(group, 12)
+        # 第一层：明确的任务请求（查询、搜索、实时信息）在完成入库、模式校验与去重后进后台。
+        if self._is_direct_task(raw_text):
+            dispatched = self._dispatch_task(group, raw_text, getattr(batch, "umo", ""))
+            if dispatched:
+                return dispatched
+
+        history = [
+            {**item, "text": _clip(item.get("text"), 300)}
+            for item in self.store.recent(group, 12)
+        ]
 
         # 上下文压缩：超预算时保留最近与点名消息，其余压成摘要。
         history, summary = compaction.compact(
@@ -347,14 +473,7 @@ class Brain:
         )
         batch.history_summary = summary
 
-        # 人格：按群启用的优先，其次提示词覆盖，最后内置。
-        persona = self.persona
-        if self.personas:
-            active = self.personas.active(group)
-            if active:
-                persona = active.compose(getattr(batch, "scene", "group"))
-        if self.prompt_store:
-            persona = self.prompt_store.get("persona", group, persona)
+        persona = self._resolve_persona(group, getattr(batch, "scene", "group"))
         self.context_builder.persona = persona
 
         # 回复效果反馈：有人接了自己上一句话，就记一次正反馈。
@@ -518,6 +637,17 @@ class Brain:
             return 0.6
         return None
 
+    def _resolve_persona(self, group, scene="group"):
+        """人格：按群启用的优先，其次提示词覆盖，最后内置。"""
+        persona = self.persona
+        if self.personas:
+            active = self.personas.active(group)
+            if active:
+                persona = active.compose(scene)
+        if self.prompt_store:
+            persona = self.prompt_store.get("persona", group, persona)
+        return persona
+
     @staticmethod
     def _is_direct_task(text):
         return any(hint in str(text or "") for hint in TASK_HINTS)
@@ -535,7 +665,7 @@ class Brain:
                 result = self.harness.run(group, TASK_PREFIX + prompt)
                 if result:
                     return result
-            return self.model.reply(self.persona, [], prompt)[:600]
+            return self.model.reply(TASK_PREFIX, [], prompt)[:600]
 
         task_id = self.subagent.submit("chat", task, runner)
         if not task_id:
@@ -561,8 +691,61 @@ class Brain:
         self.store.add_message(group, "bot", "大肥鱼", "bot", line)
         return line
 
+    def _present_subagent_result(self, group, task):
+        """把后台子代理的客观结果交给主模型，按群人格转成直接发群的话。"""
+        raw = str(task.get("result") or "").strip()
+        if not raw:
+            return ""
+        prompt = str(task.get("prompt") or "").strip()
+        prose, blocks = _split_code_blocks(raw)
+        fallback = _sanitize_meta_reply(prose) if blocks else _sanitize_meta_reply(raw)
+
+        rewritten = ""
+        if self.model is not None:
+            instruction = SUBAGENT_CODE_INTRO_PROMPT if blocks else SUBAGENT_REPLY_PROMPT
+            system = self._resolve_persona(group) + "\n\n" + instruction
+            clipped_history = [
+                {**item, "text": _clip(item.get("text"), SUBAGENT_HISTORY_ITEM_LIMIT)}
+                for item in self.store.recent(group, 6)
+            ]
+            history, _ = compaction.compact(
+                clipped_history,
+                budget_tokens=SUBAGENT_HISTORY_BUDGET,
+                keep_recent=3,
+                self_names=("大肥鱼", "回声"),
+            )
+            body = _clip(prose if blocks else raw, SUBAGENT_MODEL_INPUT_LIMIT)
+            if blocks and not body:
+                body = "（后台已完成计算/代码生成，请写一句简短的群聊开场白引出后面的内容）"
+            user_parts = []
+            clipped_prompt = _clip(prompt, SUBAGENT_PROMPT_LIMIT)
+            if clipped_prompt:
+                user_parts.append("原任务：" + clipped_prompt)
+            user_parts.append("后台结果：\n" + body)
+            user_msg = "\n\n".join(user_parts)
+            try:
+                candidate = self.model.reply(system, history, user_msg)
+            except Exception:
+                candidate = ""
+            candidate = _sanitize_meta_reply(_unwrap_reply_text(candidate))
+            if candidate and not any(word in candidate for word in FILTER_WORDS):
+                rewritten = candidate
+
+        if blocks:
+            intro = rewritten
+            if not intro and fallback and not any(word in fallback for word in FILTER_WORDS):
+                intro = fallback
+            code_part = "\n\n".join(blocks)
+            return (intro + "\n" + code_part).strip() if intro else code_part
+
+        if rewritten:
+            return rewritten
+        if fallback and not any(word in fallback for word in FILTER_WORDS):
+            return fallback
+        return "查完了，不过这会儿没组织好词，你再问我一句。"
+
     def poll_subagents(self):
-        """后台任务完成后取回结论；失败也回一句，别让群里干等。"""
+        """后台任务完成后交给主模型转述再回群；失败也回一句，别让群里干等。"""
         if not self.subagent:
             return []
         rows = []
@@ -571,7 +754,11 @@ class Brain:
             if not target:
                 continue
             ok = task.get("status") == "completed" and bool(task.get("result"))
-            text = task["result"] if ok else "没弄成，等下再试"
+            text = (self._present_subagent_result(target[0], task)
+                    if ok else "没弄成，等下再试")
+            if not text:
+                ok = False
+                text = "没弄成，等下再试"
             self.store.add_message(target[0], "bot", "大肥鱼", "bot", text)
             rows.append({
                 "group": target[0],

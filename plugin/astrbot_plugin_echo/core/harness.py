@@ -7,6 +7,7 @@
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 from pathlib import Path
@@ -92,6 +93,21 @@ class CodexHarness:
             "--sandbox", SANDBOX, "--", task,
         ]
 
+    @staticmethod
+    def _clean_workdir(workdir):
+        """清理工作目录内临时生成的文件与子目录，避免跨任务残留。"""
+        root = Path(workdir)
+        if not root.exists():
+            return
+        for entry in list(root.iterdir()):
+            try:
+                if entry.is_dir() and not entry.is_symlink():
+                    shutil.rmtree(entry, ignore_errors=True)
+                else:
+                    entry.unlink(missing_ok=True)
+            except OSError:
+                pass
+
     def run(self, group_id, task):
         task = str(task or "").strip()
         if not task or not self.available():
@@ -122,10 +138,17 @@ class CodexHarness:
             # Codex 还会起 bwrap / shell，必须杀整个进程组，避免遗留子进程。
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
+            except (ProcessLookupError, PermissionError, OSError):
                 proc.kill()
             proc.communicate()
             return ""
+        finally:
+            # 无论正常退出还是超时，都杀掉残余进程组并清空工作区，不留监听服务或临时文件。
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+            self._clean_workdir(workdir)
         return parse_events(stdout, MAX_OUTPUT)
 
 

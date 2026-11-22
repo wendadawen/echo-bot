@@ -27,6 +27,8 @@ def split(text, max_parts=3):
     text = (text or "").strip()
     if not text:
         return []
+    if max_parts <= 1:
+        return [text]
     rough = [p.strip() for p in re.split(r"(?<=[。！？!?~…])|\n+", text) if p.strip()]
     if not rough:
         rough = [text]
@@ -43,7 +45,9 @@ def split(text, max_parts=3):
             merged[-1] += part
         else:
             merged.append(part)
-    return merged[:max_parts]
+    if len(merged) > max_parts:
+        merged = merged[:max_parts - 1] + ["".join(merged[max_parts - 1:])]
+    return merged
 
 
 def delay(part, chars_per_second=12.0, cap=1.4, elapsed=0.0):
@@ -152,11 +156,5 @@ def apply_jargon(text, jargon):
 
 
 def decorate(text, style=None, store=None, situation=""):
-    """输出前的最后一跳：复用学到的表达，长度交给拆条处理。"""
-    text = (text or "").strip()
-    if not text:
-        return ""
-    learned = pick_expression(situation, store)
-    if learned and random.random() < 0.15:
-        text = learned
-    return text
+    """输出前的最后一跳：整理空白，不再把生成好的回复随机替换成历史旧话。"""
+    return (text or "").strip()

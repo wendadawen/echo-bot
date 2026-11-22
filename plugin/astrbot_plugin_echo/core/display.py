@@ -24,8 +24,18 @@ LATEX_PATTERNS = (
 LINK_PATTERN = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 
 
+def _replace_link(match):
+    label = match.group(1).strip()
+    target = match.group(2).strip()
+    if target.startswith(("http://", "https://")):
+        if not label or label == target:
+            return target
+        return "{} ({})".format(label, target)
+    return label
+
+
 def clean(part):
-    """去掉 QQ 不认识的 markdown / latex 标记；代码块内容原样保留。"""
+    """去掉 QQ 不认识的 markdown / latex 标记；代码块内容与公网链接原样保留。"""
     text = str(part or "").strip()
     blocks = []
 
@@ -36,7 +46,7 @@ def clean(part):
     text = CODE_BLOCK.sub(hold, text)
     for pattern in LATEX_PATTERNS:
         text = pattern.sub(r"\1", text)
-    text = LINK_PATTERN.sub(r"\1", text)
+    text = LINK_PATTERN.sub(_replace_link, text)
     text = MARK_PATTERN.sub("", text)
     text = LIST_PATTERN.sub("", text)
     text = text.replace("**", "").replace("`", "")

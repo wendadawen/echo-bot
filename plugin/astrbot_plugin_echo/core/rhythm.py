@@ -48,6 +48,7 @@ class Item:
     ts: float
     kind: str = "text"  # text / image / face / notice
     group_id: str = ""
+    quote: str = ""
 
 
 @dataclass
@@ -88,6 +89,13 @@ class Batch:
     @property
     def has_image(self):
         return any(i.kind == "image" for i in self.items)
+
+    @property
+    def quote(self):
+        for item in reversed(self.items):
+            if getattr(item, "quote", ""):
+                return item.quote
+        return ""
 
 
 class Rhythm:

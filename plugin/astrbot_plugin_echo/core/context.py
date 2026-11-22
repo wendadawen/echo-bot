@@ -155,14 +155,6 @@ class ContextBuilder:
             text = self._section(name, group_id, query, user_name, batch, history)
             if text:
                 sections.append(text)
-        # 最近对话单独作为一段，保持原始顺序但不与其它层混在一起。
-        if history:
-            lines = []
-            for item in history[-6:]:
-                role = "大肥鱼" if item.get("role") == "bot" else item.get("user_name", "群友")
-                lines.append("{}：{}".format(role, str(item.get("text", ""))[:80]))
-            if lines:
-                sections.append("最近几句：\n" + "\n".join(lines))
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
         sections.append("现在是 {}（本地时间）".format(now))
         return "\n\n".join(sections)

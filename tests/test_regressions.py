@@ -221,6 +221,401 @@ class TestIncidentRegressions(unittest.TestCase):
     def test_empty_batch_is_silent(self):
         self.assertEqual("empty", make_brain().handle_batch(make_batch(""))["reason"])
 
+    @staticmethod
+    def _wait_subagent(brain):
+        for _ in range(50):
+            rows = brain.poll_subagents()
+            if rows:
+                return rows
+            time.sleep(0.05)
+        return []
+
+    def test_task_prefix_is_pure_backend_worker(self):
+        from astrbot_plugin_echo.core.brain import TASK_PREFIX
+        self.assertNotIn("大肥鱼", TASK_PREFIX)
+        self.assertNotIn("肥鱼", TASK_PREFIX)
+        self.assertNotIn("群聊口吻", TASK_PREFIX)
+        self.assertIn("后台", TASK_PREFIX)
+        self.assertIn("不要扮演角色", TASK_PREFIX)
+        self.assertIn("不要替主程序起草群聊话术", TASK_PREFIX)
+
+    def test_action_prompt_forbids_subagent_drafting_reply(self):
+        self.assertIn("代写", ACTION_PROMPT)
+
+    def test_poll_subagents_rewrites_raw_report_via_main_model(self):
+        from astrbot_plugin_echo.core.brain import PERSONA, SUBAGENT_REPLY_PROMPT
+
+        calls = []
+
+        class RewriteModel:
+            def reply(self, system, history, user_text):
+                calls.append((system, history, user_text))
+                return "肥鱼推到函数方程对称那步就卡住了，临界带外的零点排不掉，这猜想目前确实还没公认证明。"
+
+        store = Store(":memory:")
+        brain = Brain(store, RewriteModel())
+        brain.subagent = SubAgentManager()
+        raw_report = (
+            "函数方程 ξ(s)=ξ(1−s) 只能说明零点成对。\n\n"
+            "刚才查资料时 DuckDuckGo 返回了人机验证页，没拿到搜索结果。\n\n"
+            "群里可以这么回：\n\n"
+            "“肥鱼试了函数方程这条路：目前没有公认证明。”"
+        )
+        task_id = brain.subagent.submit("chat", "尝试证明黎曼猜想", lambda _: raw_report)
+        brain._task_targets[task_id] = ("g1", "demo:group-1")
+        rows = self._wait_subagent(brain)
+
+        self.assertEqual(1, len(rows))
+        self.assertTrue(rows[0]["ok"])
+        self.assertNotIn("群里可以这么回", rows[0]["text"])
+        self.assertNotIn("DuckDuckGo", rows[0]["text"])
+        self.assertIn("函数方程", rows[0]["text"])
+        self.assertEqual(1, len(calls))
+        self.assertIn(PERSONA[:20], calls[0][0])
+        self.assertIn(SUBAGENT_REPLY_PROMPT, calls[0][0])
+        self.assertIn("尝试证明黎曼猜想", calls[0][2])
+        self.assertIn(raw_report, calls[0][2])
+        self.assertEqual(rows[0]["text"], store.recent("g1", 1)[-1]["text"])
+
+    def test_poll_subagents_preserves_code_blocks_verbatim(self):
+        class IntroModel:
+            def reply(self, system, history, user_text):
+                self.last_user = user_text
+                return "算好了，前面这段拿去用。"
+
+        # 1) 完整闭合的 python 代码块
+        model1 = IntroModel()
+        brain1 = Brain(Store(":memory:"), model1)
+        brain1.subagent = SubAgentManager()
+        tid1 = brain1.subagent.submit(
+            "chat", "写个求和",
+            lambda _: "后台已跑通：\n\n```python\ns = sum(range(10))\nprint(s)\n```",
+        )
+        brain1._task_targets[tid1] = ("g1", "demo:group-1")
+        rows1 = self._wait_subagent(brain1)
+        self.assertEqual(1, len(rows1))
+        self.assertIn("算好了，前面这段拿去用。", rows1[0]["text"])
+        self.assertIn("s = sum(range(10))\nprint(s)", rows1[0]["text"])
+        self.assertNotIn("```", rows1[0]["text"])
+        self.assertNotIn("sum(range(10))", model1.last_user)
+
+        # 2) 被 800 字截断的未闭合 text 代码块
+        model2 = IntroModel()
+        brain2 = Brain(Store(":memory:"), model2)
+        brain2.subagent = SubAgentManager()
+        digits = "3.14159265358979323846"
+        tid2 = brain2.subagent.submit(
+            "chat", "输出圆周率",
+            lambda _: f"已用高精度算法校验。\n\n```text\n{digits}",
+        )
+        brain2._task_targets[tid2] = ("g1", "demo:group-1")
+        rows2 = self._wait_subagent(brain2)
+        self.assertEqual(1, len(rows2))
+        self.assertIn("算好了，前面这段拿去用。", rows2[0]["text"])
+        self.assertIn(digits, rows2[0]["text"])
+        self.assertNotIn("```", rows2[0]["text"])
+        self.assertNotIn("text\n", rows2[0]["text"])
+        self.assertNotIn(digits, model2.last_user)
+
+    def test_poll_subagents_fallback_strips_meta_leak_when_model_fails(self):
+        class BrokenModel:
+            def reply(self, system, history, user_text):
+                raise RuntimeError("upstream down")
+
+        brain = Brain(Store(":memory:"), BrokenModel())
+        brain.subagent = SubAgentManager()
+        raw_report = (
+            "函数方程只能说明零点对称。\n\n"
+            "群里可以这么回：\n\n"
+            "“试了函数方程这条路，目前没有公认证明。”"
+        )
+        tid = brain.subagent.submit("chat", "尝试证明黎曼猜想", lambda _: raw_report)
+        brain._task_targets[tid] = ("g1", "demo:group-1")
+        rows = self._wait_subagent(brain)
+
+        self.assertEqual(1, len(rows))
+        self.assertTrue(rows[0]["ok"])
+        self.assertEqual("试了函数方程这条路，目前没有公认证明。", rows[0]["text"])
+
+    def test_poll_subagents_filters_service_tone_from_rewrite(self):
+        class ServiceToneModel:
+            def reply(self, system, history, user_text):
+                return "作为 AI，我已经为您查询到相关信息，希望能帮到您。"
+
+        brain = Brain(Store(":memory:"), ServiceToneModel())
+        brain.subagent = SubAgentManager()
+        tid = brain.subagent.submit("chat", "查天气", lambda _: "苏州今天多云，14到21度。")
+        brain._task_targets[tid] = ("g1", "demo:group-1")
+        rows = self._wait_subagent(brain)
+
+        self.assertEqual(1, len(rows))
+        self.assertTrue(rows[0]["ok"])
+        self.assertNotIn("作为 AI", rows[0]["text"])
+        self.assertNotIn("希望能帮到", rows[0]["text"])
+        self.assertEqual("苏州今天多云，14到21度。", rows[0]["text"])
+
+    def test_poll_subagents_truncates_codex_input_to_main_model(self):
+        from astrbot_plugin_echo.core.brain import (
+            SUBAGENT_HISTORY_ITEM_LIMIT,
+            SUBAGENT_MODEL_INPUT_LIMIT,
+            SUBAGENT_PROMPT_LIMIT,
+        )
+
+        calls = []
+
+        class RecordingModel:
+            def reply(self, system, history, user_text):
+                calls.append((system, history, user_text))
+                return "肥鱼压缩转述好了。"
+
+        store = Store(":memory:")
+        store.add_message("g1", "1001", "阿伟", "user", "H" * 1000)
+        store.add_message("g1", "bot", "大肥鱼", "bot", "B" * 1000)
+        brain = Brain(store, RecordingModel())
+        brain.subagent = SubAgentManager()
+
+        long_prompt = "P" * 500 + "PROMPT_TAIL"
+        report_800 = "R" * 780 + "TAIL_MARKER"
+        tid = brain.subagent.submit("chat", long_prompt, lambda _: report_800)
+        brain._task_targets[tid] = ("g1", "demo:group-1")
+        rows = self._wait_subagent(brain)
+
+        self.assertEqual(1, len(rows))
+        self.assertEqual("肥鱼压缩转述好了。", rows[0]["text"])
+        self.assertEqual(1, len(calls))
+        _, hist1, user1 = calls[0]
+        self.assertNotIn("TAIL_MARKER", user1)
+        self.assertNotIn("PROMPT_TAIL", user1)
+        self.assertLessEqual(
+            len(user1), SUBAGENT_PROMPT_LIMIT + SUBAGENT_MODEL_INPUT_LIMIT + 100
+        )
+        for item in hist1:
+            self.assertLessEqual(len(item["text"]), SUBAGENT_HISTORY_ITEM_LIMIT + 1)
+
+        # 直接传入超长 3000 字结果，确保即使绕过 SubAgentManager 也不会撑爆主模型上下文。
+        calls.clear()
+        huge_3000 = "X" * 2980 + "TAIL_MARKER"
+        out2 = brain._present_subagent_result(
+            "g1", {"prompt": long_prompt, "result": huge_3000}
+        )
+        self.assertEqual("肥鱼压缩转述好了。", out2)
+        self.assertEqual(1, len(calls))
+        _, hist2, user2 = calls[0]
+        self.assertNotIn("TAIL_MARKER", user2)
+        self.assertNotIn("PROMPT_TAIL", user2)
+        self.assertLessEqual(
+            len(user2), SUBAGENT_PROMPT_LIMIT + SUBAGENT_MODEL_INPUT_LIMIT + 100
+        )
+        for item in hist2:
+            self.assertLessEqual(len(item["text"]), SUBAGENT_HISTORY_ITEM_LIMIT + 1)
+
+    def test_plan_and_split_never_drop_text(self):
+        from astrbot_plugin_echo.core import expression
+
+        full_text = (
+            "有啊，把 Claude 那份黎曼猜想 Lean 证明贴来，肥鱼可以认真核验；"
+            "不过不为了烧 token 硬编任务，浪费口粮我可要心疼的。"
+        )
+        out = display.plan(full_text)
+        self.assertEqual(1, len(out.parts))
+        self.assertEqual(full_text, out.parts[0])
+
+        parts = expression.split(
+            "第一句已经足够长了肯定超过二十四个字不会和后面合并。第二句同样超过二十四个字了保证分成第二段。第三句收尾。",
+            max_parts=2,
+        )
+        self.assertEqual(2, len(parts))
+        self.assertEqual(
+            "第一句已经足够长了肯定超过二十四个字不会和后面合并。第二句同样超过二十四个字了保证分成第二段。第三句收尾。",
+            "".join(parts),
+        )
+
+    def test_clean_preserves_http_links_and_strips_local_paths(self):
+        self.assertEqual(
+            "IMDb (https://www.imdb.com/title/tt0118966/)",
+            display.clean("[IMDb](https://www.imdb.com/title/tt0118966/)"),
+        )
+        self.assertEqual(
+            "index.html",
+            display.clean("[index.html](/AstrBot/data/index.html)"),
+        )
+
+    def test_decorate_never_replaces_with_old_expression(self):
+        from astrbot_plugin_echo.core.expression import learn_expressions
+
+        store = learn_expressions("高志朋 我不建议任何人", "旧的回复")
+        for _ in range(50):
+            self.assertEqual(
+                "全新回答",
+                decorate("全新回答", store=store, situation="高志朋 我不建议任何人"),
+            )
+
+    def test_harness_cleans_workdir_and_sanitizes_internal_leaks(self):
+        from astrbot_plugin_echo.core.brain import TASK_PREFIX, _sanitize_meta_reply
+
+        with tempfile.TemporaryDirectory() as folder:
+            workdir = Path(folder)
+            (workdir / "index.html").write_text("<html></html>", encoding="utf-8")
+            sub = workdir / "assets"
+            sub.mkdir()
+            (sub / "app.js").write_text("console.log(1)", encoding="utf-8")
+
+            CodexHarness._clean_workdir(workdir)
+            self.assertTrue(workdir.exists())
+            self.assertEqual([], list(workdir.iterdir()))
+
+        self.assertIn("禁止启动 HTTP", TASK_PREFIX)
+        self.assertIn("内网 IP", TASK_PREFIX)
+
+        leaked = (
+            "群里可以这么回：\n\n"
+            "“弄好了，打开 [控制台](http://172.19.0.2:8765/) 或 "
+            "/AstrBot/data/plugin_data/astrbot_plugin_echo/harness/index.html 看看。”"
+        )
+        cleaned = _sanitize_meta_reply(leaked)
+        self.assertNotIn("172.19.0.2", cleaned)
+        self.assertNotIn("/AstrBot/", cleaned)
+        self.assertNotIn("群里可以这么回", cleaned)
+
+    def test_batch_quote_reaches_model_system_prompt(self):
+        seen_systems = []
+
+        class RecordingModel:
+            def reply(self, system, history, user_text):
+                seen_systems.append(system)
+                return '{"action":"reply","text":"收到引用了"}'
+
+        brain = Brain(Store(":memory:"), RecordingModel())
+        now = time.time()
+        batch = Batch(
+            "g1",
+            items=[
+                Item(
+                    "这是什么回答",
+                    "1001",
+                    "阿伟",
+                    True,
+                    "demo:group-1",
+                    now,
+                    quote="大肥鱼：肥鱼认真试了...",
+                )
+            ],
+            started=now,
+            deadline=now,
+        )
+        result = brain.handle_batch(batch)
+        self.assertTrue(result["replied"])
+        self.assertTrue(seen_systems)
+        self.assertIn("被引用的是：大肥鱼：肥鱼认真试了", seen_systems[0])
+
+    def test_batch_stores_all_items_and_direct_task_records_message(self):
+        from astrbot_plugin_echo.core.modes import ModePolicy
+
+        store = Store(":memory:")
+        brain = Brain(store, MockModel())
+        now = time.time()
+        batch = Batch(
+            "g1",
+            items=[
+                Item("第一句问链接", "1001", "阿伟", False, "demo:group-1", now),
+                Item("第二句补一句", "1002", "小美", True, "demo:group-1", now + 1),
+            ],
+            started=now,
+            deadline=now + 1,
+        )
+        brain.handle_batch(batch)
+        texts = [row["text"] for row in store.recent("g1", 10)]
+        self.assertIn("第一句问链接", texts)
+        self.assertIn("第二句补一句", texts)
+
+        # 显式查询任务在入库与模式校验后才派后台：
+        # 1) 时段静默规则未 @ 时会被挡下；2) 被 @ 时既入库又派发。
+        store2 = Store(":memory:")
+        brain2 = Brain(
+            store2, MockModel(),
+            modes=ModePolicy(rules=[("g1", "00:00-00:00", "quiet")]),
+        )
+        brain2.subagent = SubAgentManager()
+
+        quiet_res = brain2.handle_batch(make_batch("查询苏州天气", mentioned=False))
+        self.assertEqual("mode_quiet", quiet_res["reason"])
+        self.assertEqual([], store2.recent("g1", 10))
+
+        direct_res = brain2.handle_batch(make_batch("查询苏州天气", mentioned=True))
+        self.assertEqual("task", direct_res["reason"])
+        self.assertEqual(["查询苏州天气"], [r["text"] for r in store2.recent("g1", 10)])
+
+    def test_context_does_not_duplicate_recent_history_block(self):
+        from astrbot_plugin_echo.core.context import ContextBuilder
+
+        builder = ContextBuilder("你是大肥鱼", None)
+        built = builder.build(
+            "g1",
+            query="你好",
+            user_name="阿伟",
+            history=[{"role": "user", "user_name": "阿伟", "text": "前文内容"}],
+        )
+        self.assertNotIn("最近几句：", built)
+
+    def test_emoji_bank_dedups_and_caches_across_reloads(self):
+        class CountingVisionModel:
+            name = "openai"
+
+            def __init__(self, reply_text="无语|一只猫翻白眼"):
+                self.calls = 0
+                self.reply_text = reply_text
+
+            def vision_reply(self, text, image_url):
+                self.calls += 1
+                return self.reply_text
+
+        with tempfile.TemporaryDirectory() as folder:
+            # 1) 同群同图重复发两次：只调 1 次视觉模型，只留 1 条记录。
+            model = CountingVisionModel("无语|一只猫翻白眼")
+            bank = vision.EmojiBank(folder)
+            img = b"same-sticker-bytes-001"
+            self.assertEqual("无语", bank.collect("g1", img, model))
+            self.assertEqual("无语", bank.collect("g1", img, model))
+            self.assertEqual(1, model.calls)
+            self.assertEqual(1, bank.stats("g1")["g1"])
+
+            # 2) 模拟重启重载：同群与跨群再收同图，0 次模型调用。
+            reloaded = vision.EmojiBank(folder)
+            model2 = CountingVisionModel("不该被调用")
+            self.assertEqual("无语", reloaded.collect("g1", img, model2))
+            self.assertEqual("无语", reloaded.collect("g2", img, model2))
+            self.assertEqual(0, model2.calls)
+            self.assertEqual(1, reloaded.stats("g1")["g1"])
+            self.assertEqual(1, reloaded.stats("g2")["g2"])
+
+            # 3) 被内容过滤拦下的图片同样缓存，第二次 0 次模型调用。
+            bad_model = CountingVisionModel("敏敏|这是一个付款码")
+            bad_img = b"bad-qr-bytes-002"
+            self.assertEqual("", reloaded.collect("g1", bad_img, bad_model))
+            self.assertEqual("", reloaded.collect("g1", bad_img, bad_model))
+            self.assertEqual(1, bad_model.calls)
+
+            # 4) 历史无 sha256 的重复 index.json 在初始化时自动去重并删除多余文件。
+            legacy_dir = Path(folder) / "legacy"
+            legacy_dir.mkdir(parents=True, exist_ok=True)
+            f1 = legacy_dir / "old1.png"
+            f2 = legacy_dir / "old2.png"
+            f1.write_bytes(b"dup-legacy-bytes")
+            f2.write_bytes(b"dup-legacy-bytes")
+            (legacy_dir / "index.json").write_text(
+                json.dumps({
+                    "g9": [
+                        {"path": str(f1), "tag": "困", "description": "困", "ts": 100.0},
+                        {"path": str(f2), "tag": "睡", "description": "睡", "ts": 200.0},
+                    ]
+                }),
+                encoding="utf-8",
+            )
+            migrated = vision.EmojiBank(legacy_dir)
+            self.assertEqual(1, migrated.stats("g9")["g9"])
+            self.assertFalse(f1.exists())
+            self.assertTrue(f2.exists())
+
 
 class TestRhythm(unittest.TestCase):
     def test_carry_into_next_batch(self):
