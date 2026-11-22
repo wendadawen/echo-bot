@@ -151,9 +151,11 @@ class Echo(Star):
         # 命令不走防抖，立刻回。
         direct = await asyncio.to_thread(self.brain.command, message, text)
         if direct is not None:
-            if direct == "行，闭嘴。":
+            # 按命令判断静默，不依赖回复文案。
+            cmd = text.lstrip("/").strip()
+            if cmd in ("闭嘴", "shutup"):
                 self.rhythm.mute(group_id, True)
-            elif direct == "行，说吧。":
+            elif cmd in ("说话", "开麦", "speak"):
                 self.rhythm.mute(group_id, False)
             event.stop_event()
             yield event.plain_result(direct)

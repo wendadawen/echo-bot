@@ -183,7 +183,7 @@ class TestTaskRouting(unittest.TestCase):
             time.sleep(0.05)
         self.assertEqual(1, len(rows))
         self.assertFalse(rows[0]["ok"])
-        self.assertIn("没办成", rows[0]["text"])
+        self.assertIn("没弄成", rows[0]["text"])
 
     def test_refusal_falls_back_to_task(self):
         class RefuseModel:

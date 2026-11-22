@@ -91,7 +91,7 @@ class TestBrain(unittest.TestCase):
 
     def test_mute_silences_until_unmute(self):
         store, brain = make_brain()
-        self.assertIn("闭嘴", brain.handle(msg("/闭嘴"))["text"])
+        self.assertIn("不说了", brain.handle(msg("/闭嘴"))["text"])
         self.assertFalse(brain.handle(msg("随便聊聊"))["replied"])
         self.assertFalse(brain.handle(msg("在吗", mentioned=False))["replied"])
         self.assertIn("说", brain.handle(msg("/说话"))["text"])
@@ -109,7 +109,7 @@ class TestBrain(unittest.TestCase):
 
         store, brain = make_brain()
         brain.modes = ModePolicy()
-        self.assertIn("只聊归并排序", brain.handle(msg("/专注 归并排序"))["text"])
+        self.assertIn("就聊归并排序", brain.handle(msg("/专注 归并排序"))["text"])
         self.assertEqual("focus", brain.modes.mode("g1"))
         self.assertTrue(brain.modes.focus_hit("g1", "归并排序怎么拆"))
         self.assertFalse(brain.modes.focus_hit("g1", "今晚吃什么"))
@@ -183,7 +183,7 @@ class TestBrain(unittest.TestCase):
         for text in ("提醒 5分钟 交周报", "/提醒 1小时 开会"):
             result = brain.handle(msg(text))
             self.assertEqual("command", result["reason"])
-            self.assertIn("后我 @ 你", result["text"])
+            self.assertIn("后叫你", result["text"])
         self.assertEqual(2, len(store.pending_reminders("g1")))
 
     def test_memory_commands_are_gone(self):
@@ -294,7 +294,7 @@ class TestBrain(unittest.TestCase):
         brain = Brain(store, ScriptedModel(output))
         result = brain.handle(msg("/提醒 明天下午三点左右提醒我取快递"))
         self.assertEqual("command", result["reason"])
-        self.assertIn("我 @ 你", result["text"])
+        self.assertIn("叫你", result["text"])
         items = store.pending_reminders("g1")
         self.assertEqual(1, len(items))
         self.assertEqual("取快递", items[0]["text"])

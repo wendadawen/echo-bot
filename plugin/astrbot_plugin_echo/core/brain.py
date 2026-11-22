@@ -467,7 +467,7 @@ class Brain:
         if not task_id:
             return {}
         self._task_targets[task_id] = (group, umo)
-        return {"replied": True, "text": "行，我去查，等我一下", "reason": "task"}
+        return {"replied": True, "text": "行，我看看，一会说", "reason": "task"}
 
     def spontaneous(self, group, umo=""):
         """群安静太久时主动开一句；失败或像客服就保持沉默。"""
@@ -497,10 +497,12 @@ class Brain:
             if not target:
                 continue
             ok = task.get("status") == "completed" and bool(task.get("result"))
+            text = task["result"] if ok else "没弄成，等下再试"
+            self.store.add_message(target[0], "bot", "大肥鱼", "bot", text)
             rows.append({
                 "group": target[0],
                 "umo": target[1],
-                "text": task["result"] if ok else "没办成，那边没给结果",
+                "text": text,
                 "task": task["id"],
                 "ok": ok,
                 "error": task.get("error") or "",
@@ -586,11 +588,11 @@ class Brain:
         if cmd in ("闭嘴", "shutup"):
             if self.modes:
                 self.modes.set(msg.group_id, "quiet")
-            return "行，闭嘴。"
+            return "行，我不说了。"
         if cmd in ("说话", "开麦", "speak"):
             if self.modes:
                 self.modes.reset(msg.group_id)
-            return "行，说吧。"
+            return "行，我回来了。"
         if cmd in ("忘掉", "清空"):
             self.store.clear_messages(msg.group_id)
             return "行，清了。"
@@ -600,7 +602,7 @@ class Brain:
                 return "专注什么？"
             if self.modes:
                 self.modes.set(msg.group_id, "focus", topic=topic)
-            return "行，只聊{}。".format(topic[:20])
+            return "行，就聊{}。".format(topic[:20])
         if cmd in ("随便", "正常", "normal"):
             if self.modes:
                 self.modes.reset(msg.group_id)
@@ -623,7 +625,7 @@ class Brain:
                 repeat = item.get("repeat") or ""
                 suffix = "（每天 {}）".format(repeat.split(":", 1)[1]) if repeat.startswith("daily:") else ""
                 lines.append("- {}：{}{}".format(item["user_name"], item["text"], suffix))
-            return "本群待办：\n" + "\n".join(lines)
+            return "还记着这几件：\n" + "\n".join(lines)
         if not cmd.startswith("提醒"):
             return None
         return self._create_reminder(msg, cmd[2:].strip())
@@ -643,7 +645,7 @@ class Brain:
                 self.schedule.add(msg.group_id, note, "interval", str(minutes),
                                   user_id=msg.user_id, user_name=msg.user_name,
                                   umo=msg.umo)
-                return "好，每{}{}我 @ 你：{}".format(amount, unit, note)
+                return "行，每{}{}叫你：{}".format(amount, unit, note)
         weekly = re.match(
             r"^每(?:周|星期)([一二三四五六日天])\s*"
             r"(\d{1,2}(?::\d{1,2}|点\d{0,2}))\s*(.+)$", body
@@ -655,7 +657,7 @@ class Brain:
                                   "{} {}".format(weekday, clock),
                                   user_id=msg.user_id, user_name=msg.user_name,
                                   umo=msg.umo)
-                return "好，每周{} {} 我 @ 你：{}".format(weekday, clock, note)
+                return "行，每周{} {} 叫你：{}".format(weekday, clock, note)
 
         # 0b. 规则：下周几（一次性，默认早上 9 点）
         next_week = re.match(r"^下(?:周|星期)([一二三四五六日天])\s*(.*)$", body)
@@ -679,7 +681,7 @@ class Brain:
                                   due_at=due.timestamp(),
                                   user_id=msg.user_id, user_name=msg.user_name,
                                   umo=msg.umo)
-                return "好，{} 我 @ 你：{}".format(
+                return "行，{} 叫你：{}".format(
                     due.strftime("%m-%d %H:%M"), note)
 
         # 1. 规则：每天固定时间
@@ -700,7 +702,7 @@ class Brain:
                 msg.group_id, msg.user_id, msg.user_name, note,
                 time.time() + amount * scale, msg.umo,
             )
-            return "好，{}{}后我 @ 你：{}".format(amount, unit, note)
+            return "行，{}{}后叫你：{}".format(amount, unit, note)
 
         # 3. 规则认不出时，交给模型翻译成固定结构，校验通过才创建
         parsed = self._model_parse(body)
@@ -714,14 +716,14 @@ class Brain:
             msg.group_id, msg.user_id, msg.user_name, parsed["text"],
             time.time() + parsed["minutes"] * 60, msg.umo,
         )
-        return "好，{}分钟后我 @ 你：{}".format(parsed["minutes"], parsed["text"])
+        return "行，{}分钟后叫你：{}".format(parsed["minutes"], parsed["text"])
 
     def _add_daily(self, msg, hour, minute, note):
         repeat = "daily:{:02d}:{:02d}".format(hour, minute)
         self.store.add_reminder(
             msg.group_id, msg.user_id, msg.user_name, note, time.time(), msg.umo, repeat,
         )
-        return "好，每天 {:02d}:{:02d} 我 @ 你：{}".format(hour, minute, note)
+        return "行，每天 {:02d}:{:02d} 叫你：{}".format(hour, minute, note)
 
     def _add_scheduled(self, msg, parsed):
         now = datetime.now()
@@ -734,7 +736,7 @@ class Brain:
             msg.group_id, msg.user_id, msg.user_name, parsed["text"],
             target.timestamp(), msg.umo,
         )
-        return "好，{} 我 @ 你：{}".format(target.strftime("%m-%d %H:%M"), parsed["text"])
+        return "行，{} 叫你：{}".format(target.strftime("%m-%d %H:%M"), parsed["text"])
 
     @staticmethod
     def _parse_daily(body):
