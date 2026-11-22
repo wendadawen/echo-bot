@@ -97,6 +97,15 @@ FILTER_WORDS = (
     "乐意为您",
 )
 
+REPEAT_WINDOW = 30
+
+
+def _repeat_key(group_id, user_id, text):
+    """归一化后作为重复判断的键：去掉标点和空白。"""
+    clean = re.sub(r"[\s，,。.！!？?～~、…]+", "", str(text or ""))
+    return (str(group_id), str(user_id), clean)
+
+
 HELP = "/帮助"
 
 FORMAT_HINT = "没懂，发 /帮助"
@@ -158,6 +167,7 @@ class Brain:
         self.subagent = subagent
         self.schedule = schedule
         self._task_targets = {}
+        self._repeat_seen = {}
         self.context_builder = ContextBuilder(
             self.persona, memory, self.style, attention=attention,
             modes=modes, persons=persons,
@@ -252,6 +262,21 @@ class Brain:
                 self.attention.consume(group)
 
         self.store.add_message(group, user_id or "unknown", user_name, "user", text)
+
+        # 同一人短时间内重复同一句话：消息照记，但只回一次，避免连发刷屏。
+        repeat_key = _repeat_key(group, user_id, text)
+        now = time.time()
+        last = self._repeat_seen.get(repeat_key, 0)
+        self._repeat_seen[repeat_key] = now
+        if last and now - last < REPEAT_WINDOW:
+            return {"replied": False, "text": "", "reason": "repeat"}
+        if len(self._repeat_seen) > 500:
+            cutoff = now - REPEAT_WINDOW
+            self._repeat_seen = {
+                key: stamp for key, stamp in self._repeat_seen.items()
+                if stamp >= cutoff
+            }
+
         history = self.store.recent(group, 12)
 
         # 上下文压缩：超预算时保留最近与点名消息，其余压成摘要。

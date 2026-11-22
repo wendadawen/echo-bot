@@ -125,6 +125,26 @@ class TestBrain(unittest.TestCase):
         brain.handle(msg("/闭嘴"))
         self.assertIn("闭嘴", brain.handle(msg("/模式"))["text"])
 
+    def test_repeated_message_in_batch_is_ignored(self):
+        from astrbot_plugin_echo.core.rhythm import Batch, Item
+
+        store, brain = make_brain()
+        now = time.time()
+
+        def run(text):
+            batch = Batch(
+                "g1",
+                items=[Item(text, "1001", "阿伟", True, "demo:group-1", now)],
+                started=now,
+                deadline=now,
+            )
+            return brain.handle_batch(batch)
+
+        self.assertTrue(run("你好呀")["replied"])
+        self.assertEqual("repeat", run("你好呀")["reason"])
+        self.assertEqual("repeat", run("你好呀～")["reason"])
+        self.assertTrue(run("在吗")["replied"])
+
     def test_reply_is_written_to_history(self):
         store, brain = make_brain()
         brain.handle(msg("你好"))
