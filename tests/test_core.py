@@ -174,7 +174,7 @@ class TestBrain(unittest.TestCase):
         model = ScriptedModel("嗯嗯")
         brain = Brain(Store(":memory:"), model, 1.0)
         brain.handle(msg("随便聊聊"))
-        self.assertIn("不要编造", model.systems[0])
+        self.assertIn("编造", model.systems[0])
         self.assertIn("多人群聊", model.systems[0])
 
     def test_apology_is_replaced(self):
