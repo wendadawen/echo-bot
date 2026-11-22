@@ -12,7 +12,7 @@ NC="$DATA/napcat"
 arch="$(dpkg --print-architecture)"
 case "$arch" in
   amd64) qq_url="${QQ_DEB_AMD64:-https://qqdl.gtimg.cn/qqfile/QQNT/9.9.37/beta/816b3c79/linuxqq_3.2.35-54395_amd64.deb}" ;;
-  arm64) qq_url="${QQ_DEB_ARM64:-https://qqdl.gtimg.cn/qqfile/QQNT/9.9.37/beta/816b3c79/linuxqq_3.2.35-54395_arm64.deb}" ;;
+  arm64) qq_url="${QQ_DEB_ARM64:-https://qqdl.gtimg.cn/qqfile/QQNT/9.9.36/beta/9ee04bef/linuxqq_3.2.34-53644_arm64.deb}" ;;
   *) echo "[bootstrap] 不支持的架构：$arch" >&2; exit 1 ;;
 esac
 napcat_url="${NAPCAT_ZIP_URL:-https://github.com/XingYunStar/NapCatQQ/releases/download/v4.18.42/NapCat.Shell.zip}"
