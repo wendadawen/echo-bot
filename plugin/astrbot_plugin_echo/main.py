@@ -20,7 +20,6 @@ from astrbot.api.star import Context, Star, StarTools
 from .core.attention import AttentionTracker
 from .core.brain import PERSONA, Brain
 from .core.display import MessageLimiter, clean
-from .core.expression import delay, split
 from .core.forward import extract as forward_extract
 from .core.forward import looks_like_forward
 from .core.forward import render as forward_render
@@ -341,7 +340,6 @@ class Echo(Star):
                         continue
                     if not result.get("replied"):
                         continue
-                    elapsed = float(result.get("elapsed") or 0.0)
                     if result.get("face"):
                         try:
                             face = Face(id=int(result["face"]))
@@ -354,19 +352,7 @@ class Echo(Star):
                     elif result.get("image"):
                         await self._send_image(group, batch.umo, result["image"])
                     else:
-                        parts = result.get("parts") or split(result.get("text", ""))
-                        delays = result.get("delays") or []
-                        parts = self.limiter.cap_parts(parts)
-                        for index, part in enumerate(parts):
-                            if not self.limiter.allow(group):
-                                break
-                            await self.context.send_message(
-                                batch.umo, MessageChain([Plain(part)])
-                            )
-                            self.limiter.record(group)
-                            wait = (delays[index] if index < len(delays)
-                                    else delay(part, elapsed=elapsed))
-                            await asyncio.sleep(wait)
+                        await self._send_reply(group, batch.umo, result)
                 # 群安静太久时，偶尔主动开一句（默认很克制）。
                 if now - self._heartbeat_at > 60:
                     self._heartbeat_at = now
@@ -408,6 +394,18 @@ class Echo(Star):
             except Exception as exc:
                 logger.error("大肥鱼对话循环异常：%s", exc)
             await asyncio.sleep(0.4)
+
+    async def _send_reply(self, group, umo, result):
+        """禁止多条拆发，每轮回复统一合并成一条完整消息发送。"""
+        if not umo:
+            return
+        raw_parts = result.get("parts") or [result.get("text", "")]
+        merged = "\n".join(str(p or "").strip() for p in raw_parts if str(p or "").strip())
+        single = clean(merged)
+        if not single or not self.limiter.allow(group):
+            return
+        await self.context.send_message(umo, MessageChain([Plain(single)]))
+        self.limiter.record(group)
 
     async def _send_image(self, group, umo, path):
         if not umo or not Path(path).exists():

@@ -956,12 +956,9 @@ class TestIncidentRegressions(unittest.TestCase):
         self.assertIn("默认选 silent", ACTION_PROMPT)
         self.assertIn("发送本地文件", ACTION_PROMPT)
 
-    def test_main_send_file_sends_component_and_always_cleans_up(self):
-        import asyncio
-        import importlib
+    @staticmethod
+    def _astrbot_stubs():
         import types
-
-        sent = []
 
         class FakePlain:
             def __init__(self, text):
@@ -1025,7 +1022,6 @@ class TestIncidentRegressions(unittest.TestCase):
         star_mod.Context = object
         star_mod.Star = FakeStar
         star_mod.StarTools = FakeStarTools
-
         stubs = {
             "astrbot": astrbot_mod,
             "astrbot.api": api_mod,
@@ -1033,6 +1029,14 @@ class TestIncidentRegressions(unittest.TestCase):
             "astrbot.api.message_components": comp_mod,
             "astrbot.api.star": star_mod,
         }
+        return stubs, FakeFile, FakePlain
+
+    def test_main_send_file_sends_component_and_always_cleans_up(self):
+        import asyncio
+        import importlib
+
+        sent = []
+        stubs, FakeFile, _ = self._astrbot_stubs()
         with tempfile.TemporaryDirectory() as folder:
             with patch.dict(sys.modules, stubs):
                 main_mod = importlib.import_module("astrbot_plugin_echo.main")
@@ -1080,6 +1084,49 @@ class TestIncidentRegressions(unittest.TestCase):
                 self.assertTrue(fail_sent and "bad.html" in fail_sent[0])
                 self.assertFalse(f2.exists())
                 sys.modules.pop("astrbot_plugin_echo.main", None)
+
+    def test_main_send_reply_never_splits_long_message(self):
+        import asyncio
+        import importlib
+        from astrbot_plugin_echo.core.display import MessageLimiter
+
+        long_ack = (
+            "这次我直接做资料检索，重点区分专家权重 offloading、"
+            "推理系统和训练系统，避免把泛 MoE 优化混进来。"
+        )
+        brain = Brain(Store(":memory:"), MockModel())
+        brain.subagent = SubAgentManager()
+        dispatched = brain._dispatch_task("g1", "帮我调研论文", "demo:umo", ack_text=long_ack)
+        self.assertEqual([long_ack], dispatched["parts"])
+
+        sent = []
+        stubs, _, FakePlain = self._astrbot_stubs()
+        with patch.dict(sys.modules, stubs):
+            main_mod = importlib.import_module("astrbot_plugin_echo.main")
+            echo = main_mod.Echo.__new__(main_mod.Echo)
+            echo.limiter = MessageLimiter(per_minute=20, per_burst=3)
+
+            class FakeCtx:
+                async def send_message(self, umo, chain):
+                    sent.append((umo, chain.chain))
+
+            echo.context = FakeCtx()
+            # 1) 不带 parts 字段的传统结果，也不允许在发送层按逗号拆条
+            asyncio.run(echo._send_reply("g1", "demo:umo", {"replied": True, "text": long_ack}))
+            self.assertEqual(1, len(sent))
+            self.assertEqual(1, len(sent[0][1]))
+            self.assertIsInstance(sent[0][1][0], FakePlain)
+            self.assertEqual(long_ack, sent[0][1][0].text)
+
+            # 2) 即使带多个 parts，也会统一合并为单条发出
+            sent.clear()
+            asyncio.run(echo._send_reply(
+                "g1", "demo:umo",
+                {"replied": True, "parts": ["第一段，较长。", "第二段。", "第三段。"]},
+            ))
+            self.assertEqual(1, len(sent))
+            self.assertEqual("第一段，较长。\n第二段。\n第三段。", sent[0][1][0].text)
+            sys.modules.pop("astrbot_plugin_echo.main", None)
 
     def test_codex_timeout_never_falls_back_to_bare_model_and_reports_partial(self):
         bare_calls = []
@@ -1165,6 +1212,7 @@ class TestIncidentRegressions(unittest.TestCase):
         res = brain.handle_batch(make_batch("你怎么没查？"))
         self.assertEqual("task", res["reason"])
         self.assertEqual("抱歉刚才漏了，我现在补查。", res["text"])
+        self.assertEqual(["抱歉刚才漏了，我现在补查。"], res["parts"])
         self.assertEqual("抱歉刚才漏了，我现在补查。", store.recent("g1", 5)[-1]["text"])
 
         rows = []

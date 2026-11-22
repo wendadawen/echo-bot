@@ -789,7 +789,7 @@ class Brain:
         self._task_targets[task_id] = (group, umo, pre_history)
         self.store.add_message(group, "bot", "大肥鱼", "bot", ack)
         self._last_reply_at[group] = time.time()
-        return {"replied": True, "text": ack, "reason": "task"}
+        return {"replied": True, "text": ack, "parts": [ack], "reason": "task"}
 
     def spontaneous(self, group, umo=""):
         """群安静太久时主动开一句；失败或像客服就保持沉默。"""
