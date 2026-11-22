@@ -118,8 +118,8 @@ class TestIncidentRegressions(unittest.TestCase):
         self.assertIn("怕答错就用 subagent", ACTION_PROMPT)
 
     def test_subagent_description_is_concrete(self):
-        from astrbot_plugin_echo.core.actions import available
-        self.assertIn("执行命令", available())
+        from astrbot_plugin_echo.core.actions import ACTION_SPECS
+        self.assertIn("执行命令", ACTION_SPECS["subagent"][0])
 
     def test_subagent_is_listed_first(self):
         from astrbot_plugin_echo.core.actions import ACTIONS
