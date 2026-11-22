@@ -62,11 +62,13 @@ class Echo(Star):
         if not sender or sender == str(event.get_self_id() or ""):
             return
         text = (event.get_message_str() or "").strip()
-        if not text:
-            return
         mentioned = self._mentioned(event, text)
-        # 含链接的消息交给链接解析插件；被 @ 时仍由本插件回应。
+        # 含链接且未被 @：交给链接解析插件处理。
         if ("http://" in text or "https://" in text) and not mentioned:
+            return
+        # 空消息（如只 @ 不发文字）到此为止，别再流进框架内置 LLM。
+        if not text:
+            event.stop_event()
             return
         message = Message(
             group_id="{}:{}".format(event.get_platform_name(), event.get_group_id() or ""),
@@ -81,6 +83,7 @@ class Echo(Star):
         if result.get("reason") == "model_error":
             logger.error("模型调用失败：%s", result.get("error"))
         if not result["replied"]:
+            event.stop_event()
             return
         event.stop_event()
         yield event.plain_result(result["text"])
