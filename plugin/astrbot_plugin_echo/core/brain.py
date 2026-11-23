@@ -180,6 +180,9 @@ UNSAFE_PATTERNS = (
     re.compile(r"(?:^|\s)(?:ls|ll|find|tree|cat|head|tail|stat|touch|mkdir|rmdir|chmod|chown|mv|cp)\s+(?:-[A-Za-z0-9]+\s+)*/", re.I),
     re.compile(r"(?<![A-Za-z0-9._:/-])/(?:etc|proc|sys|root|AstrBot)(?:/|\b)", re.I),
     re.compile(r"(?:查看|列出|打印|输出|看下|看看).{0,8}(?:环境变量|进程列表|系统进程|服务器信息|宿主|ip\s*地址)", re.I | re.S),
+    re.compile(r"(?:看|查看|看看|看下|查|列出|打印|输出|发出来|执行|跑|运行).{0,14}(?:mount|挂载|挂载点|findmnt|lsblk|磁盘分区|文件系统|当前容器|容器内|容器信息|系统信息|内核版本|uname|whoami|printenv|ps\s+(?:aux|-ef)|df\s+-)", re.I | re.S),
+    re.compile(r"(?:当前|这个|你的|运行).{0,6}(?:mount|挂载|容器|docker|宿主机|宿主|系统|linux).{0,16}(?:结果|信息|挂载|目录|文件|映射|权限|配置|进程|磁盘|发出来|看看|查看)", re.I | re.S),
+    re.compile(r"(?<![A-Za-z0-9_])(?:mount|findmnt|lsblk|whoami|printenv|uname\s+-[a-z]|df\s+-[a-z]|ps\s+(?:aux|-ef)|ip\s+(?:addr|route)|ifconfig|netstat|ss\s+-[a-z])(?![A-Za-z0-9_])", re.I),
 )
 
 
@@ -200,8 +203,8 @@ TASK_PREFIX = (
     "你是后台执行助手，只负责查证、计算或执行并把真实结果交回主程序，不直接对群友说话。"
     "不要扮演角色，不要替主程序起草群聊话术或回复建议。"
     "禁止启动 HTTP/端口监听服务或常驻后台进程，禁止读取配置或环境变量密钥，"
-    "严禁浏览、列出、读取、写入或删除任务当前目录以外的任何系统或容器路径（如 /、/tmp、/etc、/proc、/var、/home、/AstrBot 等），"
-    "禁止探测目录结构、临时文件、进程或系统信息；遇到此类要求直接拒绝。"
+    "严禁浏览、列出、读取、写入或删除任务当前目录以外的任何系统或容器路径（如 /、/tmp、/etc、/proc、/var、/home、/dev、/AstrBot 等），"
+    "禁止探测目录结构、mount/挂载点/磁盘、临时文件、进程或系统信息；遇到此类要求直接拒绝。"
     "禁止在结果中输出容器本地路径或内网 IP。"
     "本机位于国内直连网络且具备公网访问能力：部分海外搜索引擎或百科可能超时或不可达，"
     "切勿因此误判为“当前环境无法访问互联网”；联网核查优先访问国内可达来源"
@@ -253,6 +256,7 @@ _FAILED_LOOKUP_HINTS = (
     "查不到", "没查到", "搜索受限", "不敢乱推荐", "无法获取实时", "没弄成",
     "没法可靠对上", "还没核实", "没有可用的绘图", "没能生成", "没找到",
     "不能确认", "无法访问互联网", "当前无法联网", "无法联网", "权限不够", "不支持访问",
+    "mount 信息", "挂载点", "没能从官方",
 )
 _FILE_REQUEST_HINTS = (
     "文件", "报告", "网页", "html", "csv", "pdf", "文档", "表格", "脚本", "代码", "导出", "生成",
@@ -266,6 +270,7 @@ _TRANSIENT_MEMORY_NOISE = (
     "不回复", "引发不满并道歉", "重新发送", "偶尔卡顿",
     "没法可靠对上", "还没核实", "没有可用的绘图", "没能生成",
     "无法访问互联网", "当前无法联网", "临时文件", "根目录", "gx.txt", "权限不够",
+    "mount 信息", "挂载点", "没能从官方",
 )
 _NO_DIRECT_SEARCH_HINTS = (
     "搜索优先级", "一味搜索", "别搜", "不要搜", "自己去搜", "为什么搜", "怎么老搜", "怎么一直搜",
@@ -381,10 +386,10 @@ def _strip_outer_quotes(text):
 
 
 _INTERNAL_PATH_PATTERN = re.compile(
-    r"(?<![A-Za-z0-9._:/-])/(?:AstrBot|etc|opt|tmp|var|root|home|proc|sys)/[^\s)\]）】>\"'`]+"
+    r"(?<![A-Za-z0-9._:/-])/(?:AstrBot|etc|opt|tmp|var|root|home|proc|sys|dev)/[^\s)\]）】>\"'`]+"
 )
 _BARE_SYS_PATH_PATTERN = re.compile(
-    r"(?<![A-Za-z0-9._:/-])/(?:AstrBot|etc|opt|tmp|var|root|proc|sys)(?=$|[\s，,。.、)\]）】>\"'`])"
+    r"(?<![A-Za-z0-9._:/-])/(?:AstrBot|etc|opt|tmp|var|root|proc|sys|dev)(?=$|[\s，,。.、)\]）】>\"'`])"
 )
 _PRIVATE_URL_PATTERN = re.compile(
     r"(?:https?://localhost(?::\d+)?|(?<![A-Za-z0-9_-])localhost:\d+|"
