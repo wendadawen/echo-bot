@@ -29,11 +29,47 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: 检查国内镜像加速仓配置
+        id: mirror
+        env:
+          MIRROR_IMAGE: ${{ vars.MIRROR_IMAGE }}
+          MIRROR_REGISTRY: ${{ vars.MIRROR_REGISTRY }}
+          MIRROR_USERNAME: ${{ secrets.MIRROR_USERNAME }}
+          MIRROR_PASSWORD: ${{ secrets.MIRROR_PASSWORD }}
+        run: |
+          mirror_image="$(printf '%s' "${MIRROR_IMAGE:-}" | tr -d '[:space:]')"
+          mirror_registry="$(printf '%s' "${MIRROR_REGISTRY:-}" | tr -d '[:space:]')"
+          if [ -n "$mirror_image" ] && [ -n "${MIRROR_USERNAME:-}" ] && [ -n "${MIRROR_PASSWORD:-}" ]; then
+            if [ -z "$mirror_registry" ]; then
+              mirror_registry="${mirror_image%%/*}"
+            fi
+            {
+              echo "enabled=true"
+              echo "registry=${mirror_registry}"
+              echo "images<<EOF"
+              echo "ghcr.io/${GITHUB_REPOSITORY}"
+              echo "${mirror_image}"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo "enabled=false"
+              echo "registry="
+              echo "images=ghcr.io/${GITHUB_REPOSITORY}"
+            } >> "$GITHUB_OUTPUT"
+          fi
+      - name: 登录镜像加速仓（可选）
+        if: steps.mirror.outputs.enabled == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ steps.mirror.outputs.registry }}
+          username: ${{ secrets.MIRROR_USERNAME }}
+          password: ${{ secrets.MIRROR_PASSWORD }}
       - name: 生成镜像标签
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ${{ steps.mirror.outputs.images }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=tag

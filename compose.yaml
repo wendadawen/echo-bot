@@ -1,7 +1,7 @@
 # 一个容器跑整套，所有持久化数据放在 Docker 命名卷（不挂载宿主机目录）。
 services:
   astrbot:
-    image: ${BOT_IMAGE:-ghcr.io/wendadawen/echo-bot:latest}
+    image: ${BOT_IMAGE:-${IMAGE_REGISTRY:-ghcr.io}/wendadawen/echo-bot:latest}
     container_name: ${CONTAINER_NAME:-echo-bot}
     restart: unless-stopped
     mem_limit: ${MEM_LIMIT:-4g}
@@ -18,14 +18,23 @@ services:
       BOT_TASK_TIMEOUT: ${BOT_TASK_TIMEOUT:-}
       QQ_DEB_AMD64: ${QQ_DEB_AMD64:-}
       QQ_DEB_ARM64: ${QQ_DEB_ARM64:-}
+      QQ_DEB_SHA256: ${QQ_DEB_SHA256:-}
       NAPCAT_ZIP_URL: ${NAPCAT_ZIP_URL:-}
+      NAPCAT_ZIP_SHA256: ${NAPCAT_ZIP_SHA256:-}
+      LINK_RESOLVER_REF: ${LINK_RESOLVER_REF:-}
+      LINK_RESOLVER_URL: ${LINK_RESOLVER_URL:-}
+      LINK_RESOLVER_SHA256: ${LINK_RESOLVER_SHA256:-}
+      GITHUB_PROXY: ${GITHUB_PROXY:-}
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      NO_PROXY: ${NO_PROXY:-127.0.0.1,localhost}
     ports:
       - "${BIND_HOST:-127.0.0.1}:${PANEL_PORT:-6185}:6185" # AstrBot 面板
       - "${BIND_HOST:-127.0.0.1}:${NAPCAT_PORT:-6099}:6099" # 扫码登录页
     volumes:
       - echo_bot_data:/AstrBot/data
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:6185/', timeout=3)"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.build_opener(urllib.request.ProxyHandler({})).open('http://127.0.0.1:6185/', timeout=3)"]
       interval: 15s
       timeout: 5s
       retries: 20

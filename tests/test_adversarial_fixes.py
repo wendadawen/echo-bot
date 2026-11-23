@@ -1,17 +1,21 @@
 """对抗性审查修复回归集：安全边界、并发重放、重载持久化、去挂载与命令精简。全部离线。"""
 
 import asyncio
+import hashlib
 import importlib
 import io
 import json
 import os
 import shutil
+import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
 import types
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -710,6 +714,261 @@ class TestGroupMemoryAndHeartbeat(unittest.TestCase):
         self.assertEqual([], store.recent("g1", 10))
         brain.record_spontaneous("g1", line)
         self.assertEqual(line, store.recent("g1", 10)[-1]["text"])
+
+
+class TestMirrorAccelerationAndProxySafety(unittest.TestCase):
+    @staticmethod
+    def _bootstrap_helpers():
+        text = (ROOT / "docker" / "bootstrap.sh").read_text(encoding="utf-8")
+        head, sep, _ = text.partition("# --- bootstrap main ---")
+        assert sep, "missing '# --- bootstrap main ---' marker in docker/bootstrap.sh"
+        return head
+
+    @staticmethod
+    def _entrypoint_proxy_block():
+        text = (ROOT / "docker" / "entrypoint.sh").read_text(encoding="utf-8")
+        head, sep, _ = text.partition("/usr/local/bin/bootstrap.sh")
+        assert sep, "missing bootstrap call in docker/entrypoint.sh"
+        return head
+
+    def test_compose_mirror_env_and_proxy_healthcheck_isolation(self):
+        compose_text = (ROOT / "compose.yaml").read_text(encoding="utf-8")
+        self.assertIn("${BOT_IMAGE:-${IMAGE_REGISTRY:-ghcr.io}/wendadawen/echo-bot:latest}", compose_text)
+        for key in (
+            "GITHUB_PROXY:",
+            "HTTP_PROXY:",
+            "HTTPS_PROXY:",
+            "NO_PROXY:",
+            "NAPCAT_ZIP_SHA256:",
+            "LINK_RESOLVER_URL:",
+            "LINK_RESOLVER_SHA256:",
+            "QQ_DEB_SHA256:",
+        ):
+            self.assertIn(key, compose_text)
+        self.assertIn("ProxyHandler({})", compose_text)
+        self.assertNotIn("./data", compose_text)
+        self.assertIn("echo_bot_data:/AstrBot/data", compose_text)
+
+        if shutil.which("docker"):
+            base_env = {k: v for k, v in os.environ.items() if k not in ("BOT_IMAGE", "IMAGE_REGISTRY")}
+            res_default = subprocess.run(
+                ["docker", "compose", "config"],
+                cwd=str(ROOT),
+                env=base_env,
+                capture_output=True,
+                text=True,
+            )
+            if res_default.returncode == 0:
+                self.assertIn("image: ghcr.io/wendadawen/echo-bot:latest", res_default.stdout)
+                env_mirror = dict(base_env, IMAGE_REGISTRY="ghcr.nju.edu.cn")
+                res_mirror = subprocess.run(
+                    ["docker", "compose", "config"],
+                    cwd=str(ROOT),
+                    env=env_mirror,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                self.assertIn("image: ghcr.nju.edu.cn/wendadawen/echo-bot:latest", res_mirror.stdout)
+                env_custom = dict(base_env, BOT_IMAGE="crpi-test.cn-hangzhou.aliyuncs.com/ns/echo-bot:v1")
+                res_custom = subprocess.run(
+                    ["docker", "compose", "config"],
+                    cwd=str(ROOT),
+                    env=env_custom,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                self.assertIn("image: crpi-test.cn-hangzhou.aliyuncs.com/ns/echo-bot:v1", res_custom.stdout)
+
+    def test_bootstrap_github_proxy_validation_sha256_fallback_and_tar_guards(self):
+        helpers = self._bootstrap_helpers()
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            fake_curl = bin_dir / "curl"
+            fake_curl.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, shutil, sys\n"
+                "args = sys.argv[1:]\n"
+                "out = None\n"
+                "url = None\n"
+                "i = 0\n"
+                "while i < len(args):\n"
+                "    if args[i] == '-o' and i + 1 < len(args):\n"
+                "        out = args[i + 1]\n"
+                "        i += 2\n"
+                "    elif args[i] == '--' and i + 1 < len(args):\n"
+                "        url = args[i + 1]\n"
+                "        break\n"
+                "    else:\n"
+                "        url = args[i]\n"
+                "        i += 1\n"
+                "with open(os.environ['FAKE_CURL_LOG'], 'a', encoding='utf-8') as logf:\n"
+                "    logf.write(f'{url}\\n')\n"
+                "mapping = json.loads(open(os.environ['FAKE_CURL_MAP'], encoding='utf-8').read())\n"
+                "entry = mapping.get(url)\n"
+                "if not entry or 'error' in entry:\n"
+                "    sys.exit(entry.get('error', 22) if entry else 22)\n"
+                "shutil.copyfile(entry['src'], out)\n",
+                encoding="utf-8",
+            )
+            fake_curl.chmod(0o755)
+
+            good_zip = root / "good.zip"
+            with zipfile.ZipFile(good_zip, "w") as zf:
+                zf.writestr("napcat.mjs", "console.log('ok');")
+            good_zip_sha = hashlib.sha256(good_zip.read_bytes()).hexdigest()
+
+            bad_html = root / "tampered.html"
+            bad_html.write_text("<html>mirror blocked</html>", encoding="utf-8")
+
+            good_tar = root / "good_plugin.tar.gz"
+            with tarfile.open(good_tar, "w:gz") as tf:
+                info = tarfile.TarInfo("astrbot_plugin_link_resolver-ref/metadata.yaml")
+                data = b"name: link_resolver\n"
+                info.size = len(data)
+                tf.addfile(info, io.BytesIO(data))
+
+            traversal_tar = root / "traversal.tar.gz"
+            with tarfile.open(traversal_tar, "w:gz") as tf:
+                info = tarfile.TarInfo("../evil.txt")
+                data = b"pwn"
+                info.size = len(data)
+                tf.addfile(info, io.BytesIO(data))
+
+            no_meta_tar = root / "no_meta.tar.gz"
+            with tarfile.open(no_meta_tar, "w:gz") as tf:
+                info = tarfile.TarInfo("repo-ref/README.md")
+                data = b"hi"
+                info.size = len(data)
+                tf.addfile(info, io.BytesIO(data))
+
+            qq_deb = root / "qq.deb"
+            qq_deb.write_bytes(b"!<arch>\nfake-deb-payload")
+
+            gh_zip_url = "https://github.com/org/repo/releases/download/v1/NapCat.Shell.zip"
+            mirror_zip_url = f"https://mirror.example/{gh_zip_url}"
+            gh_tar_url = "https://github.com/org/plugin/archive/ref.tar.gz"
+            qq_url = "https://qqdl.gtimg.cn/qqfile/QQNT/qq.deb"
+
+            curl_map = root / "map.json"
+            curl_log = root / "curl.log"
+
+            def run_bash(script, extra_env=None):
+                env = dict(os.environ)
+                env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
+                env["FAKE_CURL_MAP"] = str(curl_map)
+                env["FAKE_CURL_LOG"] = str(curl_log)
+                if extra_env:
+                    env.update(extra_env)
+                return subprocess.run(["bash", "-c", helpers + "\n" + script], env=env, capture_output=True, text=True)
+
+            # 1) Valid HTTPS mirror hits mirror first and verifies SHA256 + zip
+            curl_log.write_text("", encoding="utf-8")
+            curl_map.write_text(json.dumps({mirror_zip_url: {"src": str(good_zip)}}), encoding="utf-8")
+            dest1 = root / "out1.zip"
+            res1 = run_bash(
+                f'download_file "{gh_zip_url}" "{dest1}" "{good_zip_sha}" "zip"',
+                {"GITHUB_PROXY": "https://mirror.example/"},
+            )
+            self.assertEqual(0, res1.returncode, res1.stderr)
+            self.assertEqual([mirror_zip_url], curl_log.read_text(encoding="utf-8").splitlines())
+
+            # 2) Tampered mirror payload fails SHA256 and falls back to direct GitHub
+            curl_log.write_text("", encoding="utf-8")
+            curl_map.write_text(
+                json.dumps({mirror_zip_url: {"src": str(bad_html)}, gh_zip_url: {"src": str(good_zip)}}),
+                encoding="utf-8",
+            )
+            dest2 = root / "out2.zip"
+            res2 = run_bash(
+                f'download_file "{gh_zip_url}" "{dest2}" "{good_zip_sha}" "zip"',
+                {"GITHUB_PROXY": "https://mirror.example"},
+            )
+            self.assertEqual(0, res2.returncode, res2.stderr)
+            self.assertEqual([mirror_zip_url, gh_zip_url], curl_log.read_text(encoding="utf-8").splitlines())
+            self.assertEqual(good_zip.read_bytes(), dest2.read_bytes())
+
+            # 3) Non-HTTPS GITHUB_PROXY is ignored and hits GitHub directly
+            curl_log.write_text("", encoding="utf-8")
+            curl_map.write_text(json.dumps({gh_zip_url: {"src": str(good_zip)}}), encoding="utf-8")
+            dest3 = root / "out3.zip"
+            res3 = run_bash(
+                f'download_file "{gh_zip_url}" "{dest3}" "{good_zip_sha}" "zip"',
+                {"GITHUB_PROXY": "http://evil.example"},
+            )
+            self.assertEqual(0, res3.returncode, res3.stderr)
+            self.assertEqual([gh_zip_url], curl_log.read_text(encoding="utf-8").splitlines())
+
+            # 4) Non-GitHub URL (qqdl.gtimg.cn) is NOT prefixed with GITHUB_PROXY
+            curl_log.write_text("", encoding="utf-8")
+            curl_map.write_text(json.dumps({qq_url: {"src": str(qq_deb)}}), encoding="utf-8")
+            dest4 = root / "qq_out.deb"
+            res4 = run_bash(
+                f'download_file "{qq_url}" "{dest4}" "" "deb"',
+                {"GITHUB_PROXY": "https://mirror.example"},
+            )
+            self.assertEqual(0, res4.returncode, res4.stderr)
+            self.assertEqual([qq_url], curl_log.read_text(encoding="utf-8").splitlines())
+
+            # 5) tar_plugin validation: rejects ../ traversal and missing metadata.yaml, accepts valid tarball
+            curl_map.write_text(json.dumps({gh_tar_url: {"src": str(traversal_tar)}}), encoding="utf-8")
+            res5a = run_bash(f'download_file "{gh_tar_url}" "{root / "t1.tgz"}" "" "tar_plugin"')
+            self.assertNotEqual(0, res5a.returncode)
+
+            curl_map.write_text(json.dumps({gh_tar_url: {"src": str(no_meta_tar)}}), encoding="utf-8")
+            res5b = run_bash(f'download_file "{gh_tar_url}" "{root / "t2.tgz"}" "" "tar_plugin"')
+            self.assertNotEqual(0, res5b.returncode)
+
+            curl_map.write_text(json.dumps({gh_tar_url: {"src": str(good_tar)}}), encoding="utf-8")
+            res5c = run_bash(f'download_file "{gh_tar_url}" "{root / "t3.tgz"}" "" "tar_plugin"')
+            self.assertEqual(0, res5c.returncode, res5c.stderr)
+
+    def test_entrypoint_proxy_normalization_and_container_isolation(self):
+        proxy_block = self._entrypoint_proxy_block()
+        inspect_cmd = (
+            "\npython3 -c 'import json, os; print(json.dumps({k: os.environ.get(k) "
+            "for k in [\"HTTP_PROXY\", \"HTTPS_PROXY\", \"NO_PROXY\", \"http_proxy\", \"https_proxy\", \"no_proxy\"]}))'"
+        )
+        base_env = {
+            k: v
+            for k, v in os.environ.items()
+            if k not in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy")
+        }
+
+        # Empty proxy vars get unset cleanly
+        env_empty = dict(base_env, HTTP_PROXY="", HTTPS_PROXY="", NO_PROXY="127.0.0.1,localhost")
+        res_empty = subprocess.run(["bash", "-c", proxy_block + inspect_cmd], env=env_empty, capture_output=True, text=True, check=True)
+        parsed_empty = json.loads(res_empty.stdout)
+        self.assertTrue(all(v is None for v in parsed_empty.values()), parsed_empty)
+
+        # Setting HTTPS_PROXY exports upper/lower and preserves loopback entries in NO_PROXY
+        env_proxy = dict(base_env, HTTPS_PROXY="http://10.0.0.2:7890", NO_PROXY="10.0.0.0/8")
+        res_proxy = subprocess.run(["bash", "-c", proxy_block + inspect_cmd], env=env_proxy, capture_output=True, text=True, check=True)
+        parsed_proxy = json.loads(res_proxy.stdout)
+        self.assertIsNone(parsed_proxy["HTTP_PROXY"])
+        self.assertIsNone(parsed_proxy["http_proxy"])
+        self.assertEqual("http://10.0.0.2:7890", parsed_proxy["HTTPS_PROXY"])
+        self.assertEqual("http://10.0.0.2:7890", parsed_proxy["https_proxy"])
+        self.assertEqual(parsed_proxy["NO_PROXY"], parsed_proxy["no_proxy"])
+        for host in ("10.0.0.0/8", "127.0.0.1", "localhost", "::1"):
+            self.assertIn(host, parsed_proxy["NO_PROXY"].split(","))
+
+        # QQ must bypass container proxy settings; Dockerfile/CI/env template expose mirror hooks
+        sup_text = (ROOT / "docker" / "supervisord.conf").read_text(encoding="utf-8")
+        self.assertIn("env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy", sup_text)
+
+        dockerfile_text = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+        for needle in ("ARG BASE_IMAGE=", "ARG GITHUB_PROXY=", "ARG PIP_INDEX_URL="):
+            self.assertIn(needle, dockerfile_text)
+
+        workflow_text = (ROOT / ".github" / "workflows" / "image.yml").read_text(encoding="utf-8")
+        for needle in ("MIRROR_IMAGE", "MIRROR_USERNAME", "MIRROR_PASSWORD"):
+            self.assertIn(needle, workflow_text)
+
+        self.assertTrue((ROOT / ".env.example").is_file())
 
 
 if __name__ == "__main__":

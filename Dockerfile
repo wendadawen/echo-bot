@@ -1,6 +1,7 @@
 # 全合一镜像：AstrBot + 回声插件 + 首次启动时补齐 QQ/NapCat 与链接解析插件
 # 官方基础镜像自带 Python 3.12 与 AstrBot 全部依赖，并提供 amd64 / arm64
-FROM soulter/astrbot:v4.29.4
+ARG BASE_IMAGE=soulter/astrbot:v4.29.4
+FROM ${BASE_IMAGE}
 
 ENV DEBIAN_FRONTEND=noninteractive \
     TZ=Asia/Shanghai \
@@ -17,6 +18,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ARG CODEX_VERSION=0.171.0
 ARG CODEX_SHA_ARM64=d8c43bee6cf11b01eb18b95f4d7961092bc40228180808859e70dabb7784c1c9
 ARG CODEX_SHA_AMD64=8391d67757496bfd14893eca6cbf0c96994bf2627566ff1f018f70600c9ef6b3
+ARG GITHUB_PROXY=""
+ARG PIP_INDEX_URL=""
 RUN set -eux; \
     arch="$(dpkg --print-architecture)"; \
     case "$arch" in \
@@ -24,9 +27,21 @@ RUN set -eux; \
       amd64) pkg="codex-package-x86_64-unknown-linux-musl.tar.gz"; sha="$CODEX_SHA_AMD64" ;; \
       *) echo "unsupported architecture: $arch"; exit 1 ;; \
     esac; \
-    curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 300 -o /tmp/codex.tgz \
-      "https://github.com/openai/codex/releases/download/rust-v${CODEX_VERSION}/${pkg}"; \
-    echo "$sha  /tmp/codex.tgz" | sha256sum -c -; \
+    codex_url="https://github.com/openai/codex/releases/download/rust-v${CODEX_VERSION}/${pkg}"; \
+    downloaded=0; \
+    if printf '%s' "$GITHUB_PROXY" | grep -Eq '^https://[^[:space:]]+$'; then \
+      proxy_url="${GITHUB_PROXY%/}/${codex_url}"; \
+      if curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 300 -o /tmp/codex.tgz -- "$proxy_url" \
+         && echo "$sha  /tmp/codex.tgz" | sha256sum -c -; then \
+        downloaded=1; \
+      else \
+        rm -f /tmp/codex.tgz; \
+      fi; \
+    fi; \
+    if [ "$downloaded" -eq 0 ]; then \
+      curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 300 -o /tmp/codex.tgz -- "$codex_url"; \
+      echo "$sha  /tmp/codex.tgz" | sha256sum -c -; \
+    fi; \
     mkdir -p /opt/codex; \
     tar -xzf /tmp/codex.tgz -C /opt/codex; \
     ln -sf /opt/codex/bin/codex /usr/local/bin/codex; \
@@ -34,9 +49,14 @@ RUN set -eux; \
     /usr/local/bin/codex --version
 
 # 链接解析插件的源码在首次启动时下载，依赖预装在镜像里。
-RUN pip install --no-cache-dir \
-      httpx "bilibili-api-python>=17.4.0,<18.0.0" msgspec Pillow aiohttp \
-      "gmssl>=3.2.2,<4.0.0" "yt-dlp>=2026.8.19"
+RUN set -eux; \
+    set -- httpx "bilibili-api-python>=17.4.0,<18.0.0" msgspec Pillow aiohttp \
+      "gmssl>=3.2.2,<4.0.0" "yt-dlp>=2026.8.19"; \
+    if [ -n "$PIP_INDEX_URL" ]; then \
+      pip install --no-cache-dir -i "$PIP_INDEX_URL" "$@"; \
+    else \
+      pip install --no-cache-dir "$@"; \
+    fi
 
 # 插件内置在镜像里，启动时由 bootstrap 同步进数据卷（默认不挂载宿主机目录）。
 COPY plugin/astrbot_plugin_echo /opt/echo/plugin/astrbot_plugin_echo
