@@ -1,11 +1,14 @@
 """持久化：消息历史、定时提醒、重载跨实例待投递队列。只用 Python 标准库。"""
 
+import fnmatch
 import json
 import sqlite3
 import threading
 import time
+from pathlib import Path
 
 DEFAULT_HISTORY_LIMIT = 30
+DEFAULT_MAX_MESSAGES_PER_GROUP = 500
 
 _PENDING_DELIVERY_DDL = """
 CREATE TABLE IF NOT EXISTS pending_deliveries (
@@ -163,6 +166,32 @@ class Store:
             cur = self._db.execute("DELETE FROM messages WHERE group_id = ?", (group_id,))
             return cur.rowcount
 
+    def prune_messages(self, keep_per_group=DEFAULT_MAX_MESSAGES_PER_GROUP):
+        """按群保留最新 N 条群消息，定期裁掉过期原文并做轻度 WAL 检查点。"""
+        keep = max(1, int(keep_per_group))
+        total_deleted = 0
+        with self._lock:
+            if self._closed:
+                return 0
+            with self._db:
+                groups = [
+                    r["group_id"]
+                    for r in self._db.execute("SELECT DISTINCT group_id FROM messages").fetchall()
+                ]
+                for gid in groups:
+                    cur = self._db.execute(
+                        "DELETE FROM messages WHERE group_id = ? AND seq NOT IN "
+                        "(SELECT seq FROM messages WHERE group_id = ? ORDER BY seq DESC LIMIT ?)",
+                        (gid, gid, keep),
+                    )
+                    total_deleted += max(0, int(cur.rowcount or 0))
+            if self._path != ":memory:":
+                try:
+                    self._db.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                except sqlite3.Error:
+                    pass
+        return total_deleted
+
     def save_pending_delivery(self, task_id, group_id, umo="", prompt="", status="failed",
                               reason="error", result="", partial="", files=None,
                               error="", pre_history=None, created_at=None):
@@ -288,3 +317,116 @@ class Store:
                 if isinstance(entry, dict) and entry.get("path"):
                     paths.add(str(entry["path"]))
         return paths
+
+
+def _has_symlink_component(start, end):
+    cur = end
+    while True:
+        if cur.is_symlink():
+            return True
+        if cur == start:
+            return False
+        parent = cur.parent
+        if parent == cur:
+            return False
+        cur = parent
+
+
+def _purge_old_files(target_dir, root_dir, resolved_root, cutoff, pattern="*", recursive=False):
+    if not target_dir.exists() or target_dir.is_symlink() or not target_dir.is_dir():
+        return 0
+    if _has_symlink_component(root_dir, target_dir):
+        return 0
+    try:
+        resolved_dir = target_dir.resolve()
+    except OSError:
+        return 0
+    if resolved_dir != resolved_root and resolved_root not in resolved_dir.parents:
+        return 0
+    removed = 0
+    stack = [target_dir]
+    while stack:
+        cur = stack.pop()
+        try:
+            entries = list(cur.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                if entry.is_symlink():
+                    continue
+                if cur == target_dir and pattern != "*" and not fnmatch.fnmatch(entry.name, pattern):
+                    continue
+                if entry.is_dir():
+                    if recursive:
+                        stack.append(entry)
+                    continue
+                if not entry.is_file():
+                    continue
+                resolved_entry = entry.resolve()
+                if resolved_root not in resolved_entry.parents:
+                    continue
+                if entry.lstat().st_mtime <= cutoff:
+                    entry.unlink(missing_ok=True)
+                    removed += 1
+            except OSError:
+                continue
+    return removed
+
+
+def cleanup_runtime_caches(data_root, now=None, temp_max_age=86400, media_max_age=259200):
+    """定期清理 AstrBot 临时图片及 QQ 日志/媒体缓存，严禁触碰登录态与数据库。"""
+    if not data_root:
+        return 0
+    root = Path(data_root)
+    if root.is_symlink() or not root.is_dir():
+        return 0
+    try:
+        resolved_root = root.resolve()
+    except OSError:
+        return 0
+
+    now_ts = time.time() if now is None else float(now)
+    temp_cutoff = now_ts - max(0, int(temp_max_age))
+    media_cutoff = now_ts - max(0, int(media_max_age))
+    removed = 0
+
+    removed += _purge_old_files(
+        root / "temp", root, resolved_root, temp_cutoff, pattern="media_*", recursive=False
+    )
+
+    qq_dir = root / "napcat" / "home" / ".config" / "QQ"
+    if qq_dir.is_dir() and not qq_dir.is_symlink() and not _has_symlink_component(root, qq_dir):
+        removed += _purge_old_files(
+            qq_dir / "global" / "nt_data" / "Log",
+            root,
+            resolved_root,
+            temp_cutoff,
+            recursive=True,
+        )
+        removed += _purge_old_files(
+            qq_dir / "NapCat" / "temp",
+            root,
+            resolved_root,
+            temp_cutoff,
+            recursive=True,
+        )
+        try:
+            acc_dirs = list(qq_dir.glob("nt_qq_*"))
+        except OSError:
+            acc_dirs = []
+        for acc in acc_dirs:
+            if not acc.is_dir() or acc.is_symlink():
+                continue
+            removed += _purge_old_files(
+                acc / "nt_temp", root, resolved_root, temp_cutoff, recursive=True
+            )
+            nt_data = acc / "nt_data"
+            if not nt_data.is_dir() or nt_data.is_symlink():
+                continue
+            for sub in ("log", "log-cache", "Pic", "Video", "File", "Ptt"):
+                removed += _purge_old_files(
+                    nt_data / sub, root, resolved_root, media_cutoff, recursive=True
+                )
+
+    return removed

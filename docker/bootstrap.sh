@@ -168,6 +168,7 @@ if [[ ! -f "$resolver_dir/metadata.yaml" ]]; then
   mkdir -p "$CACHE/link_resolver"
   tar --no-same-owner --no-same-permissions -xzf "$CACHE/link_resolver.tar.gz" -C "$CACHE/link_resolver" --strip-components=1
   mv "$CACHE/link_resolver" "$resolver_dir"
+  [[ "${KEEP_BOOTSTRAP_CACHE:-0}" == "1" ]] || rm -f "$CACHE/link_resolver.tar.gz"
   echo "[bootstrap] 链接解析插件就绪"
 fi
 
@@ -210,6 +211,7 @@ const { pathToFileURL } = require('node:url');
 const path = require('node:path');
 import(pathToFileURL(path.join(__dirname, 'napcat', 'napcat.mjs')).href);
 JS
+  [[ "${KEEP_BOOTSTRAP_CACHE:-0}" == "1" ]] || rm -f "$CACHE/qq.deb" "$CACHE/napcat.zip"
   echo "[bootstrap] 客户端装好了"
 fi
 

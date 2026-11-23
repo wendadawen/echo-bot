@@ -32,7 +32,7 @@ from astrbot_plugin_echo.core.models import MockModel, OpenAIModel, build_model 
 from astrbot_plugin_echo.core.person_info import PersonStore  # noqa: E402
 from astrbot_plugin_echo.core.rhythm import Batch, Item, Rhythm  # noqa: E402
 from astrbot_plugin_echo.core.schedule import Schedule  # noqa: E402
-from astrbot_plugin_echo.core.store import Store  # noqa: E402
+from astrbot_plugin_echo.core.store import Store, cleanup_runtime_caches  # noqa: E402
 from astrbot_plugin_echo.core.subagent import SubAgentManager  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -979,6 +979,81 @@ class TestMirrorAccelerationAndProxySafety(unittest.TestCase):
             self.assertIn(needle, workflow_text)
 
         self.assertTrue((ROOT / ".env.example").is_file())
+
+
+class TestRuntimeCacheAndMessagePruning(unittest.TestCase):
+    def test_store_prune_messages_keeps_newest_per_group(self):
+        store = Store(":memory:")
+        for i in range(1, 10):
+            store.add_message("g1", "u1", "阿伟", "user", f"g1-msg-{i}", ts=100.0 + i)
+        for i in range(1, 8):
+            store.add_message("g2", "u2", "小美", "user", f"g2-msg-{i}", ts=200.0 + i)
+
+        deleted = store.prune_messages(keep_per_group=5)
+        self.assertEqual(6, deleted)  # (9-5) + (7-5)
+        self.assertEqual(["g1-msg-5", "g1-msg-6", "g1-msg-7", "g1-msg-8", "g1-msg-9"], [m["text"] for m in store.recent("g1", 20)])
+        self.assertEqual(["g2-msg-3", "g2-msg-4", "g2-msg-5", "g2-msg-6", "g2-msg-7"], [m["text"] for m in store.recent("g2", 20)])
+        self.assertEqual(0, store.prune_messages(keep_per_group=5))
+
+    def test_cleanup_runtime_caches_and_bootstrap_contract(self):
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder)
+            data_root = base / "data"
+            outside = base / "outside_secret.txt"
+            outside.write_text("keep", encoding="utf-8")
+
+            now = 1_000_000.0
+            old_temp_ts = now - 90_000
+            old_media_ts = now - 300_000
+            fresh_ts = now - 60
+
+            def touch(rel, mtime):
+                p = data_root / rel
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_bytes(b"x")
+                os.utime(p, (mtime, mtime))
+                return p
+
+            stale_files = [
+                touch("temp/media_old.png", old_temp_ts),
+                touch("napcat/home/.config/QQ/global/nt_data/Log/a.log", old_temp_ts),
+                touch("napcat/home/.config/QQ/NapCat/temp/t.tmp", old_temp_ts),
+                touch("napcat/home/.config/QQ/nt_qq_abc/nt_temp/x.tmp", old_temp_ts),
+                touch("napcat/home/.config/QQ/nt_qq_abc/nt_data/log/l.txt", old_media_ts),
+                touch("napcat/home/.config/QQ/nt_qq_abc/nt_data/log-cache/c.bin", old_media_ts),
+                touch("napcat/home/.config/QQ/nt_qq_abc/nt_data/Pic/p.jpg", old_media_ts),
+                touch("napcat/home/.config/QQ/nt_qq_abc/nt_data/Video/v.mp4", old_media_ts),
+                touch("napcat/home/.config/QQ/nt_qq_abc/nt_data/File/f.pdf", old_media_ts),
+                touch("napcat/home/.config/QQ/nt_qq_abc/nt_data/Ptt/a.amr", old_media_ts),
+            ]
+            fresh_keep = [
+                touch("temp/media_fresh.png", fresh_ts),
+                touch("napcat/home/.config/QQ/nt_qq_abc/nt_data/Pic/fresh.jpg", fresh_ts),
+            ]
+            protected_keep = [
+                touch("temp/other_file.txt", old_temp_ts),
+                touch("napcat/home/.config/QQ/nt_qq_abc/nt_db/nt_msg.db", old_media_ts),
+                touch("napcat/home/.config/QQ/global/nt_data/Emoji/sys.zip", old_media_ts),
+                touch("napcat/home/.config/QQ/global/nt_data/mmkv/mmkv", old_media_ts),
+                touch("napcat/home/.config/QQ/global/nt_data/Login/login.dat", old_media_ts),
+                touch("bootstrap/onebot_token", old_media_ts),
+            ]
+
+            sym_file = data_root / "temp" / "media_escape"
+            sym_file.symlink_to(outside)
+
+            removed = cleanup_runtime_caches(str(data_root), now=now, temp_max_age=86400, media_max_age=259200)
+            self.assertEqual(len(stale_files), removed)
+            for p in stale_files:
+                self.assertFalse(p.exists(), f"expected deleted: {p}")
+            for p in fresh_keep + protected_keep:
+                self.assertTrue(p.exists(), f"expected preserved: {p}")
+            self.assertTrue(outside.exists())
+            self.assertTrue(sym_file.is_symlink())
+
+        boot_text = (ROOT / "docker" / "bootstrap.sh").read_text(encoding="utf-8")
+        self.assertIn('[[ "${KEEP_BOOTSTRAP_CACHE:-0}" == "1" ]] || rm -f "$CACHE/link_resolver.tar.gz"', boot_text)
+        self.assertIn('[[ "${KEEP_BOOTSTRAP_CACHE:-0}" == "1" ]] || rm -f "$CACHE/qq.deb" "$CACHE/napcat.zip"', boot_text)
 
 
 if __name__ == "__main__":

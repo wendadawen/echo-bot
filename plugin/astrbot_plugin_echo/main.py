@@ -39,7 +39,7 @@ from .core.person_info import PersonStore
 from .core.prompts import PersonaLibrary, PromptStore
 from .core.rhythm import Item, Rhythm
 from .core.schedule import Schedule
-from .core.store import Store
+from .core.store import Store, cleanup_runtime_caches
 from .core.subagent import SubAgentManager
 from .core.vision import EmojiBank
 
@@ -126,6 +126,12 @@ class Echo(Star):
         self.config = config or {}
         directory = _data_dir()
         directory.mkdir(parents=True, exist_ok=True)
+        resolved_dir = directory.resolve()
+        self._astrbot_data_root = (
+            str(resolved_dir.parents[1])
+            if len(resolved_dir.parents) >= 2 and resolved_dir.parent.name == "plugin_data"
+            else ""
+        )
         self.store = Store(str(directory / "echo.sqlite3"))
         self.model = build_model(self.config)
         self.memory = Memory(str(directory / "memory.sqlite3"))
@@ -500,10 +506,18 @@ class Echo(Star):
                                 logger.error("主动开聊发送失败（%s）：%s", type(exc).__name__, exc)
                         else:
                             self.heartbeat.backoff(group, 1800)
-                # 每 6 小时清理一次过期表情文件。
-                if now - self._emoji_cleanup_at > 21600 and self.emoji_bank:
+                # 每 6 小时清理一次过期表情、超限群消息及 QQ/临时缓存。
+                if now - self._emoji_cleanup_at > 21600:
                     self._emoji_cleanup_at = now
-                    await asyncio.to_thread(self.emoji_bank.cleanup)
+                    try:
+                        if self.emoji_bank:
+                            await asyncio.to_thread(self.emoji_bank.cleanup)
+                        await asyncio.to_thread(self.store.prune_messages)
+                        data_root = getattr(self, "_astrbot_data_root", "")
+                        if data_root:
+                            await asyncio.to_thread(cleanup_runtime_caches, data_root)
+                    except Exception as exc:
+                        logger.error("定期缓存清理异常：%s", exc)
                 # 后台任务完成：把结论及生成的群文件发回原群（逐任务异常隔离，确保不漏发不遗留 outbox）。
                 for task in await asyncio.to_thread(self.brain.poll_subagents):
                     group = task.get("group", "")
