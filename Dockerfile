@@ -7,8 +7,19 @@ ENV DEBIAN_FRONTEND=noninteractive \
     TZ=Asia/Shanghai \
     PYTHONUNBUFFERED=1
 
+ARG APT_MIRROR=""
+
 # QQ 客户端要一块虚拟屏幕和一批图形/网络库；ffmpeg 用于 B站音视频合并。
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN set -eux; \
+    if printf '%s' "$APT_MIRROR" | grep -Eq '^https?://[^[:space:]|&\\]+$'; then \
+      mirror="${APT_MIRROR%/}"; \
+      for f in /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources; do \
+        if [ -f "$f" ]; then \
+          sed -i -E "s|https?://deb\\.debian\\.org|${mirror}|g" "$f"; \
+        fi; \
+      done; \
+    fi; \
+    apt-get update && apt-get install -y --no-install-recommends \
       xvfb xauth supervisor unzip ca-certificates ffmpeg curl \
       libgtk-3-0t64 libasound2t64 libatk-bridge2.0-0t64 libnss3 libgbm1 \
       libxss1 libxkbcommon0 libsecret-1-0 libxtst6 libx11-xcb1 libxrandr2 libcups2t64 \

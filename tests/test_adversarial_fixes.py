@@ -961,8 +961,18 @@ class TestMirrorAccelerationAndProxySafety(unittest.TestCase):
         self.assertIn("env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy", sup_text)
 
         dockerfile_text = (ROOT / "Dockerfile").read_text(encoding="utf-8")
-        for needle in ("ARG BASE_IMAGE=", "ARG GITHUB_PROXY=", "ARG PIP_INDEX_URL="):
+        for needle in ("ARG BASE_IMAGE=", "ARG APT_MIRROR=", "ARG GITHUB_PROXY=", "ARG PIP_INDEX_URL=", "debian.sources"):
             self.assertIn(needle, dockerfile_text)
+
+        up_text = (ROOT / "scripts" / "up.sh").read_text(encoding="utf-8")
+        self.assertNotIn("mkdir -p data", up_text)
+        for needle in ("--cn", "--build-only", "--build", "DEPLOY_MODE", "upsert_env_key"):
+            self.assertIn(needle, up_text)
+        help_res = subprocess.run(["bash", str(ROOT / "scripts" / "up.sh"), "--help"], capture_output=True, text=True)
+        self.assertEqual(0, help_res.returncode, help_res.stderr)
+        self.assertIn("--cn", help_res.stdout)
+        bad_res = subprocess.run(["bash", str(ROOT / "scripts" / "up.sh"), "--bad-flag"], capture_output=True, text=True)
+        self.assertNotEqual(0, bad_res.returncode)
 
         workflow_text = (ROOT / ".github" / "workflows" / "image.yml").read_text(encoding="utf-8")
         for needle in ("MIRROR_IMAGE", "MIRROR_USERNAME", "MIRROR_PASSWORD"):
