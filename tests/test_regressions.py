@@ -939,13 +939,13 @@ class TestIncidentRegressions(unittest.TestCase):
         self.assertEqual("reply", res["reason"])
         self.assertEqual([], submitted)
 
-        # 3) view_rate 对极短附和语不提权；同人非极短语在 60s 内降至 0.35
+        # 3) view_rate 对极短附和语（无待回应提议时）不提权；同人非极短语在 120s 内提权至 0.85
         b2._last_reply_user["g1"] = "1001"
         b2._last_reply_at["g1"] = time.time()
         self.assertIsNone(b2.view_rate(make_batch("有道理", mentioned=False)))
         self.assertIsNone(b2.view_rate(make_batch("好的！", mentioned=False)))
-        self.assertEqual(0.35, b2.view_rate(make_batch("明天我再把接口改一版", mentioned=False)))
-        b2._last_reply_at["g1"] = time.time() - 65
+        self.assertEqual(0.85, b2.view_rate(make_batch("明天我再把接口改一版", mentioned=False)))
+        b2._last_reply_at["g1"] = time.time() - 125
         self.assertIsNone(b2.view_rate(make_batch("明天我再把接口改一版", mentioned=False)))
 
         # 4) observe_skipped 将未抽中消息写入历史库

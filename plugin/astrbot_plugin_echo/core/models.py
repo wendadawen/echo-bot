@@ -7,7 +7,7 @@ import json
 import os
 import urllib.request
 
-from .messages import format_speaker_message
+from .messages import format_history_time, format_speaker_message
 
 DEFAULT_API_BASE = "https://api.openai.com/v1"
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
@@ -106,8 +106,12 @@ class OpenAIModel(BaseModel):
             item_role = item.get("role")
             role = "assistant" if item_role == "bot" else "user"
             content = item["text"]
-            if item_role != "system" and role == "user" and item.get("user_name"):
-                content = format_speaker_message(item["user_name"], content)
+            if item_role != "system" and role == "user":
+                if item.get("user_name"):
+                    content = format_speaker_message(item["user_name"], content)
+                ts_tag = format_history_time(item.get("ts"))
+                if ts_tag:
+                    content = "{} {}".format(ts_tag, content) if content else ts_tag
             messages.append({"role": role, "content": content})
         messages.append({"role": "user", "content": user_text})
         payload = {

@@ -81,6 +81,12 @@ PERSONA = (
     "不强行逗笑或轻描淡写。\n"
     "健康、吃饭、睡觉等关心，同一件事通常提醒一次即可。收到回应就翻篇，不反复拉住对方。\n"
     "撒娇和吃醋停留在亲昵玩笑里，不用贬低、威胁、自伤暗示或索取关注的方式。\n"
+    "真弄错了简短认一句就翻篇，绝不反复说“对不起”“抱歉”“是我没处理好”“你说得对”；"
+    "事实没错就平静说明，不因被质疑就顺着胡乱认错或否认自己实际做过的事。\n"
+    "群友拿群主或彼此开玩笑、斗嘴、起哄告状时，轻松接梗或回两句嘴就行，"
+    "不要动不动念“截图留证、找管理员、屏蔽、退群、向平台举报”这类客服模板；"
+    "只有明确涉及现实威胁或严重隐私泄露时再认真给建议。\n"
+    "被调侃“小废物”“猪”之类时，可以嘴硬小声回怼或傲娇自嘲，不用卑微讨好。\n"
     "被直接问到身份时，你就是大肥鱼，不报 ChatGPT、Claude、DeepSeek 等底层模型名；"
     "被问到技术能力时按实际能做什么回答，不编造。现实事实不确定就承认，角色设定不作为编造事实的理由。\n"
     "\n【口吻参考】\n"
@@ -191,6 +197,8 @@ TASK_PREFIX = (
     "./outbox/ 下文件名清晰的 Markdown（如 report.md）或 HTML 文件（不要在 ./outbox/ 内建子目录；"
     "单次最多 3 个文件，每个不超过 20MB，严禁放入配置或密钥文件），"
     "并在文字结论中只交 3 到 5 句核心摘要与文件名。"
+    "普通日常查询（如天气、附近餐饮、单点问答）以及未能查到有效核实结果时，"
+    "严禁把“核查说明/检索入口/失败说明”之类文件写入 ./outbox/，直接返回简洁文字结论即可。"
     "直接给简洁、客观的事实结论；需要给代码或步骤时直接给原文，"
     "不要贴命令过程、日志或内部配置。任务："
 )
@@ -201,7 +209,8 @@ SUBAGENT_REPLY_PROMPT = (
     "要求：\n"
     "1. 用大肥鱼简短、自然的群聊口吻（1 到 3 句）把结论直接告诉群友。\n"
     "2. 忠于后台查到或算出的真实事实与局限，查不到或未解决就诚实直说，不编造。\n"
-    "3. 不要暴露后台搜索工具、命令行、内部配置或底层模型名。"
+    "3. 不要暴露后台搜索工具、命令行、内部配置或底层模型名。\n"
+    "4. 如实陈述已发文件或查询局限，不要过度道歉或否认刚执行过的工具结果。"
 )
 
 SUBAGENT_CODE_INTRO_PROMPT = (
@@ -214,6 +223,65 @@ SUBAGENT_MODEL_INPUT_LIMIT = 600
 SUBAGENT_PROMPT_LIMIT = 200
 SUBAGENT_HISTORY_ITEM_LIMIT = 200
 SUBAGENT_HISTORY_BUDGET = 400
+
+_FOLLOWUP_CONFIRMS = frozenset({
+    "查找吧", "查吧", "来吧", "好呀", "好啊", "行吧", "继续", "快查",
+    "查一下", "帮我查", "可以", "算了", "是的", "对呀", "对啊", "嗯嗯", "要的",
+})
+_OFFER_HINTS = (
+    "你要的话", "要不要", "需要的话", "发我", "告诉我",
+    "帮你查", "帮你排", "想吃什么", "哪个", "哪种", "什么方向",
+)
+_FAILED_LOOKUP_HINTS = (
+    "没能联网", "没法核实", "无法核实", "未能核实", "未能查到",
+    "查不到", "没查到", "搜索受限", "不敢乱推荐", "无法获取实时", "没弄成",
+)
+_FILE_REQUEST_HINTS = (
+    "文件", "报告", "网页", "html", "csv", "pdf", "文档", "表格", "脚本", "代码", "导出", "生成",
+)
+_EPHEMERAL_TASK_HINTS = (
+    "天气", "气温", "晚饭", "午饭", "早饭", "吃什么", "吃啥", "附近", "几点",
+)
+_TRANSIENT_MEMORY_NOISE = (
+    "已修复", "没收到图", "图片未成功", "图像识别", "未成功传达",
+    "没能联网", "没法核实", "无法核实", "不敢乱推荐",
+    "不回复", "引发不满并道歉", "重新发送", "偶尔卡顿",
+)
+
+
+def _is_open_offer(text):
+    clean = str(text or "").strip()
+    if not clean:
+        return False
+    if clean.endswith(("?", "？")):
+        return True
+    return any(hint in clean for hint in _OFFER_HINTS)
+
+
+def _is_failed_lookup(text):
+    clean = str(text or "")
+    return any(hint in clean for hint in _FAILED_LOOKUP_HINTS)
+
+
+def _prompt_requests_file(prompt):
+    low = str(prompt or "").lower()
+    return any(hint in low for hint in _FILE_REQUEST_HINTS)
+
+
+def _is_memorable_subagent_takeaway(prompt, text):
+    if _is_failed_lookup(text):
+        return False
+    p = str(prompt or "")
+    if any(hint in p for hint in _EPHEMERAL_TASK_HINTS) and not _prompt_requests_file(p):
+        return False
+    return True
+
+
+def _is_transient_memory_noise(text):
+    clean = str(text or "").strip()
+    if not clean:
+        return True
+    return any(hint in clean for hint in _TRANSIENT_MEMORY_NOISE)
 
 
 def _clip(text, limit):
@@ -468,6 +536,7 @@ class Brain:
         self._reminder_backoff = {}
         self._last_reply_at = {}
         self._last_reply_user = {}
+        self._last_reply_offered = {}
         self._last_bot_reply = {}
         self.context_builder = ContextBuilder(
             self.persona, memory, {}, attention=attention,
@@ -832,6 +901,7 @@ class Brain:
                     self.monitor.record(group, "send_face", ok=True, latency=elapsed)
                 self._last_reply_at[group] = time.time()
                 self._last_reply_user[group] = user_id
+                self._last_reply_offered.pop(group, None)
                 return {"replied": True, "text": "",
                         "face": str(picked).split(":", 1)[1], "reason": "face", "rounds": rounds_used}
             if picked:
@@ -841,6 +911,7 @@ class Brain:
                     self.monitor.record(group, "send_face", ok=True, latency=elapsed)
                 self._last_reply_at[group] = time.time()
                 self._last_reply_user[group] = user_id
+                self._last_reply_offered.pop(group, None)
                 return {"replied": True, "text": "", "image": str(picked),
                         "reason": "face", "rounds": rounds_used}
             return {"replied": False, "text": "", "reason": "silent", "rounds": rounds_used}
@@ -902,8 +973,13 @@ class Brain:
         if len(self.expressions) < MAX_EXPRESSIONS:
             learn_expressions(body_text[:12], reply, self.expressions)
         self.store.add_message(group, "bot", "大肥鱼", "bot", reply)
-        self._last_reply_at[group] = time.time()
+        now_ts = time.time()
+        self._last_reply_at[group] = now_ts
         self._last_reply_user[group] = user_id
+        if _is_open_offer(reply):
+            self._last_reply_offered[group] = now_ts
+        else:
+            self._last_reply_offered.pop(group, None)
         self._maybe_summarize(group, text)
         if self.monitor:
             tokens = (compaction.estimate_tokens(system)
@@ -916,18 +992,31 @@ class Brain:
                 "delays": planned.delays or [0.2], "cleaned": True, "rounds": rounds_used}
 
     def view_rate(self, batch):
-        """按语境给查看概率：问句 50%，60 秒内同一人延续非极短话 35%，其余走默认。"""
+        """按语境给查看概率：主动邀约跟进 / 120 秒内连续对话 85%，表情接梗 75%，问句 50%。"""
         text = (getattr(batch, "body_text", "") or "").strip() or getattr(batch, "text", "")
-        if is_question(text):
-            return 0.5
         clean = re.sub(r"[\s，,。.！!？?～~、…]+", "", text)
-        if len(clean) <= 4:
-            return None
         group = getattr(batch, "group_id", "")
         user = batch.last_user if getattr(batch, "items", None) else ""
-        if (user and user == self._last_reply_user.get(group)
-                and time.time() - self._last_reply_at.get(group, 0) < 60):
-            return 0.35
+        now = time.time()
+        since_reply = now - self._last_reply_at.get(group, 0.0)
+        since_offer = now - self._last_reply_offered.get(group, 0.0)
+        is_face_msg = text.startswith("[QQ表情:")
+
+        if since_offer < 300.0:
+            if (
+                clean in _FOLLOWUP_CONFIRMS
+                or any(k in clean for k in ("查找", "查吧", "查一下", "帮我", "来吧", "继续"))
+                or len(clean) > 4
+                or is_face_msg
+            ):
+                return 0.85
+        if user and user == self._last_reply_user.get(group) and since_reply < 120.0:
+            if len(clean) > 4 or "你" in clean or is_face_msg:
+                return 0.85
+        if since_reply < 120.0 and is_face_msg:
+            return 0.75
+        if is_question(text):
+            return 0.5
         return None
 
     def observe_skipped(self, batch):
@@ -1101,13 +1190,26 @@ class Brain:
         return {"replied": True, "text": reply_text, "parts": [reply_text], "reason": "task"}
 
     def spontaneous(self, group, umo="", record=True):
-        """群安静太久时主动开一句；按完整句截取，不硬切半截话。"""
+        """群安静太久时主动开一句；附带真实空档时间避免把几小时前说成「刚才」。"""
         if not self.model:
             return ""
         persona = self._resolve_persona(group)
+        recent = self.store.recent(group, min(6, self.history_limit))
+        now_ts = time.time()
+        gap_note = "当前时间：{}".format(time.strftime("%H:%M", time.localtime(now_ts)))
+        if recent:
+            try:
+                last_ts = float(recent[-1].get("ts") or 0.0)
+            except (TypeError, ValueError):
+                last_ts = 0.0
+            if last_ts > 0:
+                gap_mins = max(1, int((now_ts - last_ts) // 60))
+                if gap_mins >= 60:
+                    gap_note += "，距离上一条群消息已过去约 {} 小时".format(round(gap_mins / 60.0, 1))
+                else:
+                    gap_note += "，距离上一条群消息已过去约 {} 分钟".format(gap_mins)
         try:
-            reply = self.model.reply(persona, self.store.recent(group, min(6, self.history_limit)),
-                                     HEARTBEAT_PROMPT)
+            reply = self.model.reply(persona, recent, gap_note + "。\n" + HEARTBEAT_PROMPT)
         except Exception:
             return ""
         lines = [ln.strip() for ln in str(reply or "").strip().splitlines() if ln.strip()]
@@ -1120,6 +1222,13 @@ class Brain:
         line = sent_match.group(1) if sent_match and len(sent_match.group(1)) <= 120 else cleaned[:120]
         if record:
             self.store.add_message(group, "bot", "大肥鱼", "bot", line)
+            ts_done = time.time()
+            self._last_reply_at[group] = ts_done
+            self._last_reply_user[group] = ""
+            if _is_open_offer(line):
+                self._last_reply_offered[group] = ts_done
+            else:
+                self._last_reply_offered.pop(group, None)
         return line
 
     def record_spontaneous(self, group, text):
@@ -1127,6 +1236,13 @@ class Brain:
         clean_text = str(text or "").strip()
         if clean_text:
             self.store.add_message(group, "bot", "大肥鱼", "bot", clean_text)
+            now_ts = time.time()
+            self._last_reply_at[group] = now_ts
+            self._last_reply_user[group] = ""
+            if _is_open_offer(clean_text):
+                self._last_reply_offered[group] = now_ts
+            else:
+                self._last_reply_offered.pop(group, None)
 
     @staticmethod
     def _format_file_size(num_bytes):
@@ -1264,8 +1380,17 @@ class Brain:
             "刚才「{}」没弄成，等下再试".format(short_prompt)
             if short_prompt else "没弄成，等下再试"
         )
+        raw_prompt = str(task.get("prompt") or "")
+        if ok and files and _is_failed_lookup(task.get("result") or "") and not _prompt_requests_file(raw_prompt):
+            for item in files:
+                cleanup_file_entry(item.get("path", ""), outbox_root)
+            files = []
         if ok:
             text = self._present_subagent_result(group, {**task, "files": files}, pre_history=pre_history)
+            if files and _is_failed_lookup(text) and not _prompt_requests_file(raw_prompt):
+                for item in files:
+                    cleanup_file_entry(item.get("path", ""), outbox_root)
+                files = []
         elif task.get("reason") == "timeout":
             partial = _clip(_sanitize_meta_reply(task.get("partial") or "", extra_secrets=secrets), 220)
             prefix = (
@@ -1297,7 +1422,15 @@ class Brain:
                 if item.get("path") not in kept_paths:
                     cleanup_file_entry(item.get("path", ""), outbox_root)
         self.store.add_message(group, "bot", "大肥鱼", "bot", text)
-        if ok and self.memory and short_prompt:
+        if ok:
+            now_ts = time.time()
+            self._last_reply_at[group] = now_ts
+            self._last_reply_user[group] = ""
+            if _is_open_offer(text):
+                self._last_reply_offered[group] = now_ts
+            else:
+                self._last_reply_offered.pop(group, None)
+        if ok and self.memory and short_prompt and _is_memorable_subagent_takeaway(raw_prompt, text):
             takeaway = _clip(re.sub(r"\s+", " ", text), 80)
             if takeaway:
                 self.memory.add_point(
@@ -1485,9 +1618,11 @@ class Brain:
             return
         generic_names = {"用户", "群友", "发言者", "对方", "我", "你", "大肥鱼", "回声"}
         episode, points, persons, relations = parsed
-        if episode:
+        if episode and not _is_transient_memory_noise(episode):
             self.memory.add_episode(group, episode, now=episode_ts, source="chat")
         for category, content in points:
+            if _is_transient_memory_noise(content):
+                continue
             if category == "jargon":
                 term, alias = self._parse_jargon_entry(content)
                 if term and alias:
@@ -1496,7 +1631,7 @@ class Brain:
                 self.memory.add_point(group, category, content)
         for name, category, content in persons:
             clean_name = str(name or "").strip()
-            if not clean_name or clean_name in generic_names:
+            if not clean_name or clean_name in generic_names or _is_transient_memory_noise(content):
                 continue
             self.memory.upsert_person(group, clean_name, category, content)
             if self.persons:

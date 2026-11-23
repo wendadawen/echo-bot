@@ -42,7 +42,7 @@ from .core.modes import ModePolicy
 from .core.monitor import Monitor
 from .core.person_info import PersonStore
 from .core.prompts import PersonaLibrary, PromptStore
-from .core.rhythm import IMAGE_TTL, Item, Rhythm
+from .core.rhythm import IMAGE_TTL, SILENT_MAX_AGE, Item, Rhythm
 from .core.schedule import Schedule
 from .core.store import Store, cleanup_runtime_caches
 from .core.subagent import SubAgentManager
@@ -435,6 +435,7 @@ class Echo(Star):
                         )
 
         media_prefix = " ".join(face_tags + mface_tags).strip()
+        bare_face = False
         if not text and not forward_text:
             if not mentioned:
                 if has_image or mface_tags:
@@ -442,9 +443,16 @@ class Echo(Star):
                     await asyncio.to_thread(
                         self.store.add_message, group_id, sender, user_name, "user", marker
                     )
-                event.stop_event()
-                return
-            if media_prefix:
+                    event.stop_event()
+                    return
+                last_bot_at = float(getattr(getattr(self, "brain", None), "_last_reply_at", {}).get(group_id, 0.0) or 0.0)
+                if face_tags and time.time() - last_bot_at <= 120.0:
+                    text = " ".join(face_tags).strip()
+                    bare_face = True
+                else:
+                    event.stop_event()
+                    return
+            elif media_prefix:
                 text = (media_prefix + (" [图片]" if has_image else "")).strip()
             elif has_image:
                 text = "[图片]"
@@ -474,7 +482,7 @@ class Echo(Star):
         self.rhythm.add(group_id, Item(
             (text + (" " + forward_text if forward_text else "")).strip(),
             sender, user_name, mentioned, umo, time.time(),
-            kind="image" if has_image else "text", quote=quote_text,
+            kind="image" if has_image else ("face" if bare_face else "text"), quote=quote_text,
         ))
         event.stop_event()
         return
@@ -711,10 +719,19 @@ class Echo(Star):
                         continue
                     last = self.rhythm.last_batch(group)
                     last_turn = getattr(last, "turn_id", "") if last is not None else ""
+                    last_items = getattr(last, "items", None) or [] if last is not None else []
+                    last_ts = (
+                        max(
+                            float(getattr(last, "started", 0.0) or 0.0),
+                            float(getattr(last_items[-1], "ts", 0.0) or 0.0) if last_items else 0.0,
+                        )
+                        if last is not None else 0.0
+                    )
                     if (
                         last is not None
                         and (not last_turn or last_turn not in self._handled_turns)
                         and int(getattr(last, "replay_count", 0) or 0) < 1
+                        and (last_ts <= 0 or now - last_ts <= SILENT_MAX_AGE)
                         and not self.rhythm.has_batch(group)
                         and self.rhythm.silent_due(group, now)
                         and self.rhythm.consume_silent(group, now)
@@ -878,6 +895,16 @@ class Echo(Star):
             await self.context.send_message(
                 umo, MessageChain([File(name=display_name, file=str(resolved))])
             )
+            store = getattr(self, "store", None)
+            if store and group and display_name:
+                await asyncio.to_thread(
+                    store.add_message,
+                    group,
+                    "bot",
+                    "大肥鱼",
+                    "bot",
+                    "[已发送群文件：{}]".format(display_name),
+                )
         except Exception as exc:
             logger.error("文件发送失败（%s）：%s", display_name or path, exc)
             if umo:

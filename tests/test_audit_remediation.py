@@ -542,6 +542,291 @@ class TestEventIntegrationAndMentions(unittest.TestCase):
 
                 asyncio.run(run_flow())
 
+    def test_time_awareness_followup_continuity_silent_ttl_outbox_and_memory_guards(self) -> None:
+        from astrbot_plugin_echo.core.messages import format_history_time
+        from astrbot_plugin_echo.core.rhythm import SILENT_MAX_AGE
+
+        now = time.time()
+        # 1) format_history_time + OpenAIModel.reply + ContextBuilder.build + spontaneous 时间感
+        self.assertIn("刚刚", format_history_time(now - 10, now=now))
+        self.assertIn("分钟前", format_history_time(now - 600, now=now))
+        self.assertIn("小时前", format_history_time(now - 7200, now=now))
+        self.assertIn("天前", format_history_time(now - 2 * 86400, now=now))
+        self.assertEqual("", format_history_time(0, now=now))
+
+        captured_payload = {}
+
+        class FakeResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return json.dumps({
+                    "choices": [{"message": {"role": "assistant", "content": "收到"}}]
+                }).encode("utf-8")
+
+        def fake_urlopen(req, timeout=40):
+            captured_payload.update(json.loads(req.data.decode("utf-8")))
+            return FakeResp()
+
+        oa = OpenAIModel("k", "http://localhost/v1", "m")
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            oa.reply(
+                "sys",
+                [
+                    {"role": "user", "user_name": "阿伟", "text": "带时间的旧话", "ts": now - 1800},
+                    {"role": "bot", "user_name": "大肥鱼", "text": "机器人的话", "ts": now - 1700},
+                    {"role": "user", "user_name": "小美", "text": "无时间的话"},
+                ],
+                "[昵称：阿伟] 在吗",
+            )
+        msgs = captured_payload["messages"]
+        self.assertRegex(msgs[1]["content"], r"^\[\d{2}:\d{2} · 30分钟前\] \[昵称：阿伟\] 带时间的旧话$")
+        self.assertEqual({"role": "assistant", "content": "机器人的话"}, msgs[2])
+        self.assertEqual({"role": "user", "content": "[昵称：小美] 无时间的话"}, msgs[3])
+
+        cb = ContextBuilder("人设")
+        built = cb.build(
+            "g1",
+            query="好忙呀",
+            user_name="炸芋花",
+            history=[
+                {"role": "bot", "user_name": "大肥鱼", "text": "上回说的", "ts": now - 3600},
+                {"role": "user", "user_name": "炸芋花", "text": "之前的", "ts": now - 2100},
+            ],
+        )
+        self.assertIn("当前时间：", built)
+        self.assertIn("你上次发言于", built)
+        self.assertIn("上一条群消息距今已较久", built)
+
+        spont_prompts = []
+
+        class InspectSpontModel:
+            def reply(self, system, history, user_text):
+                spont_prompts.append(user_text)
+                return "今晚风挺大的。"
+
+        store_sp = Store(":memory:")
+        store_sp.add_message("g1", "u1", "炸芋花", "user", "之前的表情", ts=now - 3 * 3600)
+        brain_sp = Brain(store_sp, InspectSpontModel())
+        sp_line = brain_sp.spontaneous("g1", "", False)
+        self.assertEqual("今晚风挺大的。", sp_line)
+        self.assertTrue(spont_prompts and "距离上一条群消息已过去约 3" in spont_prompts[0])
+
+        # 2) Brain.view_rate 连续对话 / 跨人跟进待办 / 刚发言后的纯 QQ 表情 / 路人短语
+        brain_vr = Brain(Store(":memory:"), MockModel())
+        brain_vr._last_reply_user["g1"] = "u1"
+        brain_vr._last_reply_at["g1"] = time.time()
+        self.assertEqual(0.85, brain_vr.view_rate(Batch("g1", items=[Item("你规划一下", "u1", "A", False, "umo", time.time())])))
+        self.assertIsNone(brain_vr.view_rate(Batch("g1", items=[Item("有道理", "u2", "B", False, "umo", time.time())])))
+
+        brain_vr.record_spontaneous("g1", "你要的话我现在帮你查一下？")
+        self.assertEqual(0.85, brain_vr.view_rate(Batch("g1", items=[Item("查找吧", "u2", "B", False, "umo", time.time())])))
+        self.assertEqual(0.85, brain_vr.view_rate(Batch("g1", items=[Item("[QQ表情:大怨种]", "u3", "C", False, "umo", time.time())])))
+
+        brain_vr.record_spontaneous("g2", "出来冒个泡。")
+        self.assertEqual(0.75, brain_vr.view_rate(Batch("g2", items=[Item("[QQ表情:大怨种]", "u3", "C", False, "umo", time.time())])))
+
+        # 3) Rhythm.silent_due 超过 SILENT_MAX_AGE (300s) 不再翻旧账，未过期时仍可触发
+        rhythm = Rhythm(view_rate=1.0)
+        base_t = time.time()
+        rhythm.add("g_old", Item("旧消息", "u1", "A", False, "umo", base_t), now=base_t)
+        rhythm.due(base_t + 20)
+        rhythm.mark_view("g_old", base_t + 20)
+        self.assertTrue(rhythm.silent_due("g_old", now=base_t + SILENT_MAX_AGE - 20, interval=2))
+        self.assertFalse(rhythm.silent_due("g_old", now=base_t + SILENT_MAX_AGE + 10, interval=2))
+
+        # 4) Echo.on_group_message 未@纯 Face 仅在刚发言 120s 内接进 rhythm；Echo._send_file 落库群文件记录
+        stubs, comp, _ = _make_astrbot_stubs()
+
+        class _FakeCtx:
+            def __init__(self):
+                self.sent = []
+
+            async def send_message(self, umo, chain):
+                self.sent.append((umo, chain))
+
+        class _FakeFaceEvent:
+            def __init__(self, gid, parts):
+                self.gid = gid
+                self.parts = list(parts)
+                self.unified_msg_origin = f"aiocqhttp:GroupMessage:{gid}"
+                self.bot = None
+                self.message_obj = types.SimpleNamespace(raw_message={"post_type": "message"}, message_str="", message=self.parts)
+
+            def get_sender_id(self):
+                return "2573394163"
+
+            def get_sender_name(self):
+                return "炸芋花"
+
+            def get_self_id(self):
+                return "999999"
+
+            def get_group_id(self):
+                return self.gid
+
+            def get_platform_name(self):
+                return "aiocqhttp"
+
+            def get_messages(self):
+                return self.parts
+
+            def get_message_str(self):
+                return ""
+
+            def is_at_or_wake_command(self):
+                return False
+
+            def should_call_llm(self, flag):
+                return None
+
+            def stop_event(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(sys.modules, stubs):
+                sys.modules.pop("astrbot_plugin_echo.main", None)
+                import astrbot_plugin_echo.main as echo_main
+
+                importlib.reload(echo_main)
+
+                async def run_face_and_file():
+                    ctx = _FakeCtx()
+                    with patch.object(echo_main.StarTools, "get_data_dir", lambda *a, **kw: tmpdir):
+                        echo = echo_main.Echo(ctx, config={})
+                    for tname in ("_reminder_task", "_chat_task"):
+                        task = getattr(echo, tname, None)
+                        if task is not None:
+                            task.cancel()
+                            setattr(echo, tname, None)
+                    try:
+                        # 无近期回复 -> 独立 Face 仍忽略
+                        async for _ in echo.on_group_message(_FakeFaceEvent("g_idle", [comp.Face(id=344)])):
+                            pass
+                        self.assertEqual([], echo.rhythm.due(time.time() + 20))
+
+                        # 120s 内刚发言过 -> 独立 Face 作为 kind="face" 进 rhythm
+                        echo.brain._last_reply_at["aiocqhttp:g_live"] = time.time()
+                        async for _ in echo.on_group_message(_FakeFaceEvent("g_live", [comp.Face(id=344)])):
+                            pass
+                        face_batches = echo.rhythm.due(time.time() + 20)
+                        self.assertEqual(1, len(face_batches))
+                        self.assertEqual("[QQ表情:大怨种]", face_batches[0].body_text)
+                        self.assertEqual("face", face_batches[0].items[0].kind)
+
+                        # _send_file 成功发送后往 store 写入 [已发送群文件：...]
+                        out_dir = Path(tmpdir) / "outbox" / "t1"
+                        out_dir.mkdir(parents=True, exist_ok=True)
+                        f_test = out_dir / "report.md"
+                        f_test.write_text("# report", encoding="utf-8")
+                        echo._outbox_root = str(Path(tmpdir) / "outbox")
+                        await echo._send_file("aiocqhttp:g_live", "aiocqhttp:GroupMessage:g_live", str(f_test), "report.md")
+                        rec = echo.store.recent("aiocqhttp:g_live", 5)
+                        self.assertTrue(any("[已发送群文件：report.md]" in r.get("text", "") for r in rec))
+                    finally:
+                        await echo.terminate()
+
+                asyncio.run(run_face_and_file())
+
+        # 5) _build_delivery_row：失败查店废文件自动清理且不送群、不入记忆；真实请求文件保留；天气/晚饭结论不入长期记忆
+        with tempfile.TemporaryDirectory() as folder:
+            outbox_root = Path(folder) / "outbox"
+            d_fail = outbox_root / "task-fail"
+            d_fail.mkdir(parents=True)
+            f_fail = d_fail / "dinner_note.md"
+            f_fail.write_text("未能核实", encoding="utf-8")
+
+            d_keep = outbox_root / "task-keep"
+            d_keep.mkdir(parents=True)
+            f_keep = d_keep / "summary.md"
+            f_keep.write_text("报告正文", encoding="utf-8")
+
+            class RewriteDirectModel:
+                def reply(self, system, history, user_text):
+                    if "未能核实" in user_text or "没能联网" in user_text:
+                        return "没能联网核实附近店名和价格，这次不敢乱推荐。"
+                    return "上海西岸现在 14°C。"
+
+            mem_guard = Memory(":memory:")
+            store_guard = Store(":memory:")
+            brain_guard = Brain(store_guard, RewriteDirectModel(), memory=mem_guard)
+            brain_guard.harness = types.SimpleNamespace(outbox_root=str(outbox_root), timeout=180)
+
+            row_fail = brain_guard._build_delivery_row(
+                {
+                    "id": "tf1",
+                    "prompt": "查找苏州工业园区若水路99号附近25元以内晚饭",
+                    "status": "completed",
+                    "result": "没能联网核实店铺营业状态与价格，不敢乱推荐。",
+                    "files": [{"name": "dinner_note.md", "path": str(f_fail), "size": 12}],
+                },
+                "g1",
+                "umo:1",
+            )
+            self.assertEqual([], row_fail["files"])
+            self.assertFalse(f_fail.exists())
+            self.assertEqual([], mem_guard.recall("g1", "若水路 晚饭"))
+
+            row_weather = brain_guard._build_delivery_row(
+                {
+                    "id": "tw1",
+                    "prompt": "调查一下上海西岸天气现在",
+                    "status": "completed",
+                    "result": "上海西岸现在 14°C。",
+                    "files": [],
+                },
+                "g1",
+                "umo:1",
+            )
+            self.assertTrue(row_weather["ok"])
+            self.assertEqual([], mem_guard.recall("g1", "上海西岸 天气"))
+
+            row_keep = brain_guard._build_delivery_row(
+                {
+                    "id": "tk1",
+                    "prompt": "帮我调研并发一份文件报告（哪怕没联网也要说明局限）",
+                    "status": "completed",
+                    "result": "部分公开信息已整理，实时店铺没能联网核实。",
+                    "files": [{"name": "summary.md", "path": str(f_keep), "size": 12}],
+                },
+                "g1",
+                "umo:1",
+            )
+            self.assertEqual(1, len(row_keep["files"]))
+            self.assertTrue(f_keep.exists())
+
+        # 6) _summarize 过滤一次性排障/故障噪音，不写入 episodes / points / persons
+        class NoisyMemModel:
+            def reply(self, system, history, user_text):
+                return json.dumps({
+                    "episode": "群内反馈图像识别可能有问题，以上问题都已修复",
+                    "persons": [
+                        {"name": "和", "category": "person", "content": "称以上问题都已修复"},
+                        {"name": "炸芋花", "category": "preference", "content": "喜欢吃抹茶甜品"},
+                    ],
+                    "relations": [],
+                    "points": [
+                        {"category": "event", "content": "图片未成功传达，没能联网核实"},
+                        {"category": "preference", "content": "炸芋花喜欢喝拿铁"},
+                    ],
+                }, ensure_ascii=False)
+
+        mem_sum = Memory(":memory:")
+        ps_sum = PersonStore(":memory:")
+        ps_sum.observe("g1", "u_he", "和")
+        ps_sum.observe("g1", "u_zyh", "炸芋花")
+        brain_sum = Brain(Store(":memory:"), NoisyMemModel(), memory=mem_sum, persons=ps_sum)
+        brain_sum._summarize("g1", "测试转录", episode_ts=time.time())
+        self.assertEqual([], mem_sum.recent_episodes("g1"))
+        self.assertEqual([], mem_sum.recall("g1", "图像识别 修复"))
+        self.assertTrue(any("拿铁" in h for h in mem_sum.recall("g1", "炸芋花 拿铁")))
+        self.assertEqual("", ps_sum.summary("g1", "u_he"))
+        self.assertIn("抹茶甜品", ps_sum.summary("g1", "u_zyh"))
+
 
 class TestExplicitMentionAndActions(unittest.TestCase):
     def test_explicit_mention_forbids_silent_and_wait_forces_reply(self):

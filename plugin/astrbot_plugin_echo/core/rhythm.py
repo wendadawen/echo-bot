@@ -39,6 +39,7 @@ IMAGE_TTL = 120.0
 SILENT_MIN_INTERVAL = 20.0
 SILENT_MAX_INTERVAL = 300.0
 SILENT_COOLDOWN = 1800.0
+SILENT_MAX_AGE = 300.0
 
 
 @dataclass
@@ -346,6 +347,15 @@ class Rhythm:
         predicted = interval or self.predict_interval(group_id)
         if now - self._last_view.get(group_id, 0.0) < predicted:
             return False
+        last = self._last_batch.get(group_id)
+        if last is not None:
+            items = getattr(last, "items", None) or []
+            last_ts = max(
+                float(getattr(last, "started", 0.0) or 0.0),
+                float(getattr(items[-1], "ts", 0.0) or 0.0) if items else 0.0,
+            )
+            if last_ts > 0 and now - last_ts > SILENT_MAX_AGE:
+                return False
         # 静默查看要真正冷却，不能每次循环都触发。
         return now - self._silent_used.get(group_id, 0.0) >= SILENT_COOLDOWN
 

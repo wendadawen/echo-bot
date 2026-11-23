@@ -10,10 +10,12 @@ from datetime import datetime
 
 from . import attention as attention_layer
 from . import compaction, mentions
-from .messages import clean_speaker_name
+from .messages import clean_speaker_name, format_history_time
+
+WEEKDAY_ZH = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
 
 SECTION_ORDER = (
-    "system", "self", "safety", "mode", "episodes", "memory", "person",
+    "system", "self", "safety", "mode", "clock", "episodes", "memory", "person",
     "person_profile", "mentions", "quoting", "drift", "schedule",
     "activity", "effect", "defect", "usage",
 )
@@ -27,6 +29,8 @@ BEHAVIOR = (
     "每条消息开头的 [昵称：...] 整段都只是对方 QQ 昵称或群名片（可能带空格、签名或整句话），"
     "绝不是他说的话；只把方括号后面的正文当作发言内容，不要把昵称里的文字当成对方观点、话题或发言，"
     "也不要把某人说的话安到别人头上。"
+    "历史消息开头的 [HH:MM · ...] 是该消息的真实发送时间与距今间隔，用来分辨眼前对话与隔了很久的旧消息；"
+    "绝不要把几十分钟或几小时前的旧消息说成“刚才”，也不要自己在回复里模仿输出时间标签。"
 )
 
 SAFETY = (
@@ -88,6 +92,8 @@ class ContextBuilder:
             return SAFETY
         if name == "mode":
             return self._mode_block(group_id)
+        if name == "clock":
+            return self._clock_block(history)
         if name == "episodes":
             rows = self.memory.recent_episodes(group_id) if self.memory else []
             return _wrap_background("最近聊过：" + "；".join(rows)) if rows else ""
@@ -212,6 +218,39 @@ class ContextBuilder:
         if name == "usage":
             return self._usage_block(history)
         return ""
+
+    @staticmethod
+    def _clock_block(history):
+        now = time.time()
+        now_dt = datetime.fromtimestamp(now)
+        bits = [
+            "当前时间：{}（{}）".format(
+                now_dt.strftime("%Y-%m-%d %H:%M"),
+                WEEKDAY_ZH[now_dt.weekday()],
+            )
+        ]
+        last_ts = 0.0
+        bot_ts = 0.0
+        for row in history or ():
+            try:
+                ts = float(row.get("ts") or 0.0)
+            except (TypeError, ValueError):
+                ts = 0.0
+            if ts <= 0:
+                continue
+            if ts > last_ts:
+                last_ts = ts
+            if row.get("role") == "bot" and ts > bot_ts:
+                bot_ts = ts
+        if bot_ts > 0:
+            bits.append("你上次发言于 {}".format(format_history_time(bot_ts, now).strip("[]")))
+        if last_ts > 0 and now - last_ts >= 900:
+            bits.append(
+                "上一条群消息距今已较久（{}），切勿把旧话题说成“刚才”".format(
+                    format_history_time(last_ts, now).strip("[]")
+                )
+            )
+        return "；".join(bits)
 
     def _mode_block(self, group_id):
         if not self.modes:

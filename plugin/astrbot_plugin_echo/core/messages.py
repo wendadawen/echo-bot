@@ -5,6 +5,28 @@ import time
 from dataclasses import dataclass
 
 
+def format_history_time(ts, now=None):
+    """把时间戳格式化为短时间锚点，帮助模型分辨近期对话与跨时段旧消息。"""
+    if not ts:
+        return ""
+    try:
+        stamp = float(ts)
+    except (TypeError, ValueError):
+        return ""
+    if stamp <= 0:
+        return ""
+    cur = time.time() if now is None else float(now)
+    delta = max(0.0, cur - stamp)
+    lt = time.localtime(stamp)
+    if delta < 60:
+        return "[{} · 刚刚]".format(time.strftime("%H:%M", lt))
+    if delta < 3600:
+        return "[{} · {}分钟前]".format(time.strftime("%H:%M", lt), int(delta // 60))
+    if delta < 86400:
+        return "[{} · {}小时前]".format(time.strftime("%H:%M", lt), int(delta // 3600))
+    return "[{} · {}天前]".format(time.strftime("%m-%d %H:%M", lt), int(delta // 86400))
+
+
 def clean_speaker_name(name, limit=40):
     """清洗群友昵称/名片：折叠换行与多余空白，剥离方括号避免伪造结构边界。"""
     s = re.sub(r"\s+", " ", str(name or "")).strip()
