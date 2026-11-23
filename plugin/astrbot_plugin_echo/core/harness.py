@@ -20,8 +20,8 @@ import uuid
 from pathlib import Path
 
 MAX_OUTPUT = 800
-DEFAULT_TIMEOUT = 180
-MIN_TIMEOUT = 30
+DEFAULT_TIMEOUT = 300
+MIN_TIMEOUT = 180
 MAX_TIMEOUT = 600
 MAX_STDOUT_BYTES = 4 * 1024 * 1024
 
@@ -63,7 +63,7 @@ _SAFE_ENV_KEYS = (
 
 
 def _parse_timeout(value, default=DEFAULT_TIMEOUT):
-    """解析后台任务超时（秒），支持数字与数字字符串并限制在 [30, 600]。"""
+    """解析后台任务超时（秒），支持数字与数字字符串并限制在 [180, 600]。"""
     if value is None or isinstance(value, bool):
         return default
     if isinstance(value, str):

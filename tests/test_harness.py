@@ -264,16 +264,19 @@ class TestHarness(unittest.TestCase):
             self.assertEqual([], list(Path(harness.outbox_root).iterdir()))
 
     def test_parse_timeout_bounds_and_invalid_values(self):
-        self.assertEqual(180, DEFAULT_TIMEOUT)
-        self.assertEqual(180, _parse_timeout(None))
-        self.assertEqual(180, _parse_timeout(False))
-        self.assertEqual(180, _parse_timeout(""))
-        self.assertEqual(180, _parse_timeout("abc"))
+        self.assertEqual(300, DEFAULT_TIMEOUT)
+        self.assertEqual(300, _parse_timeout(None))
+        self.assertEqual(300, _parse_timeout(False))
+        self.assertEqual(300, _parse_timeout(""))
+        self.assertEqual(300, _parse_timeout("abc"))
         self.assertEqual(240, _parse_timeout("240"))
-        self.assertEqual(30, _parse_timeout(5))
+        self.assertEqual(180, _parse_timeout(5))
+        self.assertEqual(180, _parse_timeout(120))
         self.assertEqual(600, _parse_timeout(9999))
         h = CodexHarness(binary="/bin/true", home="/tmp/h", workdir_root="/tmp/w", timeout="240")
         self.assertEqual(240, h.timeout)
+        h_low = CodexHarness(binary="/bin/true", home="/tmp/h", workdir_root="/tmp/w", timeout=30)
+        self.assertEqual(180, h_low.timeout)
 
 
 if __name__ == "__main__":

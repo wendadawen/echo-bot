@@ -20,7 +20,7 @@ from .mentions import is_question
 from .memory import MEMORY_PROMPT, parse_memory_full
 from .messages import Message
 from . import compaction, mentions
-from .harness import cleanup_file_entry
+from .harness import DEFAULT_TIMEOUT, cleanup_file_entry
 from .rhythm import Batch
 from .schedule import WEEKDAYS, parse_clock
 
@@ -222,11 +222,11 @@ def _clip(text, limit):
     return s[:limit] + "…"
 
 
-def _format_harness_notice(task, timeout=180):
+def _format_harness_notice(task, timeout=DEFAULT_TIMEOUT):
     summary = re.sub(r"\s+", " ", str(task or "")).strip()
     if len(summary) > 24:
         summary = summary[:24] + "…"
-    sec = int(timeout or 180)
+    sec = int(timeout or DEFAULT_TIMEOUT)
     if summary:
         return "〔系统｜已启动后台工具：{} · 限时 {}s〕".format(summary, sec)
     return "〔系统｜已启动后台工具 · 限时 {}s〕".format(sec)
@@ -792,7 +792,7 @@ class Brain:
 
     def _build_codex_task(self, prompt):
         """拼装 Codex 任务指令并显式注入当前超时预算与调研交卷线。"""
-        timeout = getattr(self.harness, "timeout", 180)
+        timeout = getattr(self.harness, "timeout", DEFAULT_TIMEOUT)
         wrap_up = max(15, int(timeout) - 25)
         budget_hint = (
             "（本次任务总限时 {} 秒，请务必在 {} 秒前结束检索并整理交卷，"
@@ -844,7 +844,7 @@ class Brain:
             ack = ""
 
         if using_harness:
-            notice = _format_harness_notice(task, getattr(self.harness, "timeout", 180))
+            notice = _format_harness_notice(task, getattr(self.harness, "timeout", DEFAULT_TIMEOUT))
             reply_text = "{}\n{}".format(ack, notice) if ack else notice
         else:
             reply_text = ack or "我瞅瞅，等会儿"
@@ -1030,7 +1030,7 @@ class Brain:
 
     def _build_delivery_row(self, task, group, umo, pre_history=None):
         outbox_root = getattr(self.harness, "outbox_root", "") if self.harness else ""
-        timeout_s = getattr(self.harness, "timeout", 180)
+        timeout_s = getattr(self.harness, "timeout", DEFAULT_TIMEOUT)
         secrets = self._secrets()
         raw_files = list(task.get("files") or [])
         files = self._filter_valid_outbox_files(raw_files, outbox_root) if outbox_root else raw_files

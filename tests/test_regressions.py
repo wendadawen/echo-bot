@@ -847,7 +847,7 @@ class TestIncidentRegressions(unittest.TestCase):
             dispatched = brain._dispatch_task("g1", "写一个电影控制台网页发我", "demo:group-1")
             self.assertEqual("task", dispatched["reason"])
             # 确认调用 Harness 时带系统风格调用提示并记入历史库，保证后续问答连贯
-            expected_notice = "〔系统｜已启动后台工具：写一个电影控制台网页发我 · 限时 180s〕"
+            expected_notice = "〔系统｜已启动后台工具：写一个电影控制台网页发我 · 限时 300s〕"
             self.assertEqual(expected_notice, dispatched["text"])
             self.assertEqual(expected_notice, store.recent("g1", 5)[-1]["text"])
 
@@ -1283,11 +1283,12 @@ class TestIncidentRegressions(unittest.TestCase):
         self.assertNotIn("收到啦", joined)
 
     def test_timeout_budget_prompt_and_task_timeout_schema(self):
-        h = CodexHarness(binary="/bin/true", home="/tmp/h", workdir_root="/tmp/w", timeout=180)
+        h = CodexHarness(binary="/bin/true", home="/tmp/h", workdir_root="/tmp/w")
+        self.assertEqual(300, h.timeout)
         brain = Brain(Store(":memory:"), MockModel(), harness=h)
         built = brain._build_codex_task("调研 MoE offloading")
-        self.assertIn("180 秒", built)
-        self.assertIn("155 秒", built)
+        self.assertIn("300 秒", built)
+        self.assertIn("275 秒", built)
         self.assertIn("./outbox/", built)
 
         schema_path = (
@@ -1297,7 +1298,8 @@ class TestIncidentRegressions(unittest.TestCase):
         schema = json.loads(schema_path.read_text(encoding="utf-8"))
         self.assertIn("task_timeout", schema)
         self.assertEqual("int", schema["task_timeout"]["type"])
-        self.assertEqual(180, schema["task_timeout"]["default"])
+        self.assertEqual(300, schema["task_timeout"]["default"])
+        self.assertIn("180-600", schema["task_timeout"]["hint"])
 
         self.assertIn("严禁在纯 reply 里口头承诺", ACTION_PROMPT)
         self.assertIn('"reply"', ACTION_PROMPT)
