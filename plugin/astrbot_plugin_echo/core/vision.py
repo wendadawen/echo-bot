@@ -28,18 +28,46 @@ GRID_PROMPT = (
     "不要解释。要表达的情绪是：{}"
 )
 FILTER_WORDS = ("二维码", "付款码", "身份证", "验证码", "密码", "银行卡号")
+FACE_LABELS = {
+    "1": "撇嘴", "2": "色", "4": "得意", "5": "流泪", "6": "害羞", "9": "大哭",
+    "13": "呲牙", "14": "微笑", "20": "偷笑", "21": "可爱", "28": "憨笑", "66": "爱心",
+    "74": "太阳", "76": "赞", "79": "握手", "99": "鼓掌", "178": "斜眼笑", "179": "doge",
+    "182": "笑哭", "212": "托腮", "277": "汪汪", "285": "摸鱼", "297": "拜谢", "319": "比心",
+}
+
+
+def _detect_image_format(image_bytes):
+    """按文件魔数识别真实图片 MIME 与后缀，避免误标 png。"""
+    raw = bytes(image_bytes or b"")
+    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png", ".png"
+    if raw.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg", ".jpg"
+    if raw.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif", ".gif"
+    if len(raw) >= 12 and raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return "image/webp", ".webp"
+    if raw.startswith(b"BM"):
+        return "image/bmp", ".bmp"
+    return "image/jpeg", ".jpg"
 
 
 def _data_uri(image_bytes):
-    return "data:image/png;base64," + base64.b64encode(image_bytes).decode("ascii")
+    mime, _ = _detect_image_format(image_bytes)
+    return "data:{};base64,".format(mime) + base64.b64encode(image_bytes).decode("ascii")
 
 
 def describe(model, image_bytes, hint=DESCRIBE_PROMPT):
     """调用模型视觉能力；失败返回空串，不抛到群里。"""
     if not image_bytes:
         return ""
+    prompt = str(hint or "").strip()
+    if not prompt:
+        prompt = DESCRIBE_PROMPT
+    elif prompt != DESCRIBE_PROMPT and "一句话" not in prompt:
+        prompt = "重点看「{}」。{}".format(prompt[:80], DESCRIBE_PROMPT)
     try:
-        return model.vision_reply(hint, _data_uri(image_bytes))
+        return model.vision_reply(prompt, _data_uri(image_bytes))
     except Exception:
         return ""
 
@@ -248,7 +276,8 @@ class EmojiBank:
         return folder
 
     def _store_entry(self, group_id, image_bytes, digest, label, description, cap, now):
-        path = self._folder(group_id) / "{}_{}.png".format(int(now * 1000), digest[:8])
+        _, ext = _detect_image_format(image_bytes)
+        path = self._folder(group_id) / "{}_{}{}".format(int(now * 1000), digest[:8], ext)
         path.write_bytes(image_bytes)
         entries = self._index.setdefault(group_id, [])
         entries.append({
@@ -348,7 +377,7 @@ class EmojiBank:
                     item["ts"] = time.time()
                     self._save()
                     return item.get("tag") or "表情"
-            label = str(name or "QQ表情")[:20]
+            label = str(name or FACE_LABELS.get(face_id) or "QQ表情")[:20]
             entries.append({
                 "face_id": face_id, "tag": label, "description": label,
                 "ts": time.time(),
@@ -360,20 +389,41 @@ class EmojiBank:
             self._save()
             return label
 
+    @staticmethod
+    def _keyword_terms(keyword):
+        raw = str(keyword or "").strip().lower()
+        if not raw:
+            return []
+        terms = list(dict.fromkeys(re.findall(r"[a-z0-9]{2,}", raw)))
+        for span in re.findall(r"[\u4e00-\u9fff]+", raw):
+            if len(span) == 1:
+                if span not in terms:
+                    terms.append(span)
+            else:
+                for i in range(len(span) - 1):
+                    bg = span[i:i + 2]
+                    if bg not in terms:
+                        terms.append(bg)
+                if len(span) <= 3:
+                    for ch in span:
+                        if ch not in terms:
+                            terms.append(ch)
+        return terms
+
     def candidates(self, group_id, keyword=""):
         with self._lock:
             entries = list(self._index.get(group_id) or [])
+        terms = self._keyword_terms(keyword)
         rows = []
         for item in entries:
             path = self._safe_path(item.get("path"))
             if path is None:
                 continue
             score = 0.0
-            text = "{} {}".format(item.get("tag", ""), item.get("description", ""))
-            if keyword:
-                for word in re.findall(r"[\u4e00-\u9fff]{2,}|[a-z0-9]{3,}", keyword):
-                    if word in text:
-                        score += 1.0
+            text = "{} {}".format(item.get("tag", ""), item.get("description", "")).lower()
+            for word in terms:
+                if word in text:
+                    score += 1.0 if len(word) >= 2 else 0.3
             rows.append((score + item.get("ts", 0) / 1e12, path))
         rows.sort(key=lambda pair: pair[0], reverse=True)
         out = []
@@ -395,13 +445,16 @@ class EmojiBank:
         ]
         if not entries:
             return None
-        if keyword:
-            words = re.findall(r"[\u4e00-\u9fff]{2,}|[a-z0-9]{3,}", keyword)
+        terms = self._keyword_terms(keyword)
+        if terms:
             matched = [
                 item for item in entries
-                if any(word in "{} {}".format(item.get("tag", ""),
-                                               item.get("description", ""))
-                       for word in words)
+                if any(
+                    word in "{} {}".format(
+                        item.get("tag", ""), item.get("description", "")
+                    ).lower()
+                    for word in terms
+                )
             ]
             if matched:
                 entries = matched
@@ -420,7 +473,10 @@ class EmojiBank:
                 index = grid_pick(model, candidates, keyword or "随手")
                 if index is not None and 0 <= index < len(candidates):
                     return candidates[index][0]
-        pool = images + [item for item in entries if item.get("face_id")]
+        pool = sorted(
+            images + [item for item in entries if item.get("face_id")],
+            key=lambda x: float(x.get("ts") or 0.0),
+        )
         if not pool:
             return None
         picked = random.choice(pool[-8:])

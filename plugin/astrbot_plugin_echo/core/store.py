@@ -98,16 +98,21 @@ class Store:
 
     def add_message(self, group_id, user_id, user_name, role, text, ts=None):
         ts = time.time() if ts is None else ts
-        with self._lock, self._db:
-            cur = self._db.execute(
-                "INSERT INTO messages(group_id, user_id, user_name, role, text, ts) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (group_id, user_id, user_name, role, text, ts),
-            )
-            return cur.lastrowid
+        with self._lock:
+            if self._closed:
+                return 0
+            with self._db:
+                cur = self._db.execute(
+                    "INSERT INTO messages(group_id, user_id, user_name, role, text, ts) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (group_id, user_id, user_name, role, text, ts),
+                )
+                return cur.lastrowid
 
     def recent(self, group_id, n=DEFAULT_HISTORY_LIMIT):
         with self._lock:
+            if self._closed:
+                return []
             rows = self._db.execute(
                 "SELECT * FROM messages WHERE group_id = ? ORDER BY seq DESC LIMIT ?",
                 (group_id, max(0, int(n))),
@@ -117,6 +122,8 @@ class Store:
     def since(self, group_id, ts=0.0, limit=30):
         """按时间顺序取 ts 之后的群消息，供多轮记忆摘要窗口使用。"""
         with self._lock:
+            if self._closed:
+                return []
             rows = self._db.execute(
                 "SELECT * FROM messages WHERE group_id = ? AND ts > ? "
                 "ORDER BY seq DESC LIMIT ?",
@@ -126,16 +133,21 @@ class Store:
 
     def add_reminder(self, group_id, user_id, user_name, text, due_at, umo="", repeat="",
                      last_fired=""):
-        with self._lock, self._db:
-            cur = self._db.execute(
-                "INSERT INTO reminders(group_id, user_id, user_name, text, due_at, umo, repeat, last_fired) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (group_id, user_id, user_name, text, due_at, umo, repeat, str(last_fired or "")),
-            )
-            return cur.lastrowid
+        with self._lock:
+            if self._closed:
+                return 0
+            with self._db:
+                cur = self._db.execute(
+                    "INSERT INTO reminders(group_id, user_id, user_name, text, due_at, umo, repeat, last_fired) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (group_id, user_id, user_name, text, due_at, umo, repeat, str(last_fired or "")),
+                )
+                return cur.lastrowid
 
     def pending_reminders(self, group_id):
         with self._lock:
+            if self._closed:
+                return []
             rows = self._db.execute(
                 "SELECT * FROM reminders WHERE group_id = ? AND done = 0 ORDER BY due_at",
                 (group_id,),
@@ -145,6 +157,8 @@ class Store:
     def due_reminders(self, now=None):
         now = time.time() if now is None else now
         with self._lock:
+            if self._closed:
+                return []
             rows = self._db.execute(
                 "SELECT * FROM reminders WHERE done = 0 "
                 "AND ((repeat = '' AND due_at <= ?) OR repeat <> '') ORDER BY due_at",
@@ -152,19 +166,64 @@ class Store:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def peek_due_reminders(self, now=None):
+        """读取到期未完成的提醒但不立即提交完成，供先发后记流程使用。"""
+        return self.due_reminders(now)
+
     def mark_reminder_done(self, rid):
-        with self._lock, self._db:
-            self._db.execute("UPDATE reminders SET done = 1 WHERE id = ?", (rid,))
+        with self._lock:
+            if self._closed:
+                return False
+            with self._db:
+                cur = self._db.execute("UPDATE reminders SET done = 1 WHERE id = ?", (rid,))
+                return cur.rowcount > 0
 
     def mark_reminder_fired(self, rid, day):
-        with self._lock, self._db:
-            self._db.execute("UPDATE reminders SET last_fired = ? WHERE id = ?", (day, rid))
+        with self._lock:
+            if self._closed:
+                return False
+            with self._db:
+                cur = self._db.execute("UPDATE reminders SET last_fired = ? WHERE id = ?", (day, rid))
+                return cur.rowcount > 0
+
+    def reschedule_reminder(self, rid, due_at):
+        """发送失败时推迟一次性提醒重试时间，避免丢失或紧循环重试。"""
+        with self._lock:
+            if self._closed:
+                return False
+            with self._db:
+                cur = self._db.execute(
+                    "UPDATE reminders SET due_at = ? WHERE id = ? AND done = 0",
+                    (float(due_at), int(rid)),
+                )
+                return cur.rowcount > 0
+
+    def cancel_reminder(self, rid, group_id=""):
+        """按提醒 id（可选按群隔离）取消尚未完成的一次性/每日提醒。"""
+        with self._lock:
+            if self._closed:
+                return False
+            with self._db:
+                if group_id:
+                    cur = self._db.execute(
+                        "UPDATE reminders SET done = 1 WHERE id = ? AND group_id = ? AND done = 0",
+                        (int(rid), str(group_id)),
+                    )
+                else:
+                    cur = self._db.execute(
+                        "UPDATE reminders SET done = 1 WHERE id = ? AND done = 0",
+                        (int(rid),),
+                    )
+                return cur.rowcount > 0
 
     def clear_messages(self, group_id):
         """清空本群聊天记录（提醒与记忆不动）。"""
-        with self._lock, self._db:
-            cur = self._db.execute("DELETE FROM messages WHERE group_id = ?", (group_id,))
-            return cur.rowcount
+        with self._lock:
+            if self._closed:
+                return 0
+            with self._db:
+                cur = self._db.execute("DELETE FROM messages WHERE group_id = ?", (group_id,))
+                return cur.rowcount
 
     def prune_messages(self, keep_per_group=DEFAULT_MAX_MESSAGES_PER_GROUP):
         """按群保留最新 N 条群消息，定期裁掉过期原文并做轻度 WAL 检查点。"""
@@ -394,6 +453,12 @@ def cleanup_runtime_caches(data_root, now=None, temp_max_age=86400, media_max_ag
     removed += _purge_old_files(
         root / "temp", root, resolved_root, temp_cutoff, pattern="media_*", recursive=False
     )
+
+    napcat_cutoff = now_ts - 7 * 86400
+    for sub in ("logs", "cache"):
+        removed += _purge_old_files(
+            root / "napcat" / sub, root, resolved_root, napcat_cutoff, recursive=True
+        )
 
     qq_dir = root / "napcat" / "home" / ".config" / "QQ"
     if qq_dir.is_dir() and not qq_dir.is_symlink() and not _has_symlink_component(root, qq_dir):

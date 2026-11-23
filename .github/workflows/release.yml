@@ -18,6 +18,21 @@ jobs:
           python-version: "3.12"
       - name: 校验插件结构
         run: python tools/validate_plugin.py
+      - name: 运行单元测试与版本一致性检查
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          python -m unittest discover -s tests -p "test_*.py"
+          python - <<'PY'
+          import os, re, sys
+          from pathlib import Path
+          tag = os.environ["TAG_NAME"].strip()
+          text = Path("plugin/astrbot_plugin_echo/metadata.yaml").read_text(encoding="utf-8")
+          m = re.search(r"^version:\s*(\S+)", text, re.M)
+          ver = m.group(1) if m else ""
+          if ver.lstrip("v") != tag.lstrip("v"):
+              sys.exit(f"metadata.yaml version ({ver}) != git tag ({tag})")
+          PY
       - name: 打包插件
         run: python tools/package_plugin.py
       - name: 创建 GitHub Release

@@ -60,6 +60,10 @@ ACTION_PROMPT = (
 
 MAX_ROUNDS = 6
 RESULT_LIMIT = 260
+RESULT_STORE_LIMIT = 800
+MAX_PARAM_TEXT = 300
+MAX_SUBAGENT_TEXT = 1200
+MAX_REPLY_TEXT = 2000
 _CTRL_PATTERN = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
@@ -92,7 +96,15 @@ def _looks_like_control_json(raw):
     text = _strip_code_fence(raw)
     if not text:
         return False
-    return text.startswith("{") and ('"action"' in text or "'action'" in text)
+    return bool(re.search(r"""\{\s*['"]action['"]\s*:""", text))
+
+
+def _payload_limit(action):
+    if action == "reply":
+        return MAX_REPLY_TEXT
+    if action == "subagent":
+        return MAX_SUBAGENT_TEXT
+    return MAX_PARAM_TEXT
 
 
 def parse(raw):
@@ -122,7 +134,12 @@ def parse_full(raw):
             continue
         if isinstance(data, dict) and data.get("action") in ACTIONS:
             action = data["action"]
-            text = str(data.get("text") or data.get("seconds") or "").strip()[:300]
+            if action == "wait":
+                raw_val = data.get("seconds") if data.get("seconds") is not None else data.get("text")
+            else:
+                raw_val = data.get("text") if data.get("text") is not None else data.get("seconds")
+            limit = _payload_limit(action)
+            text = str(raw_val if raw_val is not None else "").strip()[:limit]
             reply = str(data.get("reply") or "").strip()[:120]
             return {"action": action, "text": text, "seconds": data.get("seconds"), "reply": reply}
         idx = max(pos + 1, end)
@@ -132,11 +149,13 @@ def parse_full(raw):
 def validate(action, payload, scene="group", capabilities=None, reply=""):
     """参数校验：防住明显不合法的动作、超长与控制字符输入。"""
     if action not in available(scene, capabilities):
+        if action in ("silent", "wait") and capabilities is not None and not capabilities.get("silent", True):
+            return False, "有人明确点到了你，请直接 reply 或 subagent，不要 silent 或 wait"
         return False, "这个动作在当前场景不可用"
     spec = ACTION_SPECS[action]
-    if spec[1] == "text" and not payload and action != "view_image":
+    if spec[1] == "text" and not payload and action not in ("view_image", "read_result"):
         return False, "缺少参数"
-    if len(payload) > 300:
+    if len(payload) > _payload_limit(action):
         return False, "参数过长"
     if _CTRL_PATTERN.search(payload) or (reply and _CTRL_PATTERN.search(str(reply))):
         return False, "参数含控制字符"
@@ -171,7 +190,7 @@ class ToolResultStore:
 
     def add(self, group_id, action, result):
         with self._lock:
-            self._rows.append((group_id, action, condense(result)))
+            self._rows.append((group_id, action, condense(result, limit=RESULT_STORE_LIMIT)))
             del self._rows[:-self.limit]
             return len(self._rows)
 
@@ -180,9 +199,13 @@ class ToolResultStore:
             rows = [r for r in self._rows if r[0] == group_id]
         if index is None or str(index).strip() == "":
             return rows[-1][2] if rows else ""
+        key = str(index).strip()
         try:
-            return rows[int(index)][2]
+            return rows[int(key)][2]
         except (ValueError, IndexError, TypeError):
+            for _, action, text in reversed(rows):
+                if action == key:
+                    return text
             return ""
 
     def recent(self, group_id, limit=3):
@@ -191,17 +214,17 @@ class ToolResultStore:
         return ["[{}] {}".format(action, text) for _, action, text in rows[-limit:]]
 
 
-def judge(action, payload, history, last_action):
+def judge(action, payload, history, last_action, allow_silent=True):
     """动作合理性判定：避免连续 wait、空回复、复读同一句。"""
     if action == "wait" and last_action == "wait":
-        return "silent", ""
+        return ("reply", "嗯，你们继续聊") if not allow_silent else ("silent", "")
     if action == "reply":
         if not payload:
+            return ("silent", "") if allow_silent else ("reply", "在呢。")
+        if allow_silent and history and payload.strip() == str(history[-1]).strip():
             return "silent", ""
-        if history and payload.strip() == str(history[-1]).strip():
-            return "silent", ""
-        if len(payload) > 300:
-            return "reply", payload[:300]
+        if len(payload) > MAX_REPLY_TEXT:
+            return "reply", payload[:MAX_REPLY_TEXT]
     return action, payload
 
 
@@ -229,10 +252,18 @@ class ToolLoop:
             capabilities=None):
         self._set_error("")
         caps = self.capabilities if capabilities is None else capabilities
+        allow_silent = bool(caps is None or caps.get("silent", True))
+        bot_replies = [
+            str(h.get("text") or "")
+            for h in (history or ())
+            if isinstance(h, dict) and h.get("role") == "bot"
+        ]
         prompt = system + "\n\n" + render_prompt(scene, caps)
         observations = []
         last_action = None
+        rounds = 0
         for _ in range(self.max_rounds):
+            rounds += 1
             round_prompt = prompt
             if observations:
                 round_prompt += "\n\n前几轮工具结果：\n" + "\n".join(observations[-3:])
@@ -247,14 +278,13 @@ class ToolLoop:
                     observations.append("[格式错误] JSON 不合法或未闭合，请输出完整单行 JSON")
                     continue
                 # 模型按普通口语直答时当作普通回复。
-                return {"action": "reply", "text": str(raw or "").strip()[:300]}
+                return {"action": "reply", "text": str(raw or "").strip()[:MAX_REPLY_TEXT], "rounds": rounds}
             action, payload = full["action"], full["text"]
             ok, reason = validate(action, payload, scene, capabilities=caps, reply=full.get("reply", ""))
             if not ok:
                 observations.append("[校验失败] {}".format(reason))
-                last_action = action
                 continue
-            action, payload = judge(action, payload, observations, last_action)
+            action, payload = judge(action, payload, bot_replies, last_action, allow_silent=allow_silent)
             last_action = action
             if action == "read_result":
                 observations.append("[read_result] {}".format(
@@ -262,14 +292,14 @@ class ToolLoop:
                 continue
             spec = ACTION_SPECS[action]
             if spec[2]:  # 终态
-                out = {"action": action, "text": payload}
+                out = {"action": action, "text": payload, "rounds": rounds}
                 if full.get("reply"):
                     out["reply"] = full["reply"]
                 return out
             done, result = executor(group_id, action, payload)
             text = condense(result)
-            self.results.add(group_id, action, text)
+            self.results.add(group_id, action, result)
             observations.append("[{}] {}".format(action, text))
             if done:
-                return {"action": "reply", "text": text[:300]}
-        return {"action": "silent", "text": ""}
+                return {"action": "reply", "text": text[:MAX_REPLY_TEXT], "rounds": rounds}
+        return {"action": "silent", "text": "", "rounds": rounds}

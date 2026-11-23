@@ -61,16 +61,8 @@ elif mode == "tar_plugin":
             for m in tf.getmembers():
                 if m.name.startswith("/") or ".." in PurePosixPath(m.name).parts:
                     sys.exit(5)
-                if m.ischr() or m.isblk() or m.isfifo() or m.islnk() or m.isdev():
+                if m.ischr() or m.isblk() or m.isfifo() or m.issym() or m.islnk() or m.isdev():
                     sys.exit(6)
-                if m.issym():
-                    if m.linkname.startswith("/"):
-                        sys.exit(7)
-                    norm = posixpath.normpath(
-                        posixpath.join(posixpath.dirname(m.name.lstrip("./")), m.linkname)
-                    )
-                    if norm == ".." or norm.startswith("../"):
-                        sys.exit(7)
                 parts = PurePosixPath(m.name).parts
                 if m.isfile() and len(parts) == 2 and parts[1] == "metadata.yaml":
                     found_metadata = True
@@ -215,28 +207,20 @@ JS
   echo "[bootstrap] 客户端装好了"
 fi
 
-# 若未显式指定 ONEBOT_TOKEN，自动生成 32 字节随机密钥并持久化在命名卷里，避免容器内无鉴权 WS。
-token_file="$CACHE/onebot_token"
-effective_token="${ONEBOT_TOKEN:-}"
-if [[ -z "$effective_token" ]]; then
-  if [[ -s "$token_file" ]]; then
-    effective_token="$(tr -d '[:space:]' < "$token_file")"
-  else
-    effective_token="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
-    printf '%s\n' "$effective_token" > "${token_file}.part"
-    chmod 600 "${token_file}.part"
-    mv -f "${token_file}.part" "$token_file"
-  fi
-fi
-
-# NapCat 的反向 WebSocket 连到同一个容器里的 AstrBot；通过环境变量传密文，不进命令行 argv。
-ONEBOT_TOKEN_EFFECTIVE="$effective_token" BOT_QQ_VALUE="${BOT_QQ:-}" python3 - "$NC/config" <<'PY'
-import json, os, sys
+# 单一事实来源管理 OneBot 鉴权 Token，写 NapCat webui / onebot11 配置并同步 AstrBot cmd_config.json。
+NAPCAT_WEBUI_TOKEN_ENV="${NAPCAT_WEBUI_TOKEN:-}" \
+ONEBOT_TOKEN_ENV="${ONEBOT_TOKEN:-}" \
+BOT_QQ_VALUE="${BOT_QQ:-}" \
+python3 - "$CACHE/onebot_token" "$NC/config" "/AstrBot/data/cmd_config.json" <<'PY'
+import copy, importlib, json, os, secrets, sys
 from pathlib import Path
 
-cfg_dir = Path(sys.argv[1])
-token = os.environ.get("ONEBOT_TOKEN_EFFECTIVE", "")
-qq = os.environ.get("BOT_QQ_VALUE", "")
+token_path = Path(sys.argv[1])
+nc_cfg_dir = Path(sys.argv[2])
+cmd_cfg_path = Path(sys.argv[3])
+env_token = os.environ.get("ONEBOT_TOKEN_ENV", "").strip()
+webui_token = os.environ.get("NAPCAT_WEBUI_TOKEN_ENV", "").strip()
+qq = os.environ.get("BOT_QQ_VALUE", "").strip()
 
 def atomic_write_secret(path, text):
     tmp = path.with_name(path.name + ".tmp")
@@ -245,6 +229,61 @@ def atomic_write_secret(path, text):
         fh.write(text)
     os.chmod(str(tmp), 0o600)
     os.replace(str(tmp), str(path))
+
+if webui_token:
+    webui_path = nc_cfg_dir / "webui.json"
+    webui_cfg = {}
+    if webui_path.exists():
+        try:
+            loaded = json.loads(webui_path.read_text(encoding="utf-8-sig"))
+            if isinstance(loaded, dict):
+                webui_cfg = loaded
+        except Exception:
+            webui_cfg = {}
+    if webui_cfg.get("token") != webui_token:
+        webui_cfg["token"] = webui_token
+        atomic_write_secret(webui_path, json.dumps(webui_cfg, ensure_ascii=False, indent=2) + "\n")
+
+try:
+    cmd_cfg = json.loads(cmd_cfg_path.read_text(encoding="utf-8-sig"))
+    cmd_cfg_loaded = True
+except FileNotFoundError:
+    cmd_cfg_loaded = False
+    try:
+        mod = importlib.import_module("astrbot.core.config.default")
+        found = [getattr(mod, n) for n in dir(mod)
+                 if isinstance(getattr(mod, n, None), dict) and "platform" in getattr(mod, n)]
+        cmd_cfg = copy.deepcopy(found[0]) if found else None
+    except Exception:
+        cmd_cfg = None
+
+cached_token = ""
+if token_path.is_file():
+    try:
+        cached_token = token_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        cached_token = ""
+
+cmd_token = ""
+if isinstance(cmd_cfg, dict):
+    for p in cmd_cfg.get("platform") or []:
+        if isinstance(p, dict) and p.get("type") == "aiocqhttp":
+            t = str(p.get("ws_reverse_token") or "").strip()
+            if t:
+                cmd_token = t
+                break
+
+if env_token:
+    token = env_token
+elif cached_token:
+    token = cached_token
+elif cmd_token:
+    token = cmd_token
+else:
+    token = secrets.token_hex(24)
+
+if token != cached_token or not token_path.exists():
+    atomic_write_secret(token_path, token + "\n")
 
 client = {
     "enable": True,
@@ -257,7 +296,7 @@ client = {
     "debug": False,
     "heartInterval": 30000,
 }
-config = {
+default_nc_cfg = {
     "network": {
         "httpServers": [], "httpSseServers": [], "httpClients": [],
         "websocketServers": [], "websocketClients": [client], "plugins": [],
@@ -265,49 +304,60 @@ config = {
     "musicSignUrl": "", "enableLocalFile2Url": False,
     "parseMultMsg": False, "imageDownloadProxy": "",
 }
-names = ["onebot11.json"] + ([f"onebot11_{qq}.json"] if qq.isdigit() else [])
-for name in names:
-    path = cfg_dir / name
+target_nc_paths = {nc_cfg_dir / "onebot11.json"}
+if qq.isdigit():
+    target_nc_paths.add(nc_cfg_dir / f"onebot11_{qq}.json")
+for existing in nc_cfg_dir.glob("onebot11*.json"):
+    if existing.is_file() and not existing.name.endswith(".tmp"):
+        target_nc_paths.add(existing)
+
+for path in sorted(target_nc_paths):
     if not path.exists():
-        atomic_write_secret(path, json.dumps(config, ensure_ascii=False, indent=2) + "\n")
-PY
-
-# 把 OneBot v11 平台补进面板配置，限定容器内环回监听并对齐鉴权 Token。
-ONEBOT_TOKEN_EFFECTIVE="$effective_token" python3 - <<'PY'
-import copy, importlib, json, os
-from pathlib import Path
-
-path = Path("/AstrBot/data/cmd_config.json")
-token = os.environ.get("ONEBOT_TOKEN_EFFECTIVE", "")
-
-def atomic_write_secret(target, text):
-    tmp = target.with_name(target.name + ".tmp")
-    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(text)
-    os.chmod(str(tmp), 0o600)
-    os.replace(str(tmp), str(target))
-
-try:
-    cfg = json.loads(path.read_text(encoding="utf-8-sig"))
-except FileNotFoundError:
+        atomic_write_secret(path, json.dumps(default_nc_cfg, ensure_ascii=False, indent=2) + "\n")
+        continue
     try:
-        mod = importlib.import_module("astrbot.core.config.default")
-        found = [getattr(mod, n) for n in dir(mod)
-                 if isinstance(getattr(mod, n, None), dict) and "platform" in getattr(mod, n)]
-        cfg = copy.deepcopy(found[0]) if found else None
+        nc_cfg = json.loads(path.read_text(encoding="utf-8-sig"))
     except Exception:
-        cfg = None
+        continue
+    if not isinstance(nc_cfg, dict):
+        continue
+    clients = (nc_cfg.get("network") or {}).get("websocketClients")
+    if isinstance(clients, list):
+        nc_changed = False
+        for c in clients:
+            if isinstance(c, dict) and (c.get("name") == "AstrBot" or ":6199" in str(c.get("url") or "")):
+                if c.get("token") != token:
+                    c["token"] = token
+                    nc_changed = True
+        if nc_changed:
+            atomic_write_secret(path, json.dumps(nc_cfg, ensure_ascii=False, indent=2) + "\n")
 
-if cfg is None:
+if cmd_cfg is None:
     print("[bootstrap] 面板配置还没生成，若没看到 OneBot 平台请手动添加一次")
 else:
-    platforms = cfg.setdefault("platform", [])
-    if not any(isinstance(x, dict) and x.get("type") == "aiocqhttp" for x in platforms):
+    cfg_changed = not cmd_cfg_loaded
+    platforms = cmd_cfg.setdefault("platform", [])
+    matched = [x for x in platforms if isinstance(x, dict) and x.get("type") == "aiocqhttp"]
+    if not matched:
         platforms.append({
             "id": "napcat", "type": "aiocqhttp", "enable": True,
             "ws_reverse_host": "127.0.0.1", "ws_reverse_port": 6199,
             "ws_reverse_token": token,
         })
-        atomic_write_secret(path, json.dumps(cfg, ensure_ascii=False, indent=2) + "\n")
+        cfg_changed = True
+    else:
+        for p in matched:
+            if p.get("ws_reverse_token") != token:
+                p["ws_reverse_token"] = token
+                cfg_changed = True
+    ps = cmd_cfg.setdefault("platform_settings", {})
+    if isinstance(ps, dict):
+        if ps.get("empty_mention_waiting") is not False:
+            ps["empty_mention_waiting"] = False
+            cfg_changed = True
+        if ps.get("empty_mention_waiting_need_reply") is not False:
+            ps["empty_mention_waiting_need_reply"] = False
+            cfg_changed = True
+    if cfg_changed:
+        atomic_write_secret(cmd_cfg_path, json.dumps(cmd_cfg, ensure_ascii=False, indent=2) + "\n")
 PY

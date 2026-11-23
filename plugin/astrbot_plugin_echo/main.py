@@ -5,11 +5,14 @@ AstrBot 插件入口：只负责把平台事件转成批次、把核心层的动
 """
 
 import asyncio
+import base64
 import collections
 import ipaddress
 import os
 import re
 import socket
+import struct
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -22,17 +25,18 @@ from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.message_components import At, Face, File, Image, Plain, Reply
 from astrbot.api.star import Context, Star, StarTools
 
+from .core import mentions
 from .core.attention import AttentionTracker
-from .core.brain import PERSONA, Brain
+from .core.brain import DEFAULT_HISTORY_LIMIT, PERSONA, Brain
 from .core.display import MessageLimiter, clean
 from .core.forward import extract as forward_extract
 from .core.forward import looks_like_forward
 from .core.forward import render as forward_render
 from .core.heartbeat import Heartbeat
-from .core.harness import CodexHarness, cleanup_file_entry, cleanup_outbox
+from .core.harness import DEFAULT_TIMEOUT, CodexHarness, cleanup_file_entry, cleanup_outbox
 from .core.memory import Memory
 from .core.messages import Message, format_speaker_message
-from .core.models import build_model
+from .core.models import MockModel, build_model, resolve_model_config
 from .core.modes import ModePolicy
 from .core.monitor import Monitor
 from .core.person_info import PersonStore
@@ -109,6 +113,25 @@ def _looks_like_image(data: bytes) -> bool:
     return False
 
 
+def _is_sticker_image(part, data: bytes) -> bool:
+    """区分表情包与普通截图/照片，避免大截图混入表情包仓库。"""
+    sub_type = getattr(part, "subType", None)
+    if sub_type is None:
+        sub_type = getattr(part, "sub_type", None)
+    summary = str(getattr(part, "summary", "") or "")
+    if "表情" in summary or str(sub_type or "") in ("1", "2", "sticker", "emoji"):
+        return True
+    if sub_type is not None and str(sub_type) == "0":
+        return False
+    if len(data) > 300 * 1024:
+        return False
+    if data.startswith(b"\x89PNG\r\n\x1a\n") and len(data) >= 24:
+        w, h = struct.unpack(">II", data[16:24])
+        if max(w, h) > 800:
+            return False
+    return True
+
+
 class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         hops = getattr(req, "_echo_hops", 0) + 1
@@ -147,22 +170,34 @@ class Echo(Star):
         self.schedule = Schedule(str(directory / "schedules.sqlite3"))
         self.heartbeat = Heartbeat()
         raw_timeout = self.config.get("task_timeout")
-        if raw_timeout is None or raw_timeout == "":
-            raw_timeout = os.environ.get("BOT_TASK_TIMEOUT")
-        api_base = str(self.config.get("api_base") or os.environ.get("BOT_API_BASE") or "").strip()
-        api_key = str(self.config.get("api_key") or os.environ.get("BOT_API_KEY") or "").strip()
-        model_name = str(self.config.get("model") or os.environ.get("BOT_MODEL") or "").strip()
-        self.harness = CodexHarness(
-            home=str(directory / "codex"),
-            workdir_root=str(directory / "harness"),
-            outbox_root=str(directory / "outbox"),
-            api_base=api_base,
-            api_key=api_key,
-            model=model_name,
-            timeout=raw_timeout,
+        env_timeout = os.environ.get("BOT_TASK_TIMEOUT")
+        if raw_timeout is None or raw_timeout == "" or (
+            env_timeout and str(raw_timeout).strip() == str(DEFAULT_TIMEOUT)
+        ):
+            raw_timeout = env_timeout
+        api_key, api_base, model_name = resolve_model_config(self.config)
+        harness_workdir = (
+            "/tmp/echo-harness"
+            if self._astrbot_data_root
+            else str(directory / "harness")
+        )
+        outbox_dir = str(directory / "outbox")
+        self._outbox_root = outbox_dir
+        self.harness = (
+            None
+            if isinstance(self.model, MockModel)
+            else CodexHarness(
+                home=str(directory / "codex"),
+                workdir_root=harness_workdir,
+                outbox_root=outbox_dir,
+                api_base=api_base,
+                api_key=api_key,
+                model=model_name,
+                timeout=raw_timeout,
+            )
         )
         cleanup_outbox(
-            self.harness.outbox_root,
+            outbox_dir,
             keep_paths=self.store.pending_delivery_paths(),
         )
         self.limiter = MessageLimiter(per_minute=8, per_burst=3)
@@ -171,10 +206,16 @@ class Echo(Star):
         self._emoji_cleanup_at = 0.0
         self._handled_turns = collections.OrderedDict()
         self._bg_tasks = set()
-        self._download_sem = asyncio.Semaphore(4)
+        self._group_locks = collections.defaultdict(asyncio.Lock)
+        self._pending_images = collections.defaultdict(list)
+        self._download_sem = None
         raw_history_limit = self.config.get("history_limit")
-        if raw_history_limit is None or raw_history_limit == "":
-            raw_history_limit = os.environ.get("BOT_HISTORY_LIMIT")
+        env_history_limit = os.environ.get("BOT_HISTORY_LIMIT")
+        if raw_history_limit is None or raw_history_limit == "" or (
+            env_history_limit and str(raw_history_limit).strip() == str(DEFAULT_HISTORY_LIMIT)
+        ):
+            raw_history_limit = env_history_limit
+        self.reminders_enabled = bool(self.config.get("reminder_enabled", True))
         self.brain = Brain(
             self.store,
             self.model,
@@ -182,8 +223,13 @@ class Echo(Star):
             memory=self.memory,
             emoji_bank=self.emoji_bank,
             char_frequency=str(directory / "char_frequency.json"),
-            capabilities={"view_image": True, "send_face": True,
-                          "schedule": True, "wait": True, "subagent": True},
+            capabilities={
+                "view_image": True,
+                "send_face": True,
+                "schedule": self.reminders_enabled,
+                "wait": True,
+                "subagent": not isinstance(self.model, MockModel),
+            },
             modes=self.modes,
             attention=self.attention,
             persons=self.persons,
@@ -194,8 +240,8 @@ class Echo(Star):
             schedule=self.schedule,
             harness=self.harness,
             history_limit=raw_history_limit,
+            reminders_enabled=self.reminders_enabled,
         )
-        self.reminders_enabled = bool(self.config.get("reminder_enabled", True))
         self._reminder_task = None
         self._chat_task = None
 
@@ -206,13 +252,18 @@ class Echo(Star):
         task.add_done_callback(self._bg_tasks.discard)
         return task
 
+    async def initialize(self):
+        """插件重载时（OnAstrBotLoadedEvent 不重发）拉起后台任务循环。"""
+        self._ensure_reminder_task()
+        self._ensure_chat_task()
+
     @filter.on_astrbot_loaded()
     async def on_loaded(self):
         self._ensure_reminder_task()
         self._ensure_chat_task()
 
     async def terminate(self):
-        """插件卸载时等待后台协程结束并关闭全部数据库连接。"""
+        """插件卸载时等待后台协程与摘要线程收尾，再关闭全部数据库连接。"""
         tasks = []
         for name in ("_reminder_task", "_chat_task"):
             task = getattr(self, name, None)
@@ -225,6 +276,13 @@ class Echo(Star):
             tasks.append(task)
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        brain = getattr(self, "brain", None)
+        wait_bg = getattr(brain, "wait_background", None)
+        if callable(wait_bg):
+            try:
+                await asyncio.to_thread(wait_bg, 2.0)
+            except Exception:
+                pass
         for attr in ("store", "memory", "persons", "monitor", "schedule"):
             db_obj = getattr(self, attr, None)
             close_fn = getattr(db_obj, "close", None)
@@ -234,39 +292,106 @@ class Echo(Star):
                 except Exception:
                     pass
 
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=10)
+    @staticmethod
+    def _extract_raw_text(event: AstrMessageEvent, parts) -> str:
+        """找回可能被 AstrBot WakingCheckStage 剥掉的开头命令前缀 / 或 ／。"""
+        msg_str = (event.get_message_str() or "").strip()
+        if msg_str.startswith(("/", "／")):
+            return msg_str
+        plain_str = "".join(
+            str(getattr(p, "text", "") or "")
+            for p in parts
+            if isinstance(p, Plain)
+        ).strip()
+        obj_str = str(getattr(getattr(event, "message_obj", None), "message_str", "") or "").strip()
+        for cand in (plain_str, obj_str):
+            stripped = cand.lstrip()
+            if stripped.startswith(("/", "／")):
+                if not msg_str or stripped[1:].strip() == msg_str:
+                    return stripped
+        return msg_str
+
+    @staticmethod
+    def _has_passthrough_component(parts) -> bool:
+        pass_types = {"json", "share", "poke", "record", "video", "music", "location"}
+        for part in parts:
+            cls_name = type(part).__name__.lower()
+            comp_type = str(getattr(part, "type", "") or "").lower()
+            if cls_name in pass_types or comp_type in pass_types:
+                return True
+        return False
+
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=sys.maxsize)
     async def on_group_message(self, event: AstrMessageEvent):
         """命令即时回；闲聊进防抖缓冲，由后台循环按批决策。"""
-        # 群聊完全由本插件接管，禁止 AstrBot 默认 LLM 再插一脚。
+        # 在 AstrBot v4.29.4 中 call_llm=True 表示模型请求已被接管，避免内置默认 LLM 再插一脚或报无模型错误。
         try:
-            event.should_call_llm(False)
+            event.should_call_llm(True)
         except Exception:
             pass
         self._ensure_reminder_task()
         self._ensure_chat_task()
+        # 非消息事件（通知/戳一戳等）原样放行。
+        raw_msg = getattr(getattr(event, "message_obj", None), "raw_message", None)
+        if isinstance(raw_msg, dict) and raw_msg.get("post_type") not in (None, "", "message"):
+            return
         sender = str(event.get_sender_id() or "")
         if not sender or sender == str(event.get_self_id() or ""):
             return
         raw_gid = str(event.get_group_id() or "").strip()
         if not raw_gid:
             return
-        text = (event.get_message_str() or "").strip()
+        parts = list(event.get_messages() or [])
+        text = self._extract_raw_text(event, parts)
         mentioned = self._mentioned(event, text)
-        # 合并转发：尽量把里面每条消息取出来，模型才看得懂。
+        # 合并转发：先直接拆包，拿不到节点内容再调用 OneBot get_forward_msg。
         forward_text = ""
-        for part in event.get_messages():
+        for part in parts:
             if looks_like_forward(part):
-                forward_text = forward_render(forward_extract(part))
+                lines = forward_extract(part)
+                if not lines:
+                    fid = str(getattr(part, "id", "") or "").strip()
+                    bot = getattr(event, "bot", None)
+                    call_action = getattr(bot, "call_action", None)
+                    if fid and callable(call_action):
+                        for key in ("id", "message_id"):
+                            try:
+                                res = await asyncio.wait_for(
+                                    call_action("get_forward_msg", **{key: fid}),
+                                    timeout=5.0,
+                                )
+                                lines = forward_extract(res)
+                                if lines:
+                                    break
+                            except Exception:
+                                continue
+                forward_text = forward_render(lines)
                 break
         group_id = "{}:{}".format(event.get_platform_name(), raw_gid)
-        # 含链接且未被 @：交给链接解析插件处理。
+        self.heartbeat.observe(group_id)
+        # 含链接且未被 @，或卡片/语音/戳一戳/视频等组件且无正文：放行给 link_resolver 等其它插件。
         if ("http://" in text or "https://" in text) and not mentioned:
             return
+        if not text and not forward_text and self._has_passthrough_component(parts):
+            return
         will_queue = bool(text or forward_text or mentioned)
-        # 表情/图片先收进仓库；纯未点名图片仅入库表情包，不挂载到未来批的看图队列。
+        # 表情/图片先收进仓库；纯未点名图片仅入库表情包，被 @ 引用里的图也一并拉取供看图。
         has_image = False
         collected_images = 0
-        for part in event.get_messages():
+
+        def _track_image(part_obj, attach_flag):
+            nonlocal collected_images
+            if collected_images >= 2:
+                return
+            collected_images += 1
+            bg = self._spawn_bg(self._collect_image(group_id, part_obj, attach=attach_flag))
+            self._pending_images[group_id].append(bg)
+            bg.add_done_callback(
+                lambda t, g=group_id: self._pending_images[g].remove(t)
+                if t in self._pending_images.get(g, ()) else None
+            )
+
+        for part in parts:
             if isinstance(part, Face):
                 if self.emoji_bank:
                     await asyncio.to_thread(
@@ -275,30 +400,36 @@ class Echo(Star):
                     )
             elif isinstance(part, Image):
                 has_image = True
-                if collected_images < 2:
-                    collected_images += 1
-                    self._spawn_bg(self._collect_image(group_id, part, attach=will_queue))
-        # 空消息：只有被 @ 且带图时当作看图入批，其余到此为止，别再流进框架内置 LLM。
+                _track_image(part, will_queue)
+            elif isinstance(part, Reply) and mentioned:
+                for qseg in getattr(part, "chain", None) or []:
+                    if isinstance(qseg, Image):
+                        has_image = True
+                        _track_image(qseg, True)
+        # 空消息：纯 @ 视作拍了拍自然回应；带图且被 @ 视作看图；无内容无 @ 直接拦截，避免触发默认 LLM。
         if not text and not forward_text:
-            if not (mentioned and has_image):
+            if mentioned and has_image:
+                text = "[图片]"
+            elif mentioned:
+                text = "（只 @ 了你一下，没说话）"
+            else:
                 event.stop_event()
                 return
-            text = "[图片]"
 
         umo = str(event.unified_msg_origin or "")
         user_name = str(event.get_sender_name() or sender)
         self._last_umo[group_id] = umo
-        self.heartbeat.observe(group_id)
         message = Message(group_id, sender, user_name, text, mentioned, umo)
         # 新消息提前唤醒 wait 倒计时。
         self.rhythm.wake(group_id)
 
-        # 命令必须带 / 或 ／ 前缀才拦截，避免日常聊天误触发；命中则不走防抖。
+        # 命令必须带 / 或 ／ 前缀才拦截，避免日常聊天误触发；命中则先 yield 再 stop_event 保证 RespondStage 发出。
         if text.startswith(("/", "／")):
             direct = await asyncio.to_thread(self.brain.command, message, text)
             if direct is not None:
-                event.stop_event()
+                self.heartbeat.observe(group_id)
                 yield event.plain_result(direct)
+                event.stop_event()
                 return
 
         quote_text = self._extract_quote(event)
@@ -311,37 +442,60 @@ class Echo(Star):
         return
 
     async def _collect_image(self, group_id, part, attach=True):
-        if not self.emoji_bank:
+        if not self.emoji_bank and not attach:
             return
-        url = str(getattr(part, "url", "") or "")
+        url = str(getattr(part, "url", "") or "").strip()
+        file_ref = str(getattr(part, "file", "") or "").strip()
+        path_ref = str(getattr(part, "path", "") or "").strip()
+        b64_ref = str(getattr(part, "base64", "") or "").strip()
         data = b""
+        if self._download_sem is None:
+            self._download_sem = asyncio.Semaphore(4)
         async with self._download_sem:
-            if url.startswith("http"):
-                try:
-                    data = await asyncio.to_thread(self._download, url)
-                except Exception as exc:
-                    logger.info("表情下载失败：%s", exc)
-            if not data:
-                path = str(getattr(part, "path", "") or "")
-                if path:
+            for remote_url in (url, file_ref):
+                if not data and remote_url.startswith(("http://", "https://")):
                     try:
-                        p = Path(path)
+                        data = await asyncio.to_thread(self._download, remote_url)
+                    except Exception as exc:
+                        logger.info("表情下载失败：%s", exc)
+            if not data:
+                for b64_src in (b64_ref, file_ref):
+                    if b64_src.startswith("base64://") and len(b64_src) < 3 * 1024 * 1024:
+                        try:
+                            data = base64.b64decode(b64_src[9:], validate=False)
+                        except Exception:
+                            data = b""
+                        break
+            if not data:
+                candidates = []
+                if path_ref:
+                    candidates.append(path_ref)
+                if file_ref.startswith("file://"):
+                    candidates.append(urllib.parse.unquote(urllib.parse.urlsplit(file_ref).path))
+                elif file_ref and not file_ref.startswith(("http://", "https://", "base64://")):
+                    candidates.append(file_ref)
+                for local_path in candidates:
+                    try:
+                        p = Path(local_path)
                         if not p.is_symlink() and p.is_file() and p.stat().st_size <= MAX_DOWNLOAD_BYTES:
                             data = await asyncio.to_thread(p.read_bytes)
+                            if data:
+                                break
                     except OSError:
                         data = b""
         if not _looks_like_image(data):
             return
         if attach:
             self.rhythm.attach_image(group_id, data)
-        try:
-            label = await asyncio.to_thread(
-                self.emoji_bank.collect, group_id, data, self.model
-            )
-            if label:
-                logger.info("表情已收：%s", label)
-        except Exception as exc:
-            logger.info("表情收集失败：%s", exc)
+        if self.emoji_bank and _is_sticker_image(part, data):
+            try:
+                label = await asyncio.to_thread(
+                    self.emoji_bank.collect, group_id, data, self.model
+                )
+                if label:
+                    logger.info("表情已收：%s", label)
+            except Exception as exc:
+                logger.info("表情收集失败：%s", exc)
 
     @staticmethod
     def _download(url):
@@ -382,13 +536,17 @@ class Echo(Star):
 
     def _mentioned(self, event: AstrMessageEvent, text: str) -> bool:
         self_id = str(event.get_self_id() or "")
+        has_at = False
+        has_reply = False
         for part in event.get_messages():
             if isinstance(part, At) and str(part.qq) == self_id:
-                return True
+                has_at = True
             # 引用机器人的消息，视为在跟它说话。
             if isinstance(part, Reply) and str(getattr(part, "sender_id", "")) == self_id:
-                return True
-        return text.startswith(("@大肥鱼", "@回声", "＠大肥鱼", "＠回声"))
+                has_reply = True
+        return mentions.detect(
+            text, at=has_at, reply=has_reply, self_names=("大肥鱼", "回声"),
+        ).mentioned
 
     def _ensure_chat_task(self):
         if self._chat_task is not None and not self._chat_task.done():
@@ -407,81 +565,112 @@ class Echo(Star):
         while len(self._handled_turns) > MAX_HANDLED_TURNS:
             self._handled_turns.popitem(last=False)
 
-    async def _chat_loop(self):
-        """防抖到期 → 查看概率与欠债 → 动作集决策 → 单条发送。
+    async def _process_batch(self, batch):
+        group = batch.group_id
+        async with self._group_locks[group]:
+            turn = getattr(batch, "turn_id", "")
+            if turn and turn in self._handled_turns:
+                return
+            if self.rhythm.is_muted(group):
+                self._mark_turn_handled(turn)
+                return
+            now = time.time()
+            # 批内包含图片且下载尚未收尾时，最多等 5 秒并补充挂到 batch.images。
+            pending_dl = list(self._pending_images.get(group) or ())
+            if pending_dl and (batch.has_image or batch.mentioned):
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*pending_dl, return_exceptions=True),
+                        timeout=5.0,
+                    )
+                except asyncio.TimeoutError:
+                    pass
+                except Exception:
+                    pass
+            fresh_imgs = [
+                data for stamp, data in self.rhythm._images.pop(group, [])
+                if time.time() - stamp <= 60.0
+            ]
+            if fresh_imgs:
+                existing = list(getattr(batch, "images", None) or [])
+                batch.images = (existing + fresh_imgs)[-4:]
+            if not batch.approved and not self.rhythm.should_view(
+                group, now, forced=batch.mentioned, rate=self.brain.view_rate(batch)
+            ):
+                # 未通过查看抽签的批先落历史，暂不标 handled，留给静默查看重看一次的机会。
+                await asyncio.to_thread(self.brain.observe_skipped, batch)
+                batch.persisted = True
+                return
+            self._mark_turn_handled(turn)
+            quota = self.rhythm.start_turn(group)
+            started_at = time.time()
+            result = await asyncio.to_thread(self.brain.handle_batch, batch)
+            self.rhythm.use_round(group, quota, count=result.get("rounds", 1))
+            reason = result.get("reason")
+            replay_count = int(getattr(batch, "replay_count", 0) or 0)
+            # 仅 wait 且重放次数小于 2 时允许到点再决策一次；已决策 silent 的批不重复唤醒。
+            if turn and reason == "wait" and replay_count < 2:
+                self._handled_turns.pop(turn, None)
+            if reason == "model_error":
+                logger.error("模型调用失败：%s", result.get("error") or "未知错误")
+            if reason == "wait":
+                if self.rhythm._last_input.get(group, 0.0) <= started_at:
+                    seconds = result.get("wait_seconds") or 0
+                    self.rhythm.wait(group, seconds, time.time())
+                return
+            if not result.get("replied") or self.rhythm.is_muted(group):
+                return
+            if result.get("face"):
+                try:
+                    face = Face(id=int(result["face"]))
+                except (TypeError, ValueError):
+                    face = None
+                if face is not None and self.limiter.allow(group):
+                    await self.context.send_message(batch.umo, MessageChain([face]))
+                    self.limiter.record(group)
+                    hb = getattr(self, "heartbeat", None)
+                    if hb is not None:
+                        hb.observe(group)
+            elif result.get("image"):
+                await self._send_image(group, batch.umo, result["image"])
+            else:
+                await self._send_reply(group, batch.umo, result)
 
-        同时推进 wait 到期唤醒、静默查看、主动开聊与跨重载子任务投递。
-        """
+    async def _chat_loop(self):
+        """防抖到期 → 并发按群隔离决策 → 单条发送；同时推进 wait/静默/主动开聊/清理/子任务投递。"""
         while True:
             try:
                 now = time.time()
                 pending = list(self.rhythm.due(now))
-                # wait 到期：按当时概率抽签，复用上一批上下文（由后续 due() 统一弹出，避免留滞）。
+                due_groups = {b.group_id for b in pending}
+                # wait 到期：按当时概率抽签（@ 批直接放行），排除本轮已有待处理批的群。
                 for group in list(self.rhythm.groups()):
+                    if group in due_groups:
+                        continue
                     if not self.rhythm.has_batch(group) and self.rhythm.wait_due(group, now):
                         last = self.rhythm.last_batch(group)
                         if last is not None:
                             self.rhythm.requeue(last, now)
-                # 静默查看：安静太久且防抖已完成时抽签看一眼。
+                # 静默查看：安静太久且上次跳过未看时，在冷却后抽签重看一次。
                 for group in list(self.rhythm.groups()):
+                    if group in due_groups:
+                        continue
+                    last = self.rhythm.last_batch(group)
+                    last_turn = getattr(last, "turn_id", "") if last is not None else ""
                     if (
-                        not self.rhythm.has_batch(group)
+                        last is not None
+                        and (not last_turn or last_turn not in self._handled_turns)
+                        and int(getattr(last, "replay_count", 0) or 0) < 1
+                        and not self.rhythm.has_batch(group)
                         and self.rhythm.silent_due(group, now)
                         and self.rhythm.consume_silent(group, now)
                     ):
-                        last = self.rhythm.last_batch(group)
-                        if last is not None:
-                            self.rhythm.requeue(last, now)
+                        self.rhythm.requeue(last, now)
                 pending.extend(self.rhythm.due(now))
                 for batch in pending:
-                    try:
-                        group = batch.group_id
-                        turn = getattr(batch, "turn_id", "")
-                        if turn and turn in self._handled_turns:
-                            continue
-                        self._mark_turn_handled(turn)
-                        if self.rhythm.is_muted(group):
-                            continue
-                        if not batch.approved and not self.rhythm.should_view(
-                                group, now, forced=batch.mentioned,
-                                rate=self.brain.view_rate(batch)):
-                            await asyncio.to_thread(self.brain.observe_skipped, batch)
-                            continue
-                        quota = self.rhythm.start_turn(group)
-                        started_at = time.time()
-                        result = await asyncio.to_thread(self.brain.handle_batch, batch)
-                        self.rhythm.use_round(group, quota)
-                        reason = result.get("reason")
-                        # 仅 wait 且重放次数小于 2 时允许到点再决策一次；silent 不清除 turn_id 避免每 30 分钟重复唤醒旧批。
-                        if turn and reason == "wait" and int(getattr(batch, "replay_count", 0) or 0) < 2:
-                            self._handled_turns.pop(turn, None)
-                        if reason == "model_error":
-                            logger.error("模型调用失败：%s", result.get("error") or "未知错误")
-                        if reason == "wait":
-                            if self.rhythm._last_input.get(group, 0.0) <= started_at:
-                                seconds = result.get("wait_seconds") or 0
-                                self.rhythm.wait(group, seconds, time.time())
-                            continue
-                        if not result.get("replied") or self.rhythm.is_muted(group):
-                            continue
-                        if result.get("face"):
-                            try:
-                                face = Face(id=int(result["face"]))
-                            except (TypeError, ValueError):
-                                face = None
-                            if face is not None and self.limiter.allow(group):
-                                await self.context.send_message(
-                                    batch.umo, MessageChain([face])
-                                )
-                                self.limiter.record(group)
-                        elif result.get("image"):
-                            await self._send_image(group, batch.umo, result["image"])
-                        else:
-                            await self._send_reply(group, batch.umo, result)
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:
-                        logger.error("批消息处理异常：%s", exc)
+                    self._spawn_bg(self._process_batch(batch))
+
+                now = time.time()
                 # 群安静太久时，偶尔主动开一句（先发后记 + 失败退避，防离线刷屏）。
                 if now - self._heartbeat_at > 60:
                     self._heartbeat_at = now
@@ -506,23 +695,40 @@ class Echo(Star):
                                 logger.error("主动开聊发送失败（%s）：%s", type(exc).__name__, exc)
                         else:
                             self.heartbeat.backoff(group, 1800)
-                # 每 6 小时清理一次过期表情、超限群消息及 QQ/临时缓存。
+
+                now = time.time()
+                # 每 6 小时清理一次过期表情、超限群消息、监控旧事件、过期 outbox 及 QQ/临时缓存。
                 if now - self._emoji_cleanup_at > 21600:
                     self._emoji_cleanup_at = now
                     try:
                         if self.emoji_bank:
                             await asyncio.to_thread(self.emoji_bank.cleanup)
                         await asyncio.to_thread(self.store.prune_messages)
+                        await asyncio.to_thread(self.monitor.prune)
+                        outbox_root = getattr(self, "_outbox_root", "") or (
+                            getattr(self.harness, "outbox_root", "") if getattr(self, "harness", None) else ""
+                        )
+                        if outbox_root:
+                            keep = await asyncio.to_thread(self.store.pending_delivery_paths)
+                            await asyncio.to_thread(cleanup_outbox, outbox_root, keep_paths=keep)
                         data_root = getattr(self, "_astrbot_data_root", "")
                         if data_root:
                             await asyncio.to_thread(cleanup_runtime_caches, data_root)
                     except Exception as exc:
                         logger.error("定期缓存清理异常：%s", exc)
+
                 # 后台任务完成：把结论及生成的群文件发回原群（逐任务异常隔离，确保不漏发不遗留 outbox）。
+                outbox_cleanup_root = (
+                    getattr(self.harness, "outbox_root", "")
+                    if getattr(self, "harness", None)
+                    else getattr(self, "_outbox_root", "")
+                )
                 for task in await asyncio.to_thread(self.brain.poll_subagents):
                     group = task.get("group", "")
                     umo = task.get("umo") or ""
                     files = list(task.get("files") or [])
+                    if not task.get("ok") and task.get("error"):
+                        logger.warning("后台子任务失败（group=%s）：%s", group, task.get("error"))
                     try:
                         if not umo or (group and self.rhythm.is_muted(group)):
                             continue
@@ -531,6 +737,9 @@ class Echo(Star):
                             await self.context.send_message(
                                 umo, MessageChain([Plain(part)])
                             )
+                            hb = getattr(self, "heartbeat", None)
+                            if hb is not None:
+                                hb.observe(group)
                         for item in files:
                             await self._send_file(
                                 group,
@@ -544,7 +753,7 @@ class Echo(Star):
                         logger.error("后台任务结果发送失败：%s", exc)
                     finally:
                         for item in files:
-                            cleanup_file_entry(item.get("path", ""), self.harness.outbox_root)
+                            cleanup_file_entry(item.get("path", ""), outbox_cleanup_root)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -562,6 +771,9 @@ class Echo(Star):
             return
         await self.context.send_message(umo, MessageChain([Plain(single)]))
         self.limiter.record(group)
+        hb = getattr(self, "heartbeat", None)
+        if hb is not None:
+            hb.observe(group)
 
     async def _send_image(self, group, umo, path):
         if not umo or not path:
@@ -586,15 +798,23 @@ class Echo(Star):
                 umo, MessageChain([Image(file="file://" + str(target))])
             )
             self.limiter.record(group)
+            hb = getattr(self, "heartbeat", None)
+            if hb is not None:
+                hb.observe(group)
         except Exception as exc:
             logger.error("表情发送失败：%s", exc)
 
     async def _send_file(self, group, umo, path, name=""):
         target = Path(path) if path else None
         display_name = name or (target.name if target else "")
-        outbox_root = getattr(getattr(self, "harness", None), "outbox_root", "")
+        outbox_root = (
+            getattr(self.harness, "outbox_root", "")
+            if getattr(self, "harness", None)
+            else getattr(self, "_outbox_root", "")
+        )
         try:
             if not umo or not target or target.is_symlink() or not target.is_file():
+                logger.warning("待发送文件缺失或越界，跳过：%s", display_name or path)
                 return
             resolved = target.resolve(strict=True)
             if outbox_root:
@@ -634,8 +854,12 @@ class Echo(Star):
     async def _reminder_loop(self):
         while True:
             try:
-                for item in await asyncio.to_thread(self.brain.tick):
-                    await self._send_reminder(item)
+                for item in await asyncio.to_thread(self.brain.peek_due_reminders):
+                    sent = await self._send_reminder(item)
+                    if sent:
+                        await asyncio.to_thread(self.brain.confirm_reminder, item)
+                    else:
+                        await asyncio.to_thread(self.brain.backoff_reminder, item, 60)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -647,12 +871,14 @@ class Echo(Star):
         umo = item.get("umo") or ""
         if not umo:
             logger.warning("提醒缺少会话标识，已跳过：%s", item.get("text"))
-            return
+            return True
         try:
             if uid:
                 chain = MessageChain([At(qq=uid), Plain(" " + str(item["text"]))])
             else:
                 chain = MessageChain([Plain("@{} {}".format(item["user_name"], item["text"]))])
             await self.context.send_message(umo, chain)
+            return True
         except Exception as exc:
             logger.error("提醒发送失败（%s）：%s", item["text"], exc)
+            return False

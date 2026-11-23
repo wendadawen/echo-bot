@@ -40,6 +40,10 @@ jobs:
           mirror_image="$(printf '%s' "${MIRROR_IMAGE:-}" | tr -d '[:space:]')"
           mirror_registry="$(printf '%s' "${MIRROR_REGISTRY:-}" | tr -d '[:space:]')"
           if [ -n "$mirror_image" ] && [ -n "${MIRROR_USERNAME:-}" ] && [ -n "${MIRROR_PASSWORD:-}" ]; then
+            last_seg="${mirror_image##*/}"
+            if [ "${last_seg#*:}" != "$last_seg" ]; then
+              mirror_image="${mirror_image%:"${last_seg#*:}"}"
+            fi
             if [ -z "$mirror_registry" ]; then
               mirror_registry="${mirror_image%%/*}"
             fi

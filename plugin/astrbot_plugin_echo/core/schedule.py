@@ -4,6 +4,7 @@
 但只保留群提醒需要的四种规则，独立 SQLite，不依赖框架。
 """
 
+import math
 import sqlite3
 import threading
 import time
@@ -141,25 +142,52 @@ class Schedule:
             raise ValueError("不支持的日程类型：{}".format(kind))
         if missed not in MISSED:
             missed = "fire_once"
+        spec_str = str(spec or "").strip()
         if kind == "once":
-            next_at = float(due_at or now + 60)
-            spec = ""
-        else:
-            next_at = next_time(kind, spec, now, tz)
+            try:
+                next_at = float(due_at if due_at is not None else now + 60)
+            except (TypeError, ValueError):
+                raise ValueError("once 规则需要有效时间戳")
+            if not math.isfinite(next_at):
+                raise ValueError("once 规则时间戳无效")
+            spec_str = ""
+        elif kind == "interval":
+            try:
+                minutes = int(spec_str)
+            except (TypeError, ValueError):
+                raise ValueError("interval 规则需要正整数分钟数：{}".format(spec_str))
+            if minutes < 1:
+                raise ValueError("interval 分钟数必须 >= 1")
+            spec_str = str(minutes)
+            next_at = next_time(kind, spec_str, now, tz)
+        elif kind == "daily":
+            if not parse_clock(spec_str):
+                raise ValueError("daily 规则时间格式无效：{}".format(spec_str))
+            next_at = next_time(kind, spec_str, now, tz)
+        elif kind == "weekly":
+            head, _, tail = spec_str.partition(" ")
+            if head.strip().lower() not in WEEKDAYS or not parse_clock(tail):
+                raise ValueError("weekly 规则格式无效：{}".format(spec_str))
+            next_at = next_time(kind, spec_str, now, tz)
         row_id = uuid.uuid4().hex[:12]
-        with self._lock, self._db:
-            self._db.execute(
-                "INSERT INTO schedules(id, group_id, user_id, user_name, umo, text, "
-                "kind, spec, tz, missed, next_at, created) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (row_id, group_id, user_id, user_name, umo, str(text)[:200], kind,
-                 str(spec), tz, missed, next_at, now),
-            )
+        with self._lock:
+            if self._closed:
+                return ""
+            with self._db:
+                self._db.execute(
+                    "INSERT INTO schedules(id, group_id, user_id, user_name, umo, text, "
+                    "kind, spec, tz, missed, next_at, created) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (row_id, group_id, user_id, user_name, umo, str(text)[:200], kind,
+                     spec_str, tz, missed, next_at, now),
+                )
         return row_id
 
     def due(self, now=None):
         now = time.time() if now is None else now
         with self._lock:
+            if self._closed:
+                return []
             rows = self._db.execute(
                 "SELECT * FROM schedules WHERE active = 1 AND next_at <= ? "
                 "ORDER BY next_at",
@@ -167,42 +195,67 @@ class Schedule:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def peek_due(self, now=None):
+        """读取当前到期的活跃日程（不推进 next_at），供先发后记流程使用。"""
+        return self.due(now)
+
     def fire(self, schedule_id, now=None):
         """推进一条日程；返回是否应该真的发出去（错过的按策略决定）。"""
         now = time.time() if now is None else now
-        with self._lock, self._db:
-            row = self._db.execute(
-                "SELECT * FROM schedules WHERE id = ?", (str(schedule_id),)
-            ).fetchone()
-            if row is None or not row["active"] or row["next_at"] > now:
+        with self._lock:
+            if self._closed:
                 return None
-            late = now - row["next_at"]
-            kind = row["kind"]
-            if kind == "once":
-                self._db.execute(
-                    "UPDATE schedules SET active = 0, last_fired = ? WHERE id = ?",
-                    (now, row["id"]),
-                )
-                if late > 6 * 3600 and row["missed"] == "skip":
+            with self._db:
+                row = self._db.execute(
+                    "SELECT * FROM schedules WHERE id = ?", (str(schedule_id),)
+                ).fetchone()
+                if row is None or not row["active"] or row["next_at"] > now:
                     return None
-                return dict(row)
-            # 错过太久：skip 策略只在长期没开机时避免补发；fire_once 仍补一次。
-            send = True
-            if late > 6 * 3600 and row["missed"] == "skip":
-                send = False
-            next_at = row["next_at"]
-            guard = 0
-            while next_at <= now and guard < 500:
-                next_at = next_time(kind, row["spec"], next_at, row["tz"])
-                guard += 1
-            if next_at <= now:
-                next_at = next_time(kind, row["spec"], now, row["tz"])
-            self._db.execute(
-                "UPDATE schedules SET next_at = ?, last_fired = ? WHERE id = ?",
-                (next_at, now, row["id"]),
-            )
-            payload = dict(row)
+                late = now - row["next_at"]
+                kind = row["kind"]
+                if kind == "once":
+                    self._db.execute(
+                        "UPDATE schedules SET active = 0, last_fired = ? WHERE id = ?",
+                        (now, row["id"]),
+                    )
+                    if late > 6 * 3600 and row["missed"] == "skip":
+                        return None
+                    return dict(row)
+                # 错过太久：skip 策略只在长期没开机时避免补发；fire_once 仍补一次。
+                send = True
+                if late > 6 * 3600 and row["missed"] == "skip":
+                    send = False
+                next_at = row["next_at"]
+                guard = 0
+                while next_at <= now and guard < 500:
+                    next_at = next_time(kind, row["spec"], next_at, row["tz"])
+                    guard += 1
+                if next_at <= now:
+                    next_at = next_time(kind, row["spec"], now, row["tz"])
+                self._db.execute(
+                    "UPDATE schedules SET next_at = ?, last_fired = ? WHERE id = ?",
+                    (next_at, now, row["id"]),
+                )
+                payload = dict(row)
         return payload if send else None
+
+    def confirm_fired(self, schedule_id, now=None):
+        """发送成功后再推进日程到下一周期或置为完成。"""
+        return self.fire(schedule_id, now=now)
+
+    def backoff(self, schedule_id, seconds=60, now=None):
+        """发送失败时临时顺延 next_at，避免立即重复失败。"""
+        now = time.time() if now is None else now
+        retry_at = now + max(10.0, float(seconds or 60))
+        with self._lock:
+            if self._closed:
+                return False
+            with self._db:
+                cur = self._db.execute(
+                    "UPDATE schedules SET next_at = ? WHERE id = ? AND active = 1",
+                    (retry_at, str(schedule_id)),
+                )
+                return cur.rowcount > 0
 
     def list(self, group_id=None):
         sql = "SELECT * FROM schedules WHERE active = 1"
@@ -212,6 +265,8 @@ class Schedule:
             params.append(str(group_id))
         sql += " ORDER BY next_at"
         with self._lock:
+            if self._closed:
+                return []
             rows = self._db.execute(sql, params).fetchall()
         return [dict(row) for row in rows]
 
@@ -221,14 +276,20 @@ class Schedule:
         if group_id is not None:
             sql += " AND group_id = ?"
             params.append(str(group_id))
-        with self._lock, self._db:
-            cur = self._db.execute(sql, params)
-            return cur.rowcount > 0
+        with self._lock:
+            if self._closed:
+                return False
+            with self._db:
+                cur = self._db.execute(sql, params)
+                return cur.rowcount > 0
 
     def clear(self, group_id):
-        with self._lock, self._db:
-            cur = self._db.execute(
-                "UPDATE schedules SET active = 0 WHERE group_id = ? AND active = 1",
-                (str(group_id),),
-            )
-            return cur.rowcount
+        with self._lock:
+            if self._closed:
+                return 0
+            with self._db:
+                cur = self._db.execute(
+                    "UPDATE schedules SET active = 0 WHERE group_id = ? AND active = 1",
+                    (str(group_id),),
+                )
+                return cur.rowcount

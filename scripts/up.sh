@@ -134,6 +134,15 @@ fi
 command -v docker >/dev/null 2>&1 || { echo "没找到 Docker" >&2; exit 1; }
 docker compose version >/dev/null 2>&1 || { echo "需要 Docker Compose V2" >&2; exit 1; }
 
+for _k in BASE_IMAGE APT_MIRROR PIP_INDEX_URL GITHUB_PROXY BOT_IMAGE; do
+  if [[ -z "${!_k:-}" ]]; then
+    _v="$(read_env_value "$env_file" "$_k")"
+    if [[ -n "$_v" ]]; then
+      printf -v "$_k" '%s' "$_v"
+    fi
+  fi
+done
+
 if [[ "$mode_cn" -eq 1 ]]; then
   BASE_IMAGE="${BASE_IMAGE:-soulter/astrbot:v4.29.4}"
   APT_MIRROR="${APT_MIRROR:-http://mirrors.cloud.tencent.com}"

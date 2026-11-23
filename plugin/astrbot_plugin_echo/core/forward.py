@@ -52,6 +52,8 @@ def extract(component):
         content = [component]
     else:
         content = _get(component, "content", "messages", "nodes", "message", default=None)
+        if content is None and isinstance(component, dict) and isinstance(component.get("data"), dict):
+            content = _get(component["data"], "messages", "content", "nodes", "message", default=None)
         if content is None:
             return []
         if isinstance(content, dict):
@@ -60,6 +62,8 @@ def extract(component):
             return []
     lines = []
     for node in list(content)[:MAX_ITEMS]:
+        if isinstance(node, dict) and isinstance(node.get("data"), dict):
+            node = node["data"]
         sender = _get(node, "sender", "name", "nickname", "user_name", default="")
         if sender and not isinstance(sender, str):
             sender = _get(sender, "card", "nickname", "name", default="")

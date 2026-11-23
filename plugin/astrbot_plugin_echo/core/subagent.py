@@ -48,7 +48,7 @@ class SubAgentManager:
         with self._lock:
             return [task for task in self._tasks.values() if task.status == "running"]
 
-    def submit(self, kind, prompt, runner, on_complete=None):
+    def submit(self, kind, prompt, runner, on_complete=None, on_register=None):
         """runner(prompt) -> str/dict；超过并发上限时返回 None，由调用方回一句忙。"""
         with self._lock:
             active = sum(1 for t in self._tasks.values() if t.status == "running")
@@ -57,6 +57,11 @@ class SubAgentManager:
             task = SubTask(kind, prompt)
             self._tasks[task.id] = task
             self._order.append(task.id)
+        if callable(on_register):
+            try:
+                on_register(task.id)
+            except Exception:
+                pass
 
         def work():
             result = ""
@@ -101,14 +106,17 @@ class SubAgentManager:
                 task.files = files
                 task.error = error
                 task.reason = reason
-                task.status = status
                 task.finished = time.time()
-                payload = task.as_dict()
+                payload = dict(task.as_dict(), status=status)
             if callable(on_complete) and payload is not None:
                 try:
                     on_complete(payload)
                 except Exception:
                     pass
+            with self._lock:
+                if task.status == "stopped":
+                    return
+                task.status = status
             self._trim()
 
         threading.Thread(target=work, name="echo-subagent", daemon=True).start()

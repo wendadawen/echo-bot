@@ -55,7 +55,7 @@ def drift_level(score, *, budget=2, intensity="normal"):
         return "off"
     if budget <= 0:
         return "subtle" if score >= 0.72 else "off"
-    if score >= 0.72 and budget >= 2:
+    if score >= 0.72 and budget >= 1:
         return "active"
     if score >= 0.45:
         return "subtle"
@@ -116,6 +116,8 @@ class AttentionTracker:
         with self._lock:
             rows = list(self._recent.get(gid, []))
             rem = self.budget(gid, now)
+        if not rows:
+            return "off"
         score = novelty(text, rows)
         return drift_level(score, budget=rem, intensity=intensity)
 

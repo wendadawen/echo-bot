@@ -44,15 +44,20 @@ def _wrap_background(text):
     return "<background_data>\n{}\n</background_data>".format(safe)
 
 
+GENERIC_PERSON_NAMES = frozenset({"用户", "群友", "发言者", "对方", "我", "你", "大肥鱼", "回声"})
+
+
 class ContextBuilder:
     def __init__(self, persona, memory=None, style=None, attention=None,
-                 modes=None, persons=None):
+                 modes=None, persons=None, store=None, schedules=None):
         self.persona = persona
         self.memory = memory
         self.style = style or {}
         self.attention = attention
         self.modes = modes
         self.persons = persons
+        self.store = store
+        self.schedules = schedules
         self.activity = {}
         self.quoting = {}
         self.schedule = {}
@@ -82,52 +87,104 @@ class ContextBuilder:
         if name == "safety":
             return SAFETY
         if name == "mode":
-            return _wrap_background(self._mode_block(group_id))
+            return self._mode_block(group_id)
         if name == "episodes":
             rows = self.memory.recent_episodes(group_id) if self.memory else []
             return _wrap_background("最近聊过：" + "；".join(rows)) if rows else ""
         if name == "memory":
-            rows = self.memory.recall(group_id, query) if self.memory else []
-            return _wrap_background("本群记得：" + "；".join(rows)) if rows else ""
+            if not self.memory:
+                return ""
+            ep_set = set(self.memory.recent_episodes(group_id))
+            recalled = self.memory.recall(group_id, query, limit=8)
+            rows = [r for r in recalled if r not in ep_set][:4]
+            jargon_map = self.memory.jargon(group_id)
+            bits = []
+            if rows:
+                bits.append("本群记得：" + "；".join(rows))
+            if jargon_map:
+                j_items = ["{}={}".format(k, v) for k, v in list(jargon_map.items())[:8]]
+                bits.append("群内黑话：" + "；".join(j_items))
+            return _wrap_background("\n".join(bits)) if bits else ""
         if name == "person":
             if not self.memory:
                 return ""
             candidate_names = []
-            if user_name:
-                candidate_names.append(str(user_name))
+            for raw_n in (user_name, clean_speaker_name(user_name) if user_name else ""):
+                n = str(raw_n or "").strip()
+                if n and n not in candidate_names:
+                    candidate_names.append(n)
             if self.persons and batch is not None:
                 items = getattr(batch, "items", None) or []
                 uid = getattr(items[-1], "user_id", "") if items else ""
                 if uid:
                     for row in self.persons.aliases(group_id, uid):
-                        alias_name = str(row.get("name") or "").strip()
-                        if alias_name and alias_name not in candidate_names:
-                            candidate_names.append(alias_name)
-            rows = []
+                        raw_alias = str(row.get("name") or "").strip()
+                        for variant in (raw_alias, clean_speaker_name(raw_alias)):
+                            if variant and variant not in candidate_names:
+                                candidate_names.append(variant)
+            person_rows = []
             for alias_name in candidate_names[:4]:
                 for line in self.memory.person(group_id, alias_name):
-                    if line not in rows:
-                        rows.append(line)
-            if not rows and user_name:
-                rows = self.memory.relations(group_id, user_name)
-            safe_name = clean_speaker_name(user_name) or user_name
-            return _wrap_background("关于[昵称：{}]：".format(safe_name) + "；".join(rows[:3])) if rows else ""
+                    if line not in person_rows:
+                        person_rows.append(line)
+            relation_rows = []
+            for alias_name in candidate_names[:4]:
+                for line in self.memory.relations(group_id, alias_name):
+                    # 过滤泛化称呼产生的噪音关系
+                    lhs = line.split("：", 1)[0]
+                    if any(g in lhs.split(" 与 ") for g in GENERIC_PERSON_NAMES):
+                        continue
+                    if line not in relation_rows:
+                        relation_rows.append(line)
+            combined = person_rows[:3] + relation_rows[:2]
+            safe_name = clean_speaker_name(user_name) or user_name or "对方"
+            return _wrap_background("关于[昵称：{}]：".format(safe_name) + "；".join(combined)) if combined else ""
         if name == "person_profile":
             return _wrap_background(self._profile_block(group_id, batch))
         if name == "mentions":
             info = getattr(batch, "mention_info", None) if batch is not None else None
-            block = mentions.render_block(info) if info else ""
-            if not block and batch is not None and getattr(batch, "mentioned", False):
-                block = "这次有人明确 @ 了你，必须回应"
-            return _wrap_background(block) if (info and info.quoted) else block
+            directives = []
+            quoted_part = ""
+            if info is not None:
+                if info.mentioned:
+                    directives.append("这次有人明确点到了你，必须回应")
+                if info.retold:
+                    directives.append("有人在你面前转述别人对你的评价，冲转述的人回，别去分析评价本身")
+                if info.direct_question and not info.mentioned:
+                    directives.append("这句话带着问句，但不一定是问你的，接不上就别硬接")
+                if info.quoted:
+                    quoted_part = _wrap_background("被引用的是：" + info.quoted[:100])
+            elif batch is not None and getattr(batch, "mentioned", False):
+                directives.append("这次有人明确点到了你，必须回应")
+            out_parts = []
+            if directives:
+                out_parts.append("；".join(directives))
+            if quoted_part:
+                out_parts.append(quoted_part)
+            return "\n".join(out_parts)
         if name == "quoting":
             rows = self.quoting.get(group_id) or []
             return _wrap_background("刚被引用：" + "；".join(rows)) if rows else ""
         if name == "drift":
-            return _wrap_background(self._drift_block(group_id, query, batch))
+            return self._drift_block(group_id, query, batch)
         if name == "schedule":
-            rows = self.schedule.get(group_id) or []
-            return _wrap_background("群里待办：" + "；".join(rows)) if rows else ""
+            rows = list(self.schedule.get(group_id) or [])
+            if self.store:
+                for item in self.store.pending_reminders(group_id)[:4]:
+                    label = item.get("repeat") or datetime.fromtimestamp(item["due_at"]).strftime("%m-%d %H:%M")
+                    entry = "{} {}".format(label, item.get("text", ""))[:80]
+                    if entry not in rows:
+                        rows.append(entry)
+            if self.schedules:
+                for item in self.schedules.list(group_id)[:4]:
+                    label = item.get("spec") or (
+                        datetime.fromtimestamp(item["next_at"]).strftime("%m-%d %H:%M")
+                        if item.get("next_at") else item.get("kind", "")
+                    )
+                    entry = "{} {}".format(label, item.get("text", ""))[:80]
+                    if entry not in rows:
+                        rows.append(entry)
+            return _wrap_background("群里待办：" + "；".join(rows[:6])) if rows else ""
         if name == "activity":
             state, until = self.activity.get(group_id, ("", 0))
             return _wrap_background("当前状态：" + state) if state and time.time() < until else ""
@@ -171,7 +228,13 @@ class ContextBuilder:
         level = getattr(batch, "drift_level", None) if batch is not None else None
         if not level:
             level = self.attention.level(group_id, query)
-        return attention_layer.render_block(level, self.attention.topic(group_id))
+        directive = attention_layer.render_block(level, "")
+        if not directive:
+            return ""
+        topic = self.attention.topic(group_id)
+        if topic:
+            return directive + "\n" + _wrap_background("当前话题：" + topic)
+        return directive
 
     @staticmethod
     def _usage_block(history):

@@ -1343,12 +1343,18 @@ class TestStore(unittest.TestCase):
 
 class TestHarness(unittest.TestCase):
     def test_command_uses_nobody_and_full_access(self):
+        import os
         harness = CodexHarness(binary="/usr/local/bin/codex", home="/tmp/h",
                                workdir_root="/tmp/w")
-        cmd = harness._command("查天气")
+        with patch("sys.platform", "linux"), patch.object(os, "geteuid", return_value=0, create=True):
+            cmd = harness._command("查天气")
         self.assertIn("/usr/bin/setpriv", cmd)
         self.assertIn("--reuid=65534", cmd)
         self.assertIn("danger-full-access", cmd)
+        with patch("sys.platform", "darwin"):
+            direct_cmd = harness._command("查天气")
+        self.assertEqual("/usr/local/bin/codex", direct_cmd[0])
+        self.assertNotIn("/usr/bin/setpriv", direct_cmd)
 
     def test_workdir_shared_between_groups(self):
         with tempfile.TemporaryDirectory() as folder:

@@ -39,9 +39,16 @@ def _extract_message_text(message):
             elif isinstance(block, str) and block:
                 parts.append(block)
         content = "".join(parts)
-    if not isinstance(content, str):
-        content = message.get("reasoning_content") or message.get("text") or ""
-    return content.strip() if isinstance(content, str) else str(content).strip()
+    if isinstance(content, str):
+        stripped = content.strip()
+        if stripped:
+            return stripped
+        fallback = message.get("reasoning_content") or message.get("text") or ""
+        return str(fallback).strip()
+    if content is None:
+        fallback = message.get("reasoning_content") or message.get("text") or ""
+        return str(fallback).strip()
+    return str(content).strip()
 
 
 class BaseModel:
@@ -150,15 +157,32 @@ class OpenAIModel(BaseModel):
         return _extract_message_text(choices[0].get("message") or {})
 
 
-def build_model(config=None):
-    """优先读插件面板配置，其次读环境变量；支持无 key 本地端点（Ollama）；全空回落模拟模型。"""
+def resolve_model_config(config=None):
+    """按 面板非默认配置 > 环境变量 > 默认值 解析 model 配置。"""
     config = config or {}
     key = str(config.get("api_key") or os.environ.get("BOT_API_KEY", "")).strip()
-    custom_base = str(config.get("api_base") or os.environ.get("BOT_API_BASE", "")).strip()
-    if not key and not custom_base:
+    cfg_base = str(config.get("api_base") or "").strip()
+    env_base = os.environ.get("BOT_API_BASE", "").strip()
+    if cfg_base and cfg_base.rstrip("/") != DEFAULT_API_BASE:
+        resolved_base = cfg_base
+    else:
+        resolved_base = env_base or cfg_base
+
+    cfg_model = str(config.get("model") or "").strip()
+    env_model = os.environ.get("BOT_MODEL", "").strip()
+    if cfg_model and cfg_model != "gpt-4o-mini":
+        resolved_model = cfg_model
+    else:
+        resolved_model = env_model or cfg_model or "gpt-4o-mini"
+    return key, resolved_base, resolved_model
+
+
+def build_model(config=None):
+    """优先读插件面板非默认配置，其次读环境变量；支持无 key 本地端点（Ollama）；全空或默认无 key 回落模拟模型。"""
+    key, resolved_base, model = resolve_model_config(config)
+    if not key and (not resolved_base or resolved_base.rstrip("/") == DEFAULT_API_BASE):
         return MockModel()
-    base = custom_base or DEFAULT_API_BASE
+    base = resolved_base or DEFAULT_API_BASE
     if not base.startswith(("http://", "https://")):
         return MockModel()
-    model = str(config.get("model") or os.environ.get("BOT_MODEL", "gpt-4o-mini")).strip()
     return OpenAIModel(key, base, model)

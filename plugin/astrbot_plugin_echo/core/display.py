@@ -14,12 +14,12 @@ from .expression import split as expression_split
 
 MARK_PATTERN = re.compile(r"^#+\s*", re.M)
 LIST_PATTERN = re.compile(r"^\s*[-*+]\s+", re.M)
-CODE_BLOCK = re.compile(r"```[a-zA-Z0-9_+-]*\s*\n?(.*?)```", re.S)
+CODE_BLOCK = re.compile(r"```(?:[a-zA-Z0-9_+-]+[ \t]*\n|\n)?(.*?)```", re.S)
 LATEX_PATTERNS = (
     re.compile(r"\$\$(.+?)\$\$", re.S),
     re.compile(r"\\\[(.*?)\\\]", re.S),
     re.compile(r"\\\((.*?)\\\)", re.S),
-    re.compile(r"(?<![\\$\w])\$(?!\s)(?![0-9]+(?:\.[0-9]+)?(?:\s|$))([^$\n]+?)(?<!\s)\$(?!\w)"),
+    re.compile(r"(?<![\\$A-Za-z0-9_])\$(?!\s)(?![0-9]+(?:\.[0-9]+)?(?:\s|$))([^$\n]+?)(?<!\s)\$(?![A-Za-z0-9_])"),
 )
 LINK_PATTERN = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 

@@ -204,9 +204,13 @@ class Rhythm:
                 batch.deadline = min(batch.deadline, now + preset["other"])
             else:
                 wait = preset["same"] if item.user_id == last_user else preset["other"]
-                batch.deadline = min(batch.deadline, now + wait)
+                batch.deadline = max(batch.deadline, now + wait)
         batch.items.append(item)
-        batch.deadline = min(batch.deadline, batch.started + preset["cap"])
+        cap_deadline = batch.started + preset["cap"]
+        if batch.has_image:
+            img_floor = min(batch.started + preset.get("image_min", 4.0), cap_deadline)
+            batch.deadline = max(batch.deadline, img_floor)
+        batch.deadline = min(batch.deadline, cap_deadline)
         if item.mentioned:
             mention_deadline = item.ts + preset["mention_cap"]
             if batch.has_image:
@@ -214,12 +218,14 @@ class Rhythm:
                     mention_deadline,
                     batch.started + preset.get("image_min", 4.0),
                 )
-                mention_deadline = min(mention_deadline, batch.started + preset["cap"])
+                mention_deadline = min(mention_deadline, cap_deadline)
             earliest = self._earliest_mention.get(group_id)
             self._earliest_mention[group_id] = (
                 mention_deadline if earliest is None else min(earliest, mention_deadline)
             )
-            batch.deadline = min(batch.deadline, self._earliest_mention[group_id])
+        earliest = self._earliest_mention.get(group_id)
+        if earliest is not None:
+            batch.deadline = min(batch.deadline, earliest)
         self._last_seen[group_id] = (now, item.user_id)
 
     def attach_image(self, group_id, data, now=None):
@@ -304,8 +310,9 @@ class Rhythm:
         self._rounds[group_id] = 0
         return self.quota()
 
-    def use_round(self, group_id, quota):
-        used = self._rounds.get(group_id, 0) + 1
+    def use_round(self, group_id, quota, count=1):
+        step = max(1, int(count or 1))
+        used = self._rounds.get(group_id, 0) + step
         self._rounds[group_id] = used
         if used > quota:
             self.borrow(group_id, 1)
@@ -364,4 +371,8 @@ class Rhythm:
         self._wait_until.pop(group_id, None)
         if self._debt.get(group_id, 0) > 0:
             return False
+        last = self._last_batch.get(group_id)
+        if last is not None and getattr(last, "mentioned", False):
+            self.mark_view(group_id, now)
+            return True
         return self.should_view(group_id, now)

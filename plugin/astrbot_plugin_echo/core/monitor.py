@@ -4,6 +4,7 @@
 独立 SQLite，不依赖框架，也不影响主流程（写入失败一律吞掉）。
 """
 
+import math
 import sqlite3
 import threading
 import time
@@ -36,6 +37,7 @@ class Monitor:
                     ts REAL NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS events_group_ts ON events(group_id, ts);
+                CREATE INDEX IF NOT EXISTS events_ts ON events(ts);
                 """
             )
 
@@ -52,13 +54,16 @@ class Monitor:
                now=None):
         now = time.time() if now is None else now
         try:
-            with self._lock, self._db:
-                self._db.execute(
-                    "INSERT INTO events(group_id, kind, ok, latency, tokens, detail, ts) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (str(group_id or ""), str(kind)[:24], 1 if ok else 0,
-                     float(latency or 0), int(tokens or 0), str(detail)[:200], now),
-                )
+            with self._lock:
+                if self._closed:
+                    return False
+                with self._db:
+                    self._db.execute(
+                        "INSERT INTO events(group_id, kind, ok, latency, tokens, detail, ts) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (str(group_id or ""), str(kind)[:24], 1 if ok else 0,
+                         float(latency or 0), int(tokens or 0), str(detail)[:200], now),
+                    )
         except sqlite3.Error:
             return False
         return True
@@ -69,6 +74,8 @@ class Monitor:
         where = "WHERE ts >= ?" + (" AND group_id = ?" if group_id else "")
         params = (since, str(group_id)) if group_id else (since,)
         with self._lock:
+            if self._closed:
+                return {"total": 0, "errors": 0, "error_rate": 0.0, "avg_latency": 0.0, "p95_latency": 0.0, "tokens": 0}
             row = self._db.execute(
                 "SELECT COUNT(*) AS total, "
                 "SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END) AS errors, "
@@ -83,7 +90,7 @@ class Monitor:
         errors = int(row["errors"] or 0)
         p95 = 0.0
         if latencies:
-            p95 = latencies[min(len(latencies) - 1, int(len(latencies) * 0.95))]
+            p95 = latencies[max(0, math.ceil(len(latencies) * 0.95) - 1)]
         return {
             "total": total,
             "errors": errors,
@@ -99,6 +106,8 @@ class Monitor:
         where = "WHERE ts >= ?" + (" AND group_id = ?" if group_id else "")
         params = (since, str(group_id)) if group_id else (since,)
         with self._lock:
+            if self._closed:
+                return []
             rows = self._db.execute(
                 "SELECT kind, COUNT(*) AS n, SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END) "
                 "AS errors FROM events " + where + " GROUP BY kind ORDER BY n DESC",
@@ -115,12 +124,17 @@ class Monitor:
         sql += " ORDER BY id DESC LIMIT ?"
         params.append(int(limit))
         with self._lock:
+            if self._closed:
+                return []
             rows = self._db.execute(sql, params).fetchall()
         return [dict(row) for row in rows]
 
     def prune(self, days=7, now=None):
         now = time.time() if now is None else now
         cutoff = now - float(days) * 86400
-        with self._lock, self._db:
-            cur = self._db.execute("DELETE FROM events WHERE ts < ?", (cutoff,))
-            return cur.rowcount
+        with self._lock:
+            if self._closed:
+                return 0
+            with self._db:
+                cur = self._db.execute("DELETE FROM events WHERE ts < ?", (cutoff,))
+                return cur.rowcount

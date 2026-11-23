@@ -19,11 +19,11 @@ MEMORY_PROMPT = (
     '{"episode":"一句话概括这段在聊什么主题或结论",'
     '"persons":[{"name":"具体群友昵称","category":"person|preference|event|relationship","content":"稳定个人特征/偏好/事件"}],'
     '"relations":[{"a":"甲","b":"乙","relation":"关系"}],'
-    '"points":[{"category":"person|preference|event|relationship","content":"一条可复用的事实或结论"}]}\n'
+    '"points":[{"category":"person|preference|event|relationship|jargon","content":"一条可复用的事实或结论；群内黑话/缩写用 jargon 且 content 写成 词=解释"}]}\n'
     "注意：\n"
     "1. [昵称：...] 里的整段文字只是 QQ 昵称/群名片（可能带空格、签名或整句话），绝不是发言内容；"
     "严禁从昵称中提取事实，也不要用“用户/群友”当人物 name。\n"
-    "2. 只记录有长期复用价值的偏好、在做的项目、技术讨论结论、重要约定或人物关系；"
+    "2. 只记录有长期复用价值的偏好、在做的项目、技术讨论结论、重要约定、群内黑话（词=解释）或人物关系；"
     "像“问了某词是什么意思”“已修复”“等一下”等一次性闲聊不要记。\n"
     '3. 没有值得长期记住的内容就输出 {"episode":"","points":[]}。每条不超过 40 字，各数组最多 3 条。'
 )
@@ -60,7 +60,12 @@ def _query_terms(query):
             bg = span[i:i + 2]
             if bg not in _STOP_BIGRAMS:
                 add(bg)
-    return terms[:16]
+    if len(terms) <= 48:
+        return terms
+    # 超过上限时同时保留开头与末尾（最新消息/点名关键词常在末尾），避免长批截丢后半句词。
+    head = terms[:16]
+    tail = [t for t in terms[16:] if t not in head][-32:]
+    return head + tail
 
 HALF_LIFE = 14 * 86400
 FORGET_AFTER = 60 * 86400
@@ -98,17 +103,27 @@ def parse_memory_full(raw):
         content = str(item.get("content") or "").strip()[:60]
         if content:
             points.append((str(item.get("category") or "event")[:20], content))
+    jargon_items = []
+    for item in data.get("jargon") or []:
+        if isinstance(item, dict):
+            w = str(item.get("word") or item.get("term") or "").strip()[:16]
+            a = str(item.get("alias") or item.get("meaning") or "").strip()[:40]
+            if w and a:
+                jargon_items.append(("jargon", "{}={}".format(w, a)[:60]))
+        elif isinstance(item, str) and ("=" in item or "：" in item):
+            jargon_items.append(("jargon", item.strip()[:60]))
     persons = []
     for item in data.get("persons") or []:
         if isinstance(item, dict) and item.get("name") and item.get("content"):
-            persons.append((str(item["name"])[:30], str(item.get("category") or "person")[:20],
+            persons.append((str(item["name"])[:40], str(item.get("category") or "person")[:20],
                             str(item["content"])[:60]))
     relations = []
     for item in data.get("relations") or []:
         if isinstance(item, dict) and item.get("a") and item.get("b"):
-            relations.append((str(item["a"])[:30], str(item["b"])[:30],
+            relations.append((str(item["a"])[:40], str(item["b"])[:40],
                               str(item.get("relation") or "相关")[:40]))
-    return episode, points[:3], persons[:3], relations[:3]
+    merged_points = points[:3] + jargon_items[:2]
+    return episode, merged_points[:5], persons[:3], relations[:3]
 
 
 def decay(weight, last_hit, now=None, half_life=HALF_LIFE):
@@ -209,8 +224,9 @@ class Memory:
                     "CREATE TRIGGER IF NOT EXISTS points_ad AFTER DELETE ON memory_points BEGIN "
                     "INSERT INTO points_fts(points_fts, rowid, content) VALUES ('delete', old.id, old.content); END"
                 )
+                self._db.execute("DROP TRIGGER IF EXISTS points_au")
                 self._db.execute(
-                    "CREATE TRIGGER IF NOT EXISTS points_au AFTER UPDATE ON memory_points BEGIN "
+                    "CREATE TRIGGER IF NOT EXISTS points_au AFTER UPDATE OF content ON memory_points BEGIN "
                     "INSERT INTO points_fts(points_fts, rowid, content) VALUES ('delete', old.id, old.content); "
                     "INSERT INTO points_fts(rowid, content) VALUES (new.id, new.content); END"
                 )
@@ -251,6 +267,8 @@ class Memory:
     def last_episode_at(self, group_id):
         """最近一条情节的时间，用来判断摘要间隔，重启后仍然有效。"""
         with self._lock:
+            if self._closed:
+                return 0.0
             row = self._db.execute(
                 "SELECT MAX(created_at) FROM episodes WHERE group_id = ?",
                 (str(group_id),),
@@ -262,21 +280,25 @@ class Memory:
             return
         now = time.time() if now is None else now
         with self._lock:
-            if external_id:
-                self._db.execute(
-                    "INSERT OR IGNORE INTO episodes(group_id, text, created_at, source, external_id) "
-                    "VALUES (?,?,?,?,?)",
-                    (group_id, text, now, source, external_id),
-                )
-            else:
-                self._db.execute(
-                    "INSERT INTO episodes(group_id, text, created_at, source) VALUES (?,?,?,?)",
-                    (group_id, text, now, source),
-                )
-            self._db.commit()
+            if self._closed:
+                return
+            with self._db:
+                if external_id:
+                    self._db.execute(
+                        "INSERT OR IGNORE INTO episodes(group_id, text, created_at, source, external_id) "
+                        "VALUES (?,?,?,?,?)",
+                        (group_id, text, now, source, external_id),
+                    )
+                else:
+                    self._db.execute(
+                        "INSERT INTO episodes(group_id, text, created_at, source) VALUES (?,?,?,?)",
+                        (group_id, text, now, source),
+                    )
 
     def recent_episodes(self, group_id, limit=3):
         with self._lock:
+            if self._closed:
+                return []
             rows = self._db.execute(
                 "SELECT text FROM episodes WHERE group_id=? AND state='ready' "
                 "ORDER BY id DESC LIMIT ?", (group_id, limit),
@@ -285,6 +307,8 @@ class Memory:
 
     def pending_episodes(self, group_id, limit=10):
         with self._lock:
+            if self._closed:
+                return []
             rows = self._db.execute(
                 "SELECT * FROM episodes WHERE group_id=? AND state='pending' "
                 "ORDER BY id LIMIT ?", (group_id, limit),
@@ -295,76 +319,84 @@ class Memory:
         """按 source 重建：替换掉同源的旧 Episode，写入新的一批。"""
         now = time.time() if now is None else now
         with self._lock:
-            self._db.execute(
-                "DELETE FROM episodes WHERE group_id=? AND source=?",
-                (group_id, source),
-            )
-            for index, text in enumerate(texts or []):
-                external = "{}:{:.0f}:{}".format(source, now * 1000, index)
+            if self._closed:
+                return
+            with self._db:
                 self._db.execute(
-                    "INSERT OR IGNORE INTO episodes(group_id, text, created_at, source, external_id) "
-                    "VALUES (?,?,?,?,?)",
-                    (group_id, text, now, source, external),
+                    "DELETE FROM episodes WHERE group_id=? AND source=?",
+                    (group_id, source),
                 )
-            self._db.commit()
+                for index, text in enumerate(texts or []):
+                    external = "{}:{:.0f}:{}".format(source, now * 1000, index)
+                    self._db.execute(
+                        "INSERT OR IGNORE INTO episodes(group_id, text, created_at, source, external_id) "
+                        "VALUES (?,?,?,?,?)",
+                        (group_id, text, now, source, external),
+                    )
 
     # ---- 记忆点 ----
     def add_point(self, group_id, category, content, now=None):
         now = time.time() if now is None else now
         with self._lock:
-            row = self._db.execute(
-                "SELECT id, weight, state FROM memory_points WHERE group_id=? AND content=?",
-                (group_id, content),
-            ).fetchone()
-            if row:
-                weight = maintain("reinforce", row["weight"])
-                # 遗忘后被再次提起：恢复并额外加权，模拟「又想起来了」。
-                if row["state"] in ("forgotten", "frozen"):
-                    weight = maintain("restore", weight) + 0.3
-                self._db.execute(
-                    "UPDATE memory_points SET weight=?, last_hit=?, state='active', category=? WHERE id=?",
-                    (weight, now, category, row["id"]),
-                )
-            else:
-                self._db.execute(
-                    "INSERT INTO memory_points(group_id, category, content, weight, last_hit) "
-                    "VALUES (?,?,?,?,?)",
-                    (group_id, category, content, 1.0, now),
-                )
-            self._db.commit()
+            if self._closed:
+                return
+            with self._db:
+                row = self._db.execute(
+                    "SELECT id, weight, state FROM memory_points WHERE group_id=? AND content=?",
+                    (group_id, content),
+                ).fetchone()
+                if row:
+                    weight = maintain("reinforce", row["weight"])
+                    # 遗忘后被再次提起：恢复并额外加权，模拟「又想起来了」。
+                    if row["state"] in ("forgotten", "frozen"):
+                        weight = maintain("restore", weight) + 0.3
+                    self._db.execute(
+                        "UPDATE memory_points SET weight=?, last_hit=?, state='active', category=? WHERE id=?",
+                        (weight, now, category, row["id"]),
+                    )
+                else:
+                    self._db.execute(
+                        "INSERT INTO memory_points(group_id, category, content, weight, last_hit) "
+                        "VALUES (?,?,?,?,?)",
+                        (group_id, category, content, 1.0, now),
+                    )
 
     def maintain_point(self, group_id, point_id, action):
         with self._lock:
-            row = self._db.execute(
-                "SELECT weight, protected FROM memory_points WHERE id=? AND group_id=?",
-                (point_id, group_id),
-            ).fetchone()
-            if not row:
+            if self._closed:
                 return
-            weight = maintain(action, row["weight"])
-            state = "forgotten" if action == "recycle_bin" else (
-                "frozen" if action == "freeze" else "active")
-            if action == "protect":
-                protected = 1
-            elif action == "recycle_bin":
-                protected = 0
-            else:
-                protected = row["protected"]
-            self._db.execute(
-                "UPDATE memory_points SET weight=?, state=?, protected=? WHERE id=?",
-                (weight, state, protected, point_id),
-            )
-            self._db.commit()
+            with self._db:
+                row = self._db.execute(
+                    "SELECT weight, protected FROM memory_points WHERE id=? AND group_id=?",
+                    (point_id, group_id),
+                ).fetchone()
+                if not row:
+                    return
+                weight = maintain(action, row["weight"])
+                state = "forgotten" if action == "recycle_bin" else (
+                    "frozen" if action == "freeze" else "active")
+                if action == "protect":
+                    protected = 1
+                elif action == "recycle_bin":
+                    protected = 0
+                else:
+                    protected = row["protected"]
+                self._db.execute(
+                    "UPDATE memory_points SET weight=?, state=?, protected=? WHERE id=?",
+                    (weight, state, protected, point_id),
+                )
 
     def _fts_hits(self, group_id, query, limit):
         if not self._fts:
             return []
-        tokens = _query_terms(query)[:8]
+        tokens = _query_terms(query)[:24]
         if not tokens:
             return []
         match = " OR ".join('"{}"'.format(t.replace('"', "")) for t in tokens)
         try:
             with self._lock:
+                if self._closed:
+                    return []
                 rows = self._db.execute(
                     "SELECT p.id AS rowid FROM points_fts f "
                     "JOIN memory_points p ON p.id = f.rowid "
@@ -394,6 +426,8 @@ class Memory:
             episodes = recent_eps[-2:]
         fts_ids = set(self._fts_hits(group_id, query, limit))
         with self._lock:
+            if self._closed:
+                return []
             rows = self._db.execute(
                 "SELECT * FROM memory_points WHERE group_id=? AND state='active'",
                 (group_id,),
@@ -414,38 +448,45 @@ class Memory:
         chosen = scored[:max(0, limit - len(episodes))]
         matched_rows = [item for item in chosen if item[4]]
         if matched_rows:
-            with self._lock, self._db:
-                for _, _, rid, orig_weight, _ in matched_rows:
-                    self._db.execute(
-                        "UPDATE memory_points SET last_hit=?, weight=? WHERE id=?",
-                        (now, min(5.0, float(orig_weight) + 0.3), rid),
-                    )
+            with self._lock:
+                if self._closed:
+                    return []
+                with self._db:
+                    for _, _, rid, _, _ in matched_rows:
+                        self._db.execute(
+                            "UPDATE memory_points SET last_hit=?, weight=MIN(5.0, weight + 0.3) WHERE id=?",
+                            (now, rid),
+                        )
         return (episodes + [content for _, content, _, _, _ in chosen])[:limit]
 
     # ---- 人物画像与关系 ----
     def upsert_person(self, group_id, user_name, category, content, now=None, source="auto"):
         now = time.time() if now is None else now
         with self._lock:
-            row = self._db.execute(
-                "SELECT id, weight FROM person_profiles WHERE group_id=? AND user_name=? "
-                "AND category=? AND content=?",
-                (group_id, user_name, category, content),
-            ).fetchone()
-            if row:
-                self._db.execute(
-                    "UPDATE person_profiles SET weight=?, last_hit=?, source=? WHERE id=?",
-                    (maintain("reinforce", row["weight"]), now, source, row["id"]),
-                )
-            else:
-                self._db.execute(
-                    "INSERT INTO person_profiles(group_id, user_name, category, content, weight, last_hit, source) "
-                    "VALUES (?,?,?,?,?,?,?)",
-                    (group_id, user_name, category, content, 1.0, now, source),
-                )
-            self._db.commit()
+            if self._closed:
+                return
+            with self._db:
+                row = self._db.execute(
+                    "SELECT id, weight FROM person_profiles WHERE group_id=? AND user_name=? "
+                    "AND category=? AND content=?",
+                    (group_id, user_name, category, content),
+                ).fetchone()
+                if row:
+                    self._db.execute(
+                        "UPDATE person_profiles SET weight=?, last_hit=?, source=? WHERE id=?",
+                        (maintain("reinforce", row["weight"]), now, source, row["id"]),
+                    )
+                else:
+                    self._db.execute(
+                        "INSERT INTO person_profiles(group_id, user_name, category, content, weight, last_hit, source) "
+                        "VALUES (?,?,?,?,?,?,?)",
+                        (group_id, user_name, category, content, 1.0, now, source),
+                    )
 
     def person(self, group_id, user_name, limit=3):
         with self._lock:
+            if self._closed:
+                return []
             rows = self._db.execute(
                 "SELECT category, content FROM person_profiles WHERE group_id=? AND user_name=? "
                 "ORDER BY weight DESC LIMIT ?", (group_id, user_name, limit),
@@ -456,36 +497,42 @@ class Memory:
         """人工 override / 自动快照，留一条最高权重的总览。"""
         now = time.time() if now is None else now
         with self._lock:
-            self._db.execute(
-                "DELETE FROM person_profiles WHERE group_id=? AND user_name=? AND category='snapshot'",
-                (group_id, user_name),
-            )
-            self._db.execute(
-                "INSERT INTO person_profiles(group_id, user_name, category, content, weight, last_hit, source) "
-                "VALUES (?,?,?,?,?,?,?)",
-                (group_id, user_name, "snapshot", summary[:200], 4.0, now, "override"),
-            )
-            self._db.commit()
+            if self._closed:
+                return
+            with self._db:
+                self._db.execute(
+                    "DELETE FROM person_profiles WHERE group_id=? AND user_name=? AND category='snapshot'",
+                    (group_id, user_name),
+                )
+                self._db.execute(
+                    "INSERT INTO person_profiles(group_id, user_name, category, content, weight, last_hit, source) "
+                    "VALUES (?,?,?,?,?,?,?)",
+                    (group_id, user_name, "snapshot", summary[:200], 4.0, now, "override"),
+                )
 
     def add_relation(self, group_id, a, b, relation, now=None):
         now = time.time() if now is None else now
         with self._lock:
-            row = self._db.execute(
-                "SELECT id, weight FROM relations WHERE group_id=? AND a=? AND b=? AND relation=? "
-                "AND valid_to IS NULL", (group_id, a, b, relation),
-            ).fetchone()
-            if row:
-                self._db.execute("UPDATE relations SET weight=? WHERE id=?",
-                                 (maintain("reinforce", row["weight"]), row["id"]))
-            else:
-                self._db.execute(
-                    "INSERT INTO relations(group_id, a, b, relation, weight, valid_from) "
-                    "VALUES (?,?,?,?,?,?)", (group_id, a, b, relation, 1.0, now),
-                )
-            self._db.commit()
+            if self._closed:
+                return
+            with self._db:
+                row = self._db.execute(
+                    "SELECT id, weight FROM relations WHERE group_id=? AND a=? AND b=? AND relation=? "
+                    "AND valid_to IS NULL", (group_id, a, b, relation),
+                ).fetchone()
+                if row:
+                    self._db.execute("UPDATE relations SET weight=? WHERE id=?",
+                                     (maintain("reinforce", row["weight"]), row["id"]))
+                else:
+                    self._db.execute(
+                        "INSERT INTO relations(group_id, a, b, relation, weight, valid_from) "
+                        "VALUES (?,?,?,?,?,?)", (group_id, a, b, relation, 1.0, now),
+                    )
 
     def relations(self, group_id, name="", limit=4):
         with self._lock:
+            if self._closed:
+                return []
             if name:
                 rows = self._db.execute(
                     "SELECT a, b, relation FROM relations WHERE group_id=? AND (a=? OR b=?) "
@@ -502,14 +549,18 @@ class Memory:
     # ---- 黑话、反馈与维护 ----
     def add_jargon(self, group_id, word, alias):
         with self._lock:
-            self._db.execute(
-                "INSERT OR REPLACE INTO jargon(group_id, word, alias) VALUES (?,?,?)",
-                (group_id, word, alias),
-            )
-            self._db.commit()
+            if self._closed:
+                return
+            with self._db:
+                self._db.execute(
+                    "INSERT OR REPLACE INTO jargon(group_id, word, alias) VALUES (?,?,?)",
+                    (group_id, word, alias),
+                )
 
     def jargon(self, group_id):
         with self._lock:
+            if self._closed:
+                return {}
             rows = self._db.execute("SELECT word, alias FROM jargon WHERE group_id=?",
                                     (group_id,)).fetchall()
         return {r["word"]: r["alias"] for r in rows}
@@ -517,26 +568,32 @@ class Memory:
     def record_reply(self, group_id, reply, now=None):
         now = time.time() if now is None else now
         with self._lock:
-            self._db.execute(
-                "INSERT INTO reply_effects(group_id, reply, created_at) VALUES (?,?,?)",
-                (group_id, reply[:200], now),
-            )
-            self._db.commit()
+            if self._closed:
+                return
+            with self._db:
+                self._db.execute(
+                    "INSERT INTO reply_effects(group_id, reply, created_at) VALUES (?,?,?)",
+                    (group_id, reply[:200], now),
+                )
 
     def mark_followup(self, group_id, now=None, window=120):
         """有人接了机器人的话，就给最近一条回复记一次正反馈。"""
         now = time.time() if now is None else now
         with self._lock:
-            self._db.execute(
-                "UPDATE reply_effects SET followed_up=1 WHERE id=("
-                "SELECT id FROM reply_effects WHERE group_id=? AND created_at>? "
-                "ORDER BY id DESC LIMIT 1)", (group_id, now - window),
-            )
-            self._db.commit()
+            if self._closed:
+                return
+            with self._db:
+                self._db.execute(
+                    "UPDATE reply_effects SET followed_up=1 WHERE id=("
+                    "SELECT id FROM reply_effects WHERE group_id=? AND created_at>? "
+                    "ORDER BY id DESC LIMIT 1)", (group_id, now - window),
+                )
 
     def effect_rate(self, group_id, now=None, window=86400):
         now = time.time() if now is None else now
         with self._lock:
+            if self._closed:
+                return 0.5
             row = self._db.execute(
                 "SELECT COUNT(*) total, COALESCE(SUM(followed_up),0) good FROM reply_effects "
                 "WHERE group_id=? AND created_at>?", (group_id, now - window),
@@ -547,34 +604,38 @@ class Memory:
         """低频记忆标记遗忘而非删除；超阈值才回收；Episode 保留最近若干条。"""
         now = time.time() if now is None else now
         with self._lock:
-            self._db.execute(
-                "DELETE FROM episodes WHERE group_id=? AND id NOT IN "
-                "(SELECT id FROM episodes WHERE group_id=? ORDER BY id DESC LIMIT ?)",
-                (group_id, group_id, max_episodes),
-            )
-            self._db.execute(
-                "UPDATE memory_points SET state='forgotten' WHERE group_id=? AND state='active' "
-                "AND protected=0 AND last_hit<?", (group_id, now - FORGET_AFTER),
-            )
-            count = self._db.execute(
-                "SELECT COUNT(*) n FROM memory_points WHERE group_id=? AND state='active'",
-                (group_id,),
-            ).fetchone()["n"]
-            if count > MAX_POINTS:
+            if self._closed:
+                return
+            with self._db:
+                self._db.execute(
+                    "DELETE FROM episodes WHERE group_id=? AND id NOT IN "
+                    "(SELECT id FROM episodes WHERE group_id=? ORDER BY id DESC LIMIT ?)",
+                    (group_id, group_id, max_episodes),
+                )
                 self._db.execute(
                     "UPDATE memory_points SET state='forgotten' WHERE group_id=? AND state='active' "
-                    "AND protected=0 AND id IN (SELECT id FROM memory_points WHERE group_id=? "
-                    "AND state='active' ORDER BY weight ASC LIMIT ?)",
-                    (group_id, group_id, count - MAX_POINTS),
+                    "AND protected=0 AND last_hit<?", (group_id, now - FORGET_AFTER),
                 )
-            self._db.execute(
-                "DELETE FROM reply_effects WHERE group_id=? AND created_at<?",
-                (group_id, now - 7 * 86400),
-            )
-            self._db.commit()
+                count = self._db.execute(
+                    "SELECT COUNT(*) n FROM memory_points WHERE group_id=? AND state='active'",
+                    (group_id,),
+                ).fetchone()["n"]
+                if count > MAX_POINTS:
+                    self._db.execute(
+                        "UPDATE memory_points SET state='forgotten' WHERE group_id=? AND state='active' "
+                        "AND protected=0 AND id IN (SELECT id FROM memory_points WHERE group_id=? "
+                        "AND state='active' AND protected=0 ORDER BY weight ASC LIMIT ?)",
+                        (group_id, group_id, count - MAX_POINTS),
+                    )
+                self._db.execute(
+                    "DELETE FROM reply_effects WHERE group_id=? AND created_at<?",
+                    (group_id, now - 7 * 86400),
+                )
 
     def stats(self, group_id):
         with self._lock:
+            if self._closed:
+                return {"fts": self._fts}
             out = {}
             for table in ("episodes", "memory_points", "person_profiles", "relations", "jargon"):
                 out[table] = self._db.execute(

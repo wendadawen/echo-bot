@@ -137,12 +137,18 @@ class PromptStore:
         rows = []
         with self._lock:
             for name in PROMPT_NAMES:
-                path = self._path(name, group_id)
                 source = "默认"
                 size = 0
-                if path.exists():
-                    source = "本群覆盖" if group_id else "全局覆盖"
-                    size = path.stat().st_size
+                if group_id:
+                    path = self._path(name, group_id)
+                    if path.exists():
+                        source = "本群覆盖"
+                        size = path.stat().st_size
+                if not size:
+                    global_path = self._path(name, None)
+                    if global_path.exists():
+                        source = "全局覆盖"
+                        size = global_path.stat().st_size
                 rows.append({"name": name, "source": source, "bytes": size})
         return rows
 

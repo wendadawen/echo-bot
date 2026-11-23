@@ -24,6 +24,7 @@ DEFAULT_TIMEOUT = 300
 MIN_TIMEOUT = 180
 MAX_TIMEOUT = 600
 MAX_STDOUT_BYTES = 4 * 1024 * 1024
+MAX_STDERR_BYTES = 8192
 
 # 容器本身就是隔离边界，容器内再套 bwrap 会因 user namespace 限制直接失败。
 # 所以用 danger-full-access，靠外层容器的目录权限、独立任务 HOME 和降权进程收边界。
@@ -52,7 +53,7 @@ _SECRET_CONTENT_PATTERNS = (
     re.compile(rb"-----BEGIN\s+[A-Z0-9 ]*PRIVATE KEY-----"),
     re.compile(rb"(?:ws_reverse_token|napcat_webui_token|onebot_token)\s*[\"':=]", re.I),
     re.compile(rb"[\"']?(?:api_key|openai_api_key|echo_api_key)[\"']?\s*[:=]\s*[\"'][^\"']{8,}", re.I),
-    re.compile(rb"\bsk-[A-Za-z0-9_-]{16,}\b"),
+    re.compile(rb"(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]{16,}(?![A-Za-z0-9_-])"),
 )
 _SAFE_ENV_KEYS = (
     "PATH", "LANG", "LC_ALL", "TZ",
@@ -259,12 +260,19 @@ class CodexHarness:
         self.timeout = _parse_timeout(timeout)
         self._config_lock = threading.Lock()
 
+    @staticmethod
+    def _use_setpriv():
+        return (
+            sys.platform.startswith("linux")
+            and hasattr(os, "geteuid")
+            and os.geteuid() == 0
+        )
+
     def available(self):
         if not (self.binary and self.home and os.path.exists(self.binary)):
             return False
-        if sys.platform.startswith("linux") and hasattr(os, "geteuid") and os.geteuid() == 0:
-            if not os.path.exists(SETPRIV_BIN):
-                return False
+        if self._use_setpriv() and not os.path.exists(SETPRIV_BIN):
+            return False
         return True
 
     def _prepare_dirs(self):
@@ -294,16 +302,23 @@ class CodexHarness:
 
     def _config_text(self):
         base = (self.api_base or "https://api.openai.com/v1").rstrip("/")
+        if base.endswith("/chat/completions"):
+            base = base[:-len("/chat/completions")].rstrip("/") or base
         model = self.model or "gpt-4o-mini"
-        return (
-            "model = {}\n"
-            'model_provider = "echo"\n\n'
-            "[model_providers.echo]\n"
-            'name = "echo"\n'
-            "base_url = {}\n"
-            'env_key = "ECHO_API_KEY"\n'
-            'wire_api = "responses"\n'
-        ).format(json.dumps(model), json.dumps(base))
+        lines = [
+            "model = {}".format(json.dumps(model)),
+            'model_provider = "echo"',
+            "",
+            "[model_providers.echo]",
+            'name = "echo"',
+            "base_url = {}".format(json.dumps(base)),
+        ]
+        if self.api_key:
+            lines.append('env_key = "ECHO_API_KEY"')
+        else:
+            lines.append("requires_openai_auth = false")
+        lines.append('wire_api = "responses"')
+        return "\n".join(lines) + "\n"
 
     def _ensure_config(self, target_dir=None):
         """按插件配置生成 Codex provider 配置；原子写入且拒绝跟随符号链接。"""
@@ -340,17 +355,22 @@ class CodexHarness:
         return path
 
     def _command(self, task):
-        """降权到 nobody（附加 --no-new-privs）再用当前 binary 启动 Codex。"""
-        return [
-            SETPRIV_BIN,
-            "--reuid={}".format(NOBODY_UID),
-            "--regid={}".format(NOBODY_GID),
-            "--clear-groups",
-            "--no-new-privs",
+        """Linux root 容器内降权到 nobody（附加 --no-new-privs）；非 root 环境直接运行 Codex。"""
+        exec_args = [
             self.binary or "codex",
             "exec", "--json", "--skip-git-repo-check",
             "--sandbox", SANDBOX, "--", task,
         ]
+        if self._use_setpriv():
+            return [
+                SETPRIV_BIN,
+                "--reuid={}".format(NOBODY_UID),
+                "--regid={}".format(NOBODY_GID),
+                "--clear-groups",
+                "--no-new-privs",
+                *exec_args,
+            ]
+        return exec_args
 
     @staticmethod
     def _clean_workdir(workdir):
@@ -538,7 +558,7 @@ class CodexHarness:
         try:
             proc = subprocess.Popen(
                 cmd, cwd=str(task_dir), env=env, stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, start_new_session=True,
             )
         except OSError as exc:
@@ -548,8 +568,10 @@ class CodexHarness:
         proc_pid = getattr(proc, "pid", None)
         timed_out = False
         stdout = ""
+        stderr_tail = ""
         collected = []
         proc_stdout = getattr(proc, "stdout", None)
+        proc_stderr = getattr(proc, "stderr", None)
 
         def _kill_process_group():
             if isinstance(proc_pid, int) and proc_pid > 0:
@@ -567,20 +589,38 @@ class CodexHarness:
 
         try:
             if proc_stdout is not None:
+                data_lock = threading.Lock()
                 kept_lines = []
                 tail_agent_lines = collections.deque(maxlen=32)
                 total_bytes = 0
+                stderr_lines = collections.deque(maxlen=64)
+                stderr_bytes = 0
 
                 def _drain():
                     nonlocal total_bytes
                     try:
                         for line in proc_stdout:
                             line_len = len(line.encode("utf-8", errors="ignore"))
-                            if '"agent_message"' in line:
-                                tail_agent_lines.append(line)
-                            if total_bytes < MAX_STDOUT_BYTES:
-                                kept_lines.append(line)
-                                total_bytes += line_len
+                            with data_lock:
+                                if '"agent_message"' in line:
+                                    tail_agent_lines.append(line)
+                                if total_bytes < MAX_STDOUT_BYTES:
+                                    kept_lines.append(line)
+                                    total_bytes += line_len
+                    except Exception:
+                        pass
+
+                def _drain_stderr():
+                    nonlocal stderr_bytes
+                    try:
+                        for line in proc_stderr:
+                            line_len = len(line.encode("utf-8", errors="ignore"))
+                            with data_lock:
+                                stderr_lines.append(line[-400:] if len(line) > 400 else line)
+                                stderr_bytes += line_len
+                                while stderr_bytes > MAX_STDERR_BYTES and len(stderr_lines) > 1:
+                                    dropped = stderr_lines.popleft()
+                                    stderr_bytes -= len(dropped.encode("utf-8", errors="ignore"))
                     except Exception:
                         pass
 
@@ -588,6 +628,12 @@ class CodexHarness:
                     target=_drain, name="echo-codex-stdout", daemon=True
                 )
                 reader.start()
+                stderr_reader = None
+                if proc_stderr is not None:
+                    stderr_reader = threading.Thread(
+                        target=_drain_stderr, name="echo-codex-stderr", daemon=True
+                    )
+                    stderr_reader.start()
                 try:
                     proc.wait(timeout=self.timeout)
                 except subprocess.TimeoutExpired:
@@ -606,13 +652,27 @@ class CodexHarness:
                             proc_stdout.close()
                         except OSError:
                             pass
-                if total_bytes >= MAX_STDOUT_BYTES and tail_agent_lines:
-                    stdout = "".join(kept_lines) + "\n" + "".join(tail_agent_lines)
-                else:
-                    stdout = "".join(kept_lines)
+                    if stderr_reader is not None:
+                        stderr_reader.join(timeout=1)
+                        if not stderr_reader.is_alive():
+                            try:
+                                proc_stderr.close()
+                            except OSError:
+                                pass
+                with data_lock:
+                    if total_bytes >= MAX_STDOUT_BYTES and tail_agent_lines:
+                        stdout = "".join(kept_lines) + "\n" + "".join(tail_agent_lines)
+                    else:
+                        stdout = "".join(kept_lines)
+                    stderr_tail = "".join(stderr_lines).strip()[-400:]
             else:
                 try:
-                    stdout, _ = proc.communicate(timeout=self.timeout)
+                    comm_res = proc.communicate(timeout=self.timeout)
+                    if isinstance(comm_res, tuple) and len(comm_res) >= 2:
+                        stdout, stderr_raw = comm_res[0], comm_res[1]
+                    else:
+                        stdout, stderr_raw = comm_res, ""
+                    stderr_tail = str(stderr_raw or "").strip()[-400:]
                 except subprocess.TimeoutExpired:
                     timed_out = True
                     _kill_process_group()
@@ -621,12 +681,12 @@ class CodexHarness:
                     except (subprocess.TimeoutExpired, OSError):
                         pass
         finally:
-            if not timed_out:
+            rc = getattr(proc, "returncode", 0)
+            if not timed_out and rc in (0, None):
                 collected = self._collect_outbox(
                     outbox_dir, task_id, expected_task_dir=task_dir
                 )
             shutil.rmtree(task_dir, ignore_errors=True)
-            cleanup_outbox(self.outbox_root)
 
         elapsed = round(time.monotonic() - started, 1)
         if timed_out:
@@ -642,10 +702,21 @@ class CodexHarness:
             }
         answer = parse_events(stdout, MAX_OUTPUT)
         rc = getattr(proc, "returncode", 0)
+        if rc not in (0, None):
+            err_msg = "exit {}".format(rc)
+            if stderr_tail:
+                err_msg = "{}: {}".format(err_msg, stderr_tail)
+            return {
+                "status": "error",
+                "text": "",
+                "partial": answer[:400],
+                "files": [],
+                "elapsed": elapsed,
+                "timeout": self.timeout,
+                "error": err_msg[:400],
+            }
         if answer or collected:
             status, err_msg = "ok", ""
-        elif rc not in (0, None):
-            status, err_msg = "error", "exit {}".format(rc)
         else:
             status, err_msg = "empty", "empty output"
         return {
