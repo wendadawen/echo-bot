@@ -156,11 +156,25 @@ class ContextBuilder:
                     quoted_part = _wrap_background("被引用的是：" + info.quoted[:100])
             elif batch is not None and getattr(batch, "mentioned", False):
                 directives.append("这次有人明确点到了你，必须回应")
+            if batch is not None and getattr(batch, "images", None):
+                directives.append(
+                    "本批已成功收到 {} 张图片，随时可用 view_image 查看；"
+                    "若群友在问图片、截图或表情包内容，绝不要说没收到图片。".format(
+                        len(batch.images)
+                    )
+                )
+            image_notes = getattr(batch, "image_notes", None) if batch is not None else None
+            img_note_part = (
+                _wrap_background("已查看本批附带图片：" + "；".join(str(x) for x in image_notes if x))
+                if image_notes else ""
+            )
             out_parts = []
             if directives:
                 out_parts.append("；".join(directives))
             if quoted_part:
                 out_parts.append(quoted_part)
+            if img_note_part:
+                out_parts.append(img_note_part)
             return "\n".join(out_parts)
         if name == "quoting":
             rows = self.quoting.get(group_id) or []

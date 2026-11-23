@@ -282,6 +282,266 @@ class TestEventIntegrationAndMentions(unittest.TestCase):
 
                     asyncio.run(run_flow())
 
+    def test_image_followup_quote_face_mface_and_auto_preview(self) -> None:
+        import importlib
+        import struct
+        import threading
+        import types
+        from unittest.mock import MagicMock, patch
+
+        stubs, comp, _ = _make_astrbot_stubs()
+        png_bytes = (
+            b"\x89PNG\r\n\x1a\n"
+            + struct.pack(">II", 64, 64)
+            + b"\x08\x06\x00\x00\x00"
+            + b"0" * 64
+        )
+
+        class _FakeContext:
+            def __init__(self):
+                self.sent = []
+
+            async def send_message(self, umo, chain):
+                self.sent.append((umo, chain))
+
+        class _FakeInspectModel:
+            def __init__(self):
+                self.vision_calls = []
+                self.reply_calls = []
+
+            def vision_reply(self, prompt, image_uri):
+                self.vision_calls.append((prompt, image_uri))
+                return "一串橙色珠子在阳光下围成圆环"
+
+            def reply(self, system, history, user_text):
+                self.reply_calls.append((system, history, user_text))
+                return '{"action":"reply","text":"看清楚了，是一串橙色珠子"}'
+
+        class _FakeEvent:
+            def __init__(
+                self,
+                group_id,
+                text,
+                parts,
+                sender_id="2573394163",
+                sender_name="炸芋花",
+                at_or_wake=False,
+                raw_message=None,
+            ):
+                self.group_id = group_id
+                self.text = text
+                self.parts = list(parts)
+                self.sender_id = sender_id
+                self.sender_name = sender_name
+                self._at_or_wake = at_or_wake
+                self.unified_msg_origin = f"aiocqhttp:GroupMessage:{group_id}"
+                self.bot = None
+                self.message_obj = types.SimpleNamespace(
+                    raw_message=raw_message if raw_message is not None else {"post_type": "message"},
+                    message_str=text,
+                    message=self.parts,
+                )
+
+            def get_sender_id(self):
+                return self.sender_id
+
+            def get_sender_name(self):
+                return self.sender_name
+
+            def get_self_id(self):
+                return "999999"
+
+            def get_group_id(self):
+                return self.group_id
+
+            def get_platform_name(self):
+                return "aiocqhttp"
+
+            def get_messages(self):
+                return self.parts
+
+            def get_message_str(self):
+                return self.text
+
+            def is_at_or_wake_command(self):
+                return self._at_or_wake
+
+            def should_call_llm(self, flag):
+                return None
+
+            def stop_event(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(sys.modules, stubs):
+                sys.modules.pop("astrbot_plugin_echo.main", None)
+                import astrbot_plugin_echo.main as echo_main
+
+                importlib.reload(echo_main)
+
+                async def run_flow():
+                    ctx = _FakeContext()
+                    with patch.object(echo_main.StarTools, "get_data_dir", lambda *a, **kw: tmpdir):
+                        echo = echo_main.Echo(ctx, config={})
+                    fake_model = _FakeInspectModel()
+                    echo.model = fake_model
+                    echo.brain.model = fake_model
+                    echo.brain.tool_loop.model = fake_model
+                    # 停掉后台循环避免与测试手工 _process_batch 竞争。
+                    for tname in ("_reminder_task", "_chat_task"):
+                        task = getattr(echo, tname, None)
+                        if task is not None:
+                            task.cancel()
+                            setattr(echo, tname, None)
+
+                    collect_started = threading.Event()
+                    collect_gate = threading.Event()
+
+                    def slow_collect(*args, **kwargs):
+                        collect_started.set()
+                        collect_gate.wait(timeout=4.0)
+
+                    download_mock = MagicMock(return_value=png_bytes)
+                    try:
+                        with patch.object(echo, "_download", new=download_mock), patch.object(
+                            echo.emoji_bank, "collect", side_effect=slow_collect
+                        ):
+                            # 1) 未@独立图片：写库 [图片] + 附带字节到 rhythm，慢 collect 不阻塞后续 @bot 批处理且自动预览
+                            gid1 = "1057446698"
+                            img_ev = _FakeEvent(
+                                gid1,
+                                "",
+                                [comp.Image(url="https://cdn.example.com/bead.png", subType=1)],
+                            )
+                            async for _ in echo.on_group_message(img_ev):
+                                pass
+                            await asyncio.sleep(0.05)
+                            # 允许图片先挂到 rhythm，同时 slow_collect 仍被 gate 阻塞
+                            stored_msgs = (
+                                echo.store.recent(f"aiocqhttp:{gid1}", 10)
+                                or echo.store.recent(gid1, 10)
+                            )
+                            self.assertTrue(
+                                any("[图片]" in str(m.get("text") or "") for m in stored_msgs),
+                                f"未@图片应记入历史 [图片]，实际: {stored_msgs}",
+                            )
+                            follow_ev = _FakeEvent(
+                                gid1,
+                                "这个是什么",
+                                [comp.At("999999"), comp.Plain(" 这个是什么")],
+                                at_or_wake=True,
+                            )
+                            async for _ in echo.on_group_message(follow_ev):
+                                pass
+                            batches1 = echo.rhythm.due(time.time() + 20)
+                            self.assertTrue(batches1)
+                            t0 = time.monotonic()
+                            await echo._process_batch(batches1[-1])
+                            elapsed = time.monotonic() - t0
+                            self.assertLess(elapsed, 1.5, f"慢 emoji_bank.collect 不应阻塞 _process_batch ({elapsed:.2f}s)")
+                            self.assertTrue(collect_started.wait(timeout=1.0))
+                            self.assertGreaterEqual(len(fake_model.vision_calls), 1)
+                            chat_calls1 = [
+                                (s, u) for (s, _h, u) in fake_model.reply_calls
+                                if "事实记忆" not in f"{s}\n{u}"
+                            ]
+                            self.assertTrue(chat_calls1)
+                            sys_prompt, user_prompt = chat_calls1[-1]
+                            combined_prompt = f"{sys_prompt}\n{user_prompt}"
+                            self.assertIn("本批已成功收到 1 张图片", combined_prompt)
+                            self.assertIn("已查看本批附带图片", combined_prompt)
+
+                            # 2) 引用图片 Reply.chain + @bot -> _extract_quote 含 [图片]，且 "我说你看..." 不误判 retold
+                            from astrbot_plugin_echo.core import mentions as echo_mentions
+
+                            self.assertFalse(echo_mentions.is_retold("我说你看我发的图片是什么"))
+                            self.assertFalse(echo_mentions.is_retold("但是我说你看这个"))
+                            self.assertTrue(echo_mentions.is_retold("但是他在说你诶"))
+                            self.assertTrue(echo_mentions.is_retold("小明跟我说你很聪明"))
+
+                            gid2 = "2057446698"
+                            quote_ev = _FakeEvent(
+                                gid2,
+                                "我说你看我发的图片是什么",
+                                [
+                                    comp.Reply(
+                                        sender_id="2573394163",
+                                        sender_nickname="炸芋花",
+                                        message_str="",
+                                        chain=[comp.Image(url="https://cdn.example.com/quoted.png", subType=0)],
+                                    ),
+                                    comp.At("999999"),
+                                    comp.Plain(" 我说你看我发的图片是什么"),
+                                ],
+                                at_or_wake=True,
+                            )
+                            quote_text = echo._extract_quote(quote_ev)
+                            self.assertIn("[图片]", quote_text)
+                            async for _ in echo.on_group_message(quote_ev):
+                                pass
+                            batches2 = echo.rhythm.due(time.time() + 20)
+                            self.assertEqual(1, len(batches2))
+                            vision_before = len(fake_model.vision_calls)
+                            reply_before = len(fake_model.reply_calls)
+                            await echo._process_batch(batches2[0])
+                            self.assertGreater(len(fake_model.vision_calls), vision_before)
+                            chat_calls2 = [
+                                (s, u) for (s, _h, u) in fake_model.reply_calls[reply_before:]
+                                if "事实记忆" not in f"{s}\n{u}"
+                            ]
+                            self.assertTrue(chat_calls2)
+                            sys_p2, user_p2 = chat_calls2[-1]
+                            combined2 = f"{sys_p2}\n{user_p2}"
+                            self.assertIn("本批已成功收到 1 张图片", combined2)
+                            self.assertIn("已查看本批附带图片", combined2)
+
+                            # 3) @bot [Face(id=76)] 这个是什么表情包 -> 文本含 [QQ表情:赞]
+                            gid3 = "3057446698"
+                            face_ev = _FakeEvent(
+                                gid3,
+                                "这个是什么表情包",
+                                [comp.At("999999"), comp.Face(id=76), comp.Plain(" 这个是什么表情包")],
+                                at_or_wake=True,
+                            )
+                            async for _ in echo.on_group_message(face_ev):
+                                pass
+                            batches3 = echo.rhythm.due(time.time() + 20)
+                            self.assertEqual(1, len(batches3))
+                            self.assertIn("[QQ表情:赞]", batches3[0].body_text)
+
+                            # 4) OneBot mface 商城表情 -> 含 [商城表情:<summary>] 且下载 url 附图
+                            gid4 = "4057446698"
+                            mface_url = "https://gxh.vip.qq.com/club/item/parcel/item/ab/abcd/raw300.gif"
+                            mface_ev = _FakeEvent(
+                                gid4,
+                                "这个商城表情呢",
+                                [comp.At("999999"), comp.Plain(" 这个商城表情呢")],
+                                at_or_wake=True,
+                                raw_message={
+                                    "post_type": "message",
+                                    "message": [
+                                        {
+                                            "type": "mface",
+                                            "data": {"summary": "开心小猫", "url": mface_url},
+                                        }
+                                    ],
+                                },
+                            )
+                            async for _ in echo.on_group_message(mface_ev):
+                                pass
+                            batches4 = echo.rhythm.due(time.time() + 20)
+                            self.assertEqual(1, len(batches4))
+                            self.assertIn("[商城表情:开心小猫]", batches4[0].body_text)
+                            await echo._process_batch(batches4[0])
+                            downloaded_urls = [c.args[0] for c in download_mock.call_args_list if c.args]
+                            self.assertIn(mface_url, downloaded_urls)
+                            self.assertGreaterEqual(len(batches4[0].images), 1)
+                    finally:
+                        collect_gate.set()
+                        await echo.terminate()
+
+                asyncio.run(run_flow())
+
 
 class TestExplicitMentionAndActions(unittest.TestCase):
     def test_explicit_mention_forbids_silent_and_wait_forces_reply(self):

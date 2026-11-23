@@ -22,6 +22,7 @@ from . import compaction, mentions
 from .harness import DEFAULT_TIMEOUT, cleanup_file_entry
 from .rhythm import Batch
 from .schedule import WEEKDAYS, parse_clock
+from .vision import describe as vision_describe
 
 # 人设改写自 whyever77/dafeiyu-astrbot（MIT）的「大肥鱼」人格设定，
 # 按本项目的群聊能力裁剪：去掉主人私聊、虚拟手机、语音与 B 站工具部分。
@@ -700,6 +701,22 @@ class Brain:
         group_style = learn_style(style_texts, self._styles.get(group))
         self._styles[group] = group_style
 
+        batch_images = list(getattr(batch, "images", None) or [])
+        if (
+            batch_images
+            and info.mentioned
+            and hasattr(self.model, "vision_reply")
+            and not getattr(batch, "image_notes", None)
+            and self._wants_image_preview(body_text, quote_text)
+        ):
+            notes = [
+                vision_describe(self.model, data, hint=body_text)
+                for data in batch_images[:2]
+            ]
+            notes = [str(n).strip()[:160] for n in notes if str(n or "").strip()]
+            if notes:
+                batch.image_notes = notes
+
         system = self.context_builder.build(
             group, body_text, user_name, batch, history,
             persona=persona, style=group_style,
@@ -770,9 +787,9 @@ class Brain:
                 images = getattr(batch, "images", None) or []
                 if not images:
                     return False, "这批消息里没有可看的图"
-                from .vision import describe
-
-                lines = [describe(self.model, data, hint=payload) for data in images[:2]]
+                if not str(payload or "").strip() and getattr(batch, "image_notes", None):
+                    return False, "；".join(batch.image_notes)
+                lines = [vision_describe(self.model, data, hint=payload) for data in images[:2]]
                 return False, "；".join(line for line in lines if line) or "图里没看出什么"
             if action == "read_result":
                 return False, self.tool_loop.results.get(group_id, payload)
@@ -972,6 +989,16 @@ class Brain:
     @staticmethod
     def _is_direct_task(text):
         return any(hint in str(text or "") for hint in TASK_HINTS)
+
+    @staticmethod
+    def _wants_image_preview(body_text, quote_text=""):
+        combined = "{} {}".format(body_text or "", quote_text or "")
+        if "[图片]" in combined or str(body_text or "").strip() == "（只 @ 了你一下，没说话）":
+            return True
+        return any(
+            k in str(body_text or "")
+            for k in ("图", "照片", "截图", "表情", "画", "看", "瞅", "认", "识别", "这是", "这个", "啥", "什么")
+        )
 
     def _build_codex_task(self, prompt):
         """拼装 Codex 任务指令并显式注入当前超时预算与调研交卷线。"""

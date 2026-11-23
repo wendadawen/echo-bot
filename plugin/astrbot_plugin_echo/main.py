@@ -14,6 +14,7 @@ import socket
 import struct
 import sys
 import time
+import types
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -41,11 +42,11 @@ from .core.modes import ModePolicy
 from .core.monitor import Monitor
 from .core.person_info import PersonStore
 from .core.prompts import PersonaLibrary, PromptStore
-from .core.rhythm import Item, Rhythm
+from .core.rhythm import IMAGE_TTL, Item, Rhythm
 from .core.schedule import Schedule
 from .core.store import Store, cleanup_runtime_caches
 from .core.subagent import SubAgentManager
-from .core.vision import EmojiBank
+from .core.vision import FACE_LABELS, EmojiBank
 
 PLUGIN_NAME = "astrbot_plugin_echo"
 MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024
@@ -368,16 +369,19 @@ class Echo(Star):
                 forward_text = forward_render(lines)
                 break
         group_id = "{}:{}".format(event.get_platform_name(), raw_gid)
+        umo = str(event.unified_msg_origin or "")
+        user_name = str(event.get_sender_name() or sender)
         self.heartbeat.observe(group_id)
         # 含链接且未被 @，或卡片/语音/戳一戳/视频等组件且无正文：放行给 link_resolver 等其它插件。
         if ("http://" in text or "https://" in text) and not mentioned:
             return
         if not text and not forward_text and self._has_passthrough_component(parts):
             return
-        will_queue = bool(text or forward_text or mentioned)
-        # 表情/图片先收进仓库；纯未点名图片仅入库表情包，被 @ 引用里的图也一并拉取供看图。
+        # 无论是否被 @，群里发出的图片都先快速下载挂入待看图队列，供几秒内追问「这是什么」时读取。
         has_image = False
         collected_images = 0
+        face_tags = []
+        mface_tags = []
 
         def _track_image(part_obj, attach_flag):
             nonlocal collected_images
@@ -393,31 +397,65 @@ class Echo(Star):
 
         for part in parts:
             if isinstance(part, Face):
-                if self.emoji_bank:
+                fid = str(getattr(part, "id", "") or "").strip()
+                fname = str(getattr(part, "name", "") or FACE_LABELS.get(fid) or "").strip()
+                if self.emoji_bank and fid:
                     await asyncio.to_thread(
-                        self.emoji_bank.collect_face, group_id,
-                        getattr(part, "id", ""), getattr(part, "name", ""),
+                        self.emoji_bank.collect_face, group_id, fid, fname,
                     )
+                tag_label = fname or (("ID" + fid) if fid else "")
+                if tag_label and len(face_tags) < 3:
+                    face_tags.append("[QQ表情:{}]".format(tag_label))
             elif isinstance(part, Image):
                 has_image = True
-                _track_image(part, will_queue)
+                _track_image(part, True)
             elif isinstance(part, Reply) and mentioned:
                 for qseg in getattr(part, "chain", None) or []:
                     if isinstance(qseg, Image):
                         has_image = True
                         _track_image(qseg, True)
-        # 空消息：纯 @ 视作拍了拍自然回应；带图且被 @ 视作看图；无内容无 @ 直接拦截，避免触发默认 LLM。
+
+        # AstrBot aiocqhttp 适配器会跳过 QQ 商城表情 (mface)，这里从 raw_message 补回文案与图片 URL。
+        if isinstance(raw_msg, dict) and isinstance(raw_msg.get("message"), list):
+            for seg in raw_msg["message"]:
+                if isinstance(seg, dict) and seg.get("type") == "mface":
+                    mdata = seg.get("data") or {}
+                    msum = str(mdata.get("summary") or "").strip().strip("[]")
+                    murl = str(mdata.get("url") or "").strip()
+                    if len(mface_tags) < 2:
+                        mface_tags.append("[商城表情:{}]".format(msum or "表情"))
+                    if murl:
+                        has_image = True
+                        _track_image(
+                            types.SimpleNamespace(
+                                url=murl, file="", path="", base64="",
+                                subType="1", summary=msum,
+                            ),
+                            True,
+                        )
+
+        media_prefix = " ".join(face_tags + mface_tags).strip()
         if not text and not forward_text:
-            if mentioned and has_image:
-                text = "[图片]"
-            elif mentioned:
-                text = "（只 @ 了你一下，没说话）"
-            else:
+            if not mentioned:
+                if has_image or mface_tags:
+                    marker = " ".join(mface_tags + (["[图片]"] if has_image else [])).strip()
+                    await asyncio.to_thread(
+                        self.store.add_message, group_id, sender, user_name, "user", marker
+                    )
                 event.stop_event()
                 return
+            if media_prefix:
+                text = (media_prefix + (" [图片]" if has_image else "")).strip()
+            elif has_image:
+                text = "[图片]"
+            else:
+                text = "（只 @ 了你一下，没说话）"
+        elif not text.startswith(("/", "／")):
+            if media_prefix:
+                text = "{} {}".format(media_prefix, text).strip()
+            if has_image and "[图片]" not in text:
+                text = "{} [图片]".format(text).strip()
 
-        umo = str(event.unified_msg_origin or "")
-        user_name = str(event.get_sender_name() or sender)
         self._last_umo[group_id] = umo
         message = Message(group_id, sender, user_name, text, mentioned, umo)
         # 新消息提前唤醒 wait 倒计时。
@@ -440,6 +478,18 @@ class Echo(Star):
         ))
         event.stop_event()
         return
+
+    async def _save_emoji(self, group_id, data):
+        if not self.emoji_bank:
+            return
+        try:
+            label = await asyncio.to_thread(
+                self.emoji_bank.collect, group_id, data, self.model
+            )
+            if label:
+                logger.info("表情已收：%s", label)
+        except Exception as exc:
+            logger.info("表情收集失败：%s", exc)
 
     async def _collect_image(self, group_id, part, attach=True):
         if not self.emoji_bank and not attach:
@@ -488,14 +538,8 @@ class Echo(Star):
         if attach:
             self.rhythm.attach_image(group_id, data)
         if self.emoji_bank and _is_sticker_image(part, data):
-            try:
-                label = await asyncio.to_thread(
-                    self.emoji_bank.collect, group_id, data, self.model
-                )
-                if label:
-                    logger.info("表情已收：%s", label)
-            except Exception as exc:
-                logger.info("表情收集失败：%s", exc)
+            # VLM 入库标注放到独立后台任务，绝不阻塞 _pending_images 的看图放行。
+            self._spawn_bg(self._save_emoji(group_id, data))
 
     @staticmethod
     def _download(url):
@@ -516,14 +560,24 @@ class Echo(Star):
         for part in event.get_messages():
             if not isinstance(part, Reply):
                 continue
+            chain = getattr(part, "chain", None) or []
             body = str(getattr(part, "message_str", "") or getattr(part, "text", "") or "").strip()
             if not body:
                 segs = []
-                for seg in getattr(part, "chain", None) or []:
-                    seg_text = getattr(seg, "text", None)
-                    if seg_text:
-                        segs.append(str(seg_text))
+                for seg in chain:
+                    if isinstance(seg, Image):
+                        segs.append("[图片]")
+                    elif isinstance(seg, Face):
+                        fid = str(getattr(seg, "id", "") or "").strip()
+                        fname = str(getattr(seg, "name", "") or FACE_LABELS.get(fid) or "").strip()
+                        segs.append("[QQ表情:{}]".format(fname or fid or "表情"))
+                    else:
+                        seg_text = getattr(seg, "text", None)
+                        if seg_text:
+                            segs.append(str(seg_text))
                 body = " ".join(segs).strip()
+            elif any(isinstance(seg, Image) for seg in chain) and "[图片]" not in body:
+                body = (body + " [图片]").strip()
             body = re.sub(r"\s+", " ", body)[:100]
             sender_name = str(getattr(part, "sender_nickname", "") or "").strip()
             if sender_name and body:
@@ -589,7 +643,7 @@ class Echo(Star):
                     pass
             fresh_imgs = [
                 data for stamp, data in self.rhythm._images.pop(group, [])
-                if time.time() - stamp <= 60.0
+                if time.time() - stamp <= IMAGE_TTL
             ]
             if fresh_imgs:
                 existing = list(getattr(batch, "images", None) or [])

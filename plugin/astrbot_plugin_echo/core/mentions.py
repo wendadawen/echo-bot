@@ -19,9 +19,20 @@ QUESTION_WORDS = (
     "有没有", "什么", "啥", "谁", "多少", "多久",
     "哪个", "哪里", "哪儿", "哪种",
 )
+_NON_RETOLD_PREFIXES = (
+    "话说", "别说", "再说", "别讲", "要说", "虽说", "瞎说", "乱说",
+    "怎么说", "这么说", "那样说", "这样说", "就是说", "也就是说", "刚才说",
+)
+_SELF_SPEAKER_SUBJ = re.compile(
+    r"^(?:但是|不过|其实|刚才|刚刚|然后|所以|反正|而且|但|可|可是|那|嗯|哎|诶)?"
+    r"(?:我们|咱们|你们|我|咱|俺|你|您)"
+    r"(?:不是|只是|就是|本来|其实|刚才|刚刚|已经|真的|没有|不会|不要|不能|不想|不敢|"
+    r"跟我|跟你|和他|和她|对你|对我|跟|和|对|就|是|想|只|才|也|还|又|都|刚|先|再|真|没|不|别){0,2}$"
+)
 _RETOLD_DYNAMIC = re.compile(
-    r"(?:^|[\s，,。！？])(?!(?:话说|别说|再说|别讲|要说|虽说|瞎说|乱说))"
-    r"[\u4e00-\u9fffA-Za-z0-9_]{1,6}(?:在)?(?:说|讲|评价)(?:你|他|她)"
+    r"(?:^|[\s，,。！？])"
+    r"(?P<subj>[\u4e00-\u9fffA-Za-z0-9_]{1,6})"
+    r"(?:在)?(?:说|讲|评价)(?:你|他|她)"
 )
 
 
@@ -71,7 +82,14 @@ def is_retold(text):
         return False
     if any(marker in clean for marker in RETOLD_MARKERS):
         return True
-    return bool(_RETOLD_DYNAMIC.search(clean))
+    for m in _RETOLD_DYNAMIC.finditer(clean):
+        matched = m.group(0).lstrip(" \t\r\n，,。！？")
+        if matched.startswith(_NON_RETOLD_PREFIXES):
+            continue
+        if _SELF_SPEAKER_SUBJ.match(m.group("subj")):
+            continue
+        return True
+    return False
 
 
 def extract_targets(text, known_names=(), self_names=()):

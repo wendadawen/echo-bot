@@ -47,6 +47,7 @@ ACTION_PROMPT = (
     '例：{"action":"subagent","reply":"抱歉刚才漏了，我现在补查。","text":"调研目前先进的 MoE offloading 论文并输出报告"}。\n'
     "  严禁在纯 reply 里口头承诺“我现在去查/补查/马上帮你查/我去搜一下”却不派 subagent；"
     "决定要查或要做就必须直接选 action=\"subagent\"。\n"
+    "- 群友发了图、引用了图或问图里是什么且 view_image 可用 → 先用 view_image 看清画面，再结合结果 reply，绝不要没看图就说没收到图；\n"
     "- 纯闲聊、情绪、玩笑、稳定常识、群内已知信息 → reply，最多两句；\n"
     "- 确实不该接话 → silent。\n"
     "群聊支持生成并发送本地文件（HTML/代码/文档等）到群里，但无法部署到公网/IP、"
