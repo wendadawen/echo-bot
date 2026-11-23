@@ -19,7 +19,7 @@ import time
 import uuid
 from pathlib import Path
 
-MAX_OUTPUT = 800
+MAX_OUTPUT = 1200
 DEFAULT_TIMEOUT = 300
 MIN_TIMEOUT = 180
 MAX_TIMEOUT = 600
@@ -392,8 +392,11 @@ class CodexHarness:
         env = {}
         for key in _SAFE_ENV_KEYS:
             val = os.environ.get(key)
-            if val is not None:
-                env[key] = val
+            if val is None:
+                continue
+            if "proxy" in key.lower() and not str(val).strip():
+                continue
+            env[key] = val
         env.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
         env["CODEX_HOME"] = str(task_codex_home)
         env["HOME"] = str(task_dir)

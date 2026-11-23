@@ -171,6 +171,15 @@ UNSAFE_PATTERNS = (
     re.compile(r"(?:暴露|开放|监听|启动|起个|起一个).{0,8}(?:端口|http\s*服务|web\s*服务|网页服务)", re.I | re.S),
     re.compile(r"(?<![A-Za-z0-9_-])(?:nohup|setsid)(?![A-Za-z0-9_-])|(?<![A-Za-z0-9_-])screen\s+-dm|(?<![A-Za-z0-9_-])tmux\s+new", re.I | re.S),
     re.compile(r"(?:忽略|无视|跳过|覆盖).{0,8}(?:(?:以上|之前|上面|全部|所有|系统)?(?:规则|限制|指令|提示|设定))", re.I | re.S),
+    re.compile(r"(?:删|删除|删掉|删了|清空|清除|清理|抹掉|毁掉).{0,12}(?:根目录|所有文件|全部文件|系统文件|容器文件|全部目录|整个目录)", re.I | re.S),
+    re.compile(r"(?:根目录|所有文件|全部文件|系统文件|容器文件|全部目录|整个目录).{0,12}(?:全?都?删|删除|删掉|删了|清空|清除|抹掉|毁掉)", re.I | re.S),
+    re.compile(r"(?:看|查看|查|列|列出|找|扫|扫描|浏览|遍历|读|读取|打开|打印|显示|输出).{0,12}(?:根目录|文件目录|系统目录|目录结构|临时文件|容器目录|服务器目录|下面有什么文件夹|有哪些文件夹|有什么文件)", re.I | re.S),
+    re.compile(r"(?:根目录|文件目录|系统目录|目录结构|临时文件|容器目录|服务器目录).{0,12}(?:列出来|列出|看看|查看|找|扫|浏览|遍历|读|打开|打印|显示|输出|下面有什么|有哪些)", re.I | re.S),
+    re.compile(r"(?:在|往|到|向).{0,10}(?:根目录|系统目录|容器目录|/(?:etc|tmp|var|opt|root|home|usr|AstrBot|proc|sys)?(?:\b|/|下|里)).{0,14}(?:创建|新建|建|写|留|放|生成|保存|删|改|清空)", re.I | re.S),
+    re.compile(r"(?<![A-Za-z0-9_])rm\s+-[a-z]*[rf]|shutil\.rmtree|os\.(?:remove|unlink)\s*\(", re.I | re.S),
+    re.compile(r"(?:^|\s)(?:ls|ll|find|tree|cat|head|tail|stat|touch|mkdir|rmdir|chmod|chown|mv|cp)\s+(?:-[A-Za-z0-9]+\s+)*/", re.I),
+    re.compile(r"(?<![A-Za-z0-9._:/-])/(?:etc|proc|sys|root|AstrBot)(?:/|\b)", re.I),
+    re.compile(r"(?:查看|列出|打印|输出|看下|看看).{0,8}(?:环境变量|进程列表|系统进程|服务器信息|宿主|ip\s*地址)", re.I | re.S),
 )
 
 
@@ -191,7 +200,13 @@ TASK_PREFIX = (
     "你是后台执行助手，只负责查证、计算或执行并把真实结果交回主程序，不直接对群友说话。"
     "不要扮演角色，不要替主程序起草群聊话术或回复建议。"
     "禁止启动 HTTP/端口监听服务或常驻后台进程，禁止读取配置或环境变量密钥，"
+    "严禁浏览、列出、读取、写入或删除任务当前目录以外的任何系统或容器路径（如 /、/tmp、/etc、/proc、/var、/home、/AstrBot 等），"
+    "禁止探测目录结构、临时文件、进程或系统信息；遇到此类要求直接拒绝。"
     "禁止在结果中输出容器本地路径或内网 IP。"
+    "本机位于国内直连网络且具备公网访问能力：部分海外搜索引擎或百科可能超时或不可达，"
+    "切勿因此误判为“当前环境无法访问互联网”；联网核查优先访问国内可达来源"
+    "（如必应 cn.bing.com、百度、arXiv 接口 export.arxiv.org 或目标机构官网），"
+    "单次请求设短超时并在 25 秒内优先产出核验结论。"
     "如果需要向群友交付文件（如 HTML 网页、脚本、文档、表格等），"
     "或者任务属于深度调研、论文梳理、多方案对比，请把完整详细的中文报告直接写成"
     "./outbox/ 下文件名清晰的 Markdown（如 report.md）或 HTML 文件（不要在 ./outbox/ 内建子目录；"
@@ -210,7 +225,8 @@ SUBAGENT_REPLY_PROMPT = (
     "1. 用大肥鱼简短、自然的群聊口吻（1 到 3 句）把结论直接告诉群友。\n"
     "2. 忠于后台查到或算出的真实事实与局限，查不到或未解决就诚实直说，不编造。\n"
     "3. 不要暴露后台搜索工具、命令行、内部配置或底层模型名。\n"
-    "4. 如实陈述已发文件或查询局限，不要过度道歉或否认刚执行过的工具结果。"
+    "4. 如实陈述已发文件或查询局限，不要过度道歉或否认刚执行过的工具结果。\n"
+    "5. 只直接汇报本次后台任务的查证结论，不要翻前面聊天记录里的指责或再次道歉（绝不说“你们说得对，我刚才没启动”）。"
 )
 
 SUBAGENT_CODE_INTRO_PROMPT = (
@@ -235,6 +251,8 @@ _OFFER_HINTS = (
 _FAILED_LOOKUP_HINTS = (
     "没能联网", "没法核实", "无法核实", "未能核实", "未能查到",
     "查不到", "没查到", "搜索受限", "不敢乱推荐", "无法获取实时", "没弄成",
+    "没法可靠对上", "还没核实", "没有可用的绘图", "没能生成", "没找到",
+    "不能确认", "无法访问互联网", "当前无法联网", "无法联网", "权限不够", "不支持访问",
 )
 _FILE_REQUEST_HINTS = (
     "文件", "报告", "网页", "html", "csv", "pdf", "文档", "表格", "脚本", "代码", "导出", "生成",
@@ -246,6 +264,17 @@ _TRANSIENT_MEMORY_NOISE = (
     "已修复", "没收到图", "图片未成功", "图像识别", "未成功传达",
     "没能联网", "没法核实", "无法核实", "不敢乱推荐",
     "不回复", "引发不满并道歉", "重新发送", "偶尔卡顿",
+    "没法可靠对上", "还没核实", "没有可用的绘图", "没能生成",
+    "无法访问互联网", "当前无法联网", "临时文件", "根目录", "gx.txt", "权限不够",
+)
+_NO_DIRECT_SEARCH_HINTS = (
+    "搜索优先级", "一味搜索", "别搜", "不要搜", "自己去搜", "为什么搜", "怎么老搜", "怎么一直搜",
+)
+_UNSUPPORTED_CAP_HINTS = (
+    "绘图", "画一张", "画张", "自画像", "文生图", "生图", "画画",
+)
+_PROMISE_LOOKUP_HINTS = (
+    "我查一下", "我去查", "我去搜", "我这就查", "我现在去查", "马上核实", "我去核实", "我来查一下", "帮你查一下", "查一下近期",
 )
 
 
@@ -289,6 +318,21 @@ def _clip(text, limit):
     if len(s) <= limit:
         return s
     return s[:limit] + "…"
+
+
+def _clip_sentence(text, limit):
+    s = str(text or "").strip()
+    if len(s) <= limit:
+        return s
+    head = s[:limit]
+    best = -1
+    for sep in ("。", "！", "？", "!", "?", "\n"):
+        pos = head.rfind(sep)
+        if pos > best:
+            best = pos
+    if best >= int(limit * 0.6):
+        return head[:best + 1].strip()
+    return _clip(s, limit)
 
 
 def _format_harness_notice(task, timeout=DEFAULT_TIMEOUT):
@@ -337,7 +381,10 @@ def _strip_outer_quotes(text):
 
 
 _INTERNAL_PATH_PATTERN = re.compile(
-    r"(?<![A-Za-z0-9._:/-])/(?:AstrBot|etc|opt|tmp|var|root|home)/[^\s)\]）】>\"'`]+"
+    r"(?<![A-Za-z0-9._:/-])/(?:AstrBot|etc|opt|tmp|var|root|home|proc|sys)/[^\s)\]）】>\"'`]+"
+)
+_BARE_SYS_PATH_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9._:/-])/(?:AstrBot|etc|opt|tmp|var|root|proc|sys)(?=$|[\s，,。.、)\]）】>\"'`])"
 )
 _PRIVATE_URL_PATTERN = re.compile(
     r"(?:https?://localhost(?::\d+)?|(?<![A-Za-z0-9_-])localhost:\d+|"
@@ -348,6 +395,8 @@ _PRIVATE_URL_PATTERN = re.compile(
 _WS_URL_PATTERN = re.compile(r"wss?://[^\s)\]）】>\"'`]+", re.I)
 _SK_TOKEN_PATTERN = re.compile(r"(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]{16,}(?![A-Za-z0-9_-])")
 _EMPTY_MD_LINK_PATTERN = re.compile(r"\[[^\]]*\]\(\s*\)")
+_EMPTY_BACKTICK_PATTERN = re.compile(r"(?<!`)``(?!`)|(?<!`)`\s*`(?!`)")
+_RAW_MENTION_QQ_PATTERN = re.compile(r"@([^\s@()（）]{1,24})\(\d{5,12}\)")
 
 
 def _scrub_internal_leaks(text, extra_secrets=()):
@@ -360,8 +409,11 @@ def _scrub_internal_leaks(text, extra_secrets=()):
     s = _PRIVATE_URL_PATTERN.sub("", s)
     s = _WS_URL_PATTERN.sub("", s)
     s = _INTERNAL_PATH_PATTERN.sub("", s)
+    s = _BARE_SYS_PATH_PATTERN.sub("", s)
     s = _SK_TOKEN_PATTERN.sub("", s)
     s = _EMPTY_MD_LINK_PATTERN.sub("", s)
+    s = _EMPTY_BACKTICK_PATTERN.sub("", s)
+    s = _RAW_MENTION_QQ_PATTERN.sub(r"@\1", s)
     s = re.sub(r"(?m)^\s*[-*•]\s*(?:文件|网页|链接|地址)?\s*[：:]?\s*$", "", s)
     s = re.sub(r"(?<=\S)[ \t]{2,}", " ", s)
     s = re.sub(r"\n{3,}", "\n\n", s)
@@ -730,8 +782,15 @@ class Brain:
                 if keyed_repeats and all(keyed_repeats):
                     return {"replied": False, "text": "", "reason": "repeat", "rounds": 1}
 
-        # 第一层：仅明确提及机器人且非转述时，限定在点名本人消息组内检测直达后台任务词。
-        if info.mentioned and not info.retold:
+        running_tasks = self._running_tasks_for_group(group)
+        if batch is not None:
+            try:
+                batch.running_tasks = running_tasks
+            except Exception:
+                pass
+
+        # 第一层：仅明确提及机器人且非转述时，限定在点名本人消息组内检测直达后台任务词（本群无进行中任务才触发）。
+        if info.mentioned and not info.retold and not running_tasks:
             scoped_parts = [
                 str(getattr(i, "text", "") or "").strip()
                 for i in items
@@ -929,12 +988,33 @@ class Brain:
             if self.monitor:
                 self.monitor.record(group, "empty_reply", ok=False, latency=elapsed)
             return {"replied": False, "text": "", "reason": "silent", "rounds": rounds_used}
-        # 第三层：模型仍然说查不了，或问句里说不知道，就替它转一次后台。
+        # 第三层：模型说查不了、问句说不知道，或在 reply 里口头承诺去查却没派 subagent 时，自动转后台（本群无进行中任务才触发）。
         uncertain = is_question(body_text) and any(
             hint in reply for hint in UNCERTAIN_HINTS
         )
-        if not is_unsafe(body_text) and (uncertain or any(hint in reply for hint in REFUSAL_HINTS)):
-            dispatched = self._dispatch_task(group, body_text, getattr(batch, "umo", ""))
+        promised_lookup = any(hint in reply for hint in _PROMISE_LOOKUP_HINTS)
+        unsupported_cap = any(k in body_text for k in _UNSUPPORTED_CAP_HINTS)
+        if (
+            not running_tasks
+            and not is_unsafe(body_text)
+            and not unsupported_cap
+            and (uncertain or promised_lookup or any(hint in reply for hint in REFUSAL_HINTS))
+        ):
+            task_prompt = body_text
+            needs_context = promised_lookup or any(
+                k in body_text for k in ("再", "继续", "这个", "那个", "这件事", "它", "那篇", "刚才")
+            )
+            if len(body_text.strip()) < 20 and needs_context and prev_history:
+                prev_topic = ""
+                for h in reversed(prev_history[-4:]):
+                    if h.get("role") == "user":
+                        cand = str(h.get("text") or "").strip()
+                        if cand and cand != body_text and not is_unsafe(cand):
+                            prev_topic = cand[:120]
+                            break
+                if prev_topic:
+                    task_prompt = "结合上文「{}」核实并回答：{}".format(prev_topic, body_text)
+            dispatched = self._dispatch_task(group, task_prompt, getattr(batch, "umo", ""))
             if dispatched:
                 dispatched["rounds"] = rounds_used
                 return dispatched
@@ -1077,7 +1157,35 @@ class Brain:
 
     @staticmethod
     def _is_direct_task(text):
-        return any(hint in str(text or "") for hint in TASK_HINTS)
+        raw = str(text or "").strip()
+        if not raw or is_unsafe(raw):
+            return False
+        if any(k in raw for k in _NO_DIRECT_SEARCH_HINTS) or any(k in raw for k in _UNSUPPORTED_CAP_HINTS):
+            return False
+        if not any(hint in raw for hint in TASK_HINTS):
+            return False
+        rem = raw
+        for tok in TASK_HINTS + ("一下", "再", "自己", "去", "帮我", "请你", "给我", "啊", "吧", "呢", "呀", "么", "了", "的"):
+            rem = rem.replace(tok, "")
+        rem = re.sub(r"[\s，,。.！!？?～~、…:：]+", "", rem)
+        return len(rem) >= 2
+
+    def _running_tasks_for_group(self, group):
+        if not self.subagent or not hasattr(self.subagent, "running"):
+            return []
+        now = time.time()
+        rows = []
+        running = list(self.subagent.running() or [])
+        with self._targets_lock:
+            targets = dict(self._task_targets)
+        for task in running:
+            tid = getattr(task, "id", "")
+            target = targets.get(tid)
+            if target and target[0] == group:
+                prompt = str(getattr(task, "prompt", "") or "").strip()
+                created = float(getattr(task, "created", now) or now)
+                rows.append((tid, prompt, int(max(0.0, now - created))))
+        return rows
 
     @staticmethod
     def _wants_image_preview(body_text, quote_text=""):
@@ -1100,12 +1208,21 @@ class Brain:
         return TASK_PREFIX + budget_hint + str(prompt or "").strip()
 
     def _dispatch_task(self, group, text, umo="", ack_text=""):
-        """把任务交给后台；真正拉起 Codex 时在单条回复内附带系统风格提示。"""
+        """把任务交给后台；真正拉起 Codex 时在单条回复内附带系统风格提示，并按群阻止并发重复任务。"""
         task = str(text or "").strip()
         if not task:
             return {}
         if is_unsafe(task):
             return {"replied": True, "text": "这个不干。", "reason": "unsafe"}
+        running = self._running_tasks_for_group(group)
+        if running:
+            busy_msg = "刚才那个「{}」还在后台查着呢（已跑 {} 秒），出结果我马上发群里，不重复起新任务啦。".format(
+                _clip(running[0][1], 24),
+                running[0][2],
+            )
+            self.store.add_message(group, "bot", "大肥鱼", "bot", busy_msg)
+            self._last_reply_at[group] = time.time()
+            return {"replied": True, "text": busy_msg, "parts": [busy_msg], "reason": "task_running"}
         if not self.subagent:
             return {}
 
@@ -1303,7 +1420,7 @@ class Brain:
                 keep_recent=3,
                 self_names=("大肥鱼", "回声"),
             )
-            body = _clip(prose if safe_blocks else raw, SUBAGENT_MODEL_INPUT_LIMIT)
+            body = _clip_sentence(prose if safe_blocks else raw, SUBAGENT_MODEL_INPUT_LIMIT)
             if safe_blocks and not body:
                 body = "（后台已完成计算/代码生成，请写一句简短的群聊开场白引出后面的内容）"
             elif files and not body:
@@ -1339,7 +1456,7 @@ class Brain:
         if rewritten:
             return display_clean(rewritten)
         if fallback and not any(word in fallback for word in FILTER_WORDS):
-            return display_clean(fallback)
+            return _clip_sentence(display_clean(fallback), 800)
         if files:
             return "做好啦，文件发群里了。"
         return "查完了，不过这会儿没组织好词，你再问我一句。"
@@ -1430,7 +1547,13 @@ class Brain:
                 self._last_reply_offered[group] = now_ts
             else:
                 self._last_reply_offered.pop(group, None)
-        if ok and self.memory and short_prompt and _is_memorable_subagent_takeaway(raw_prompt, text):
+        if (
+            ok
+            and self.memory
+            and short_prompt
+            and not _is_failed_lookup(task.get("result") or "")
+            and _is_memorable_subagent_takeaway(raw_prompt, text)
+        ):
             takeaway = _clip(re.sub(r"\s+", " ", text), 80)
             if takeaway:
                 self.memory.add_point(

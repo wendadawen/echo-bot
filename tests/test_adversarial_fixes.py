@@ -294,7 +294,7 @@ class TestReloadDeliveryAndHarnessNotice(unittest.TestCase):
         r1 = brain._dispatch_task("g1", "调研动态子图", "umo:1")
         self.assertEqual(["〔系统｜已启动后台工具：调研动态子图 · 限时 300s〕"], r1["parts"])
 
-        r2 = brain._dispatch_task("g1", "调研动态子图", "umo:1", ack_text="好的我先帮你查")
+        r2 = brain._dispatch_task("g2", "调研动态子图", "umo:2", ack_text="好的我先帮你查")
         self.assertEqual(1, len(r2["parts"]))
         self.assertEqual(
             "好的我先帮你查\n〔系统｜已启动后台工具：调研动态子图 · 限时 300s〕",

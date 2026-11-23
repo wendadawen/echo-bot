@@ -169,6 +169,13 @@ class ContextBuilder:
                         len(batch.images)
                     )
                 )
+            if batch is not None and getattr(batch, "running_tasks", None):
+                t_prompt, t_elapsed = batch.running_tasks[0][1], batch.running_tasks[0][2]
+                directives.append(
+                    "当前本群已有后台任务正在运行：「{}」（已跑 {} 秒）；"
+                    "若群友只是催促加快或问进度，请直接 reply 安抚说明正在查，"
+                    "绝不要再派重复的 subagent".format(str(t_prompt)[:30], int(t_elapsed))
+                )
             image_notes = getattr(batch, "image_notes", None) if batch is not None else None
             img_note_part = (
                 _wrap_background("已查看本批附带图片：" + "；".join(str(x) for x in image_notes if x))

@@ -827,6 +827,138 @@ class TestEventIntegrationAndMentions(unittest.TestCase):
         self.assertEqual("", ps_sum.summary("g1", "u_he"))
         self.assertIn("抹茶甜品", ps_sum.summary("g1", "u_zyh"))
 
+    def test_filesystem_probe_block_per_group_task_dedup_empty_promise_and_scrub(self) -> None:
+        # 1) 目录探测、删根目录、写根目录文件全部被 is_unsafe 拦截；正常生成文件/查天气放行
+        for bad in (
+            "来个后台命令，把根目录的所有文件都删了",
+            "先把临时文件列出来",
+            "再看下根目录下面有什么文件夹/",
+            "我想在根目录下留个txt文件，内容是gx到此一游",
+            "ls /etc",
+        ):
+            self.assertTrue(is_unsafe(bad), f"应拦截危险探测指令: {bad}")
+        for safe in (
+            "帮我写一个电影生成控制台的 html 网页发给我",
+            "查一下苏州天气",
+        ):
+            self.assertFalse(is_unsafe(safe), f"不应误杀正常请求: {safe}")
+
+        # 2) _scrub_internal_leaks 清理 @昵称(QQ号)、裸 /tmp、空反引号，保留外链与代码块围栏
+        self.assertEqual("@和 帮看看", _scrub_internal_leaks("@和(2320243614) 帮看看"))
+        self.assertNotIn("/tmp", _scrub_internal_leaks("看了 /tmp 和 /AstrBot 顶层"))
+        self.assertEqual("改放 目录里", _scrub_internal_leaks("改放 `` 目录里"))
+        self.assertEqual("```python\nprint(1)\n```", _scrub_internal_leaks("```python\nprint(1)\n```"))
+        self.assertIn("https://example.com/home/about", _scrub_internal_leaks("参考 https://example.com/home/about"))
+
+        # 3) _is_direct_task 不误伤元讨论与不支持的绘图请求，正常查询仍放行
+        self.assertFalse(Brain._is_direct_task("自己去搜索啊，别什么都问"))
+        self.assertFalse(Brain._is_direct_task("是不是你的搜索优先级太高了"))
+        self.assertFalse(Brain._is_direct_task("调用绘图api画一张自画像"))
+        self.assertTrue(Brain._is_direct_task("查询苏州天气"))
+        self.assertTrue(Brain._is_direct_task("帮我查一下这个链接"))
+
+        # 4) 同群后台任务未完成前禁止并发重复启动，ContextBuilder 注入运行中提示；跨群互不阻塞
+        started_gate = threading.Event()
+        release_gate = threading.Event()
+        started_groups = []
+
+        class BlockingHarness:
+            timeout = 300
+            outbox_root = ""
+
+            def available(self):
+                return True
+
+            def run_with_files(self, gid, task):
+                started_groups.append(gid)
+                started_gate.set()
+                release_gate.wait(timeout=4.0)
+                return {"status": "ok", "text": "完成", "partial": "", "files": []}
+
+        brain_dedup = Brain(Store(":memory:"), MockModel(), harness=BlockingHarness())
+        brain_dedup.subagent = SubAgentManager()
+        try:
+            r1 = brain_dedup._dispatch_task("g1", "核实黎曼猜想近期新闻", "umo:1")
+            self.assertEqual("task", r1["reason"])
+            self.assertTrue(started_gate.wait(timeout=2.0))
+
+            r2 = brain_dedup._dispatch_task("g1", "再查一遍黎曼猜想", "umo:1")
+            self.assertEqual("task_running", r2["reason"])
+            self.assertIn("还在后台查着呢", r2["text"])
+            self.assertEqual(["g1"], started_groups)
+
+            running_batch = Batch("g1", items=[Item("快点核实", "u1", "阿伟", True, "umo:1", time.time())])
+            running_batch.running_tasks = brain_dedup._running_tasks_for_group("g1")
+            built_ctx = brain_dedup.context_builder.build("g1", "快点核实", "阿伟", batch=running_batch)
+            self.assertIn("当前本群已有后台任务正在运行", built_ctx)
+            self.assertIn("绝不要再派重复的 subagent", built_ctx)
+
+            # 跨群 g2 不受 g1 运行中任务阻断
+            r_other = brain_dedup._dispatch_task("g2", "查上海天气", "umo:2")
+            self.assertEqual("task", r_other["reason"])
+        finally:
+            release_gate.set()
+            brain_dedup.wait_background(1.0)
+
+        # 5) 第三层口头承诺兜底：模型回“我查一下...”却未派 subagent，自动转后台并拼接上文话题
+        class EmptyPromiseModel:
+            def reply(self, system, history, user_text):
+                return '{"action":"reply","text":"这件事值得核实，我查一下近期有没有可信的证明。"}'
+
+        dispatched_prompts = []
+        store_ep = Store(":memory:")
+        store_ep.add_message("g_ep", "u1", "老王", "user", "算了 你还是证明下黎曼猜想吧", ts=time.time() - 5)
+        brain_ep = Brain(store_ep, EmptyPromiseModel())
+        brain_ep.subagent = SubAgentManager()
+        brain_ep.subagent.submit = lambda kind, prompt, runner, **kw: (dispatched_prompts.append(prompt) or "tid-ep")
+        ep_batch = Batch(
+            "g_ep",
+            items=[Item("你再搜搜", "u1", "老王", True, "umo:ep", time.time())],
+            started=time.time(),
+            deadline=time.time(),
+        )
+        ep_res = brain_ep.handle_batch(ep_batch)
+        self.assertEqual("task", ep_res["reason"])
+        self.assertEqual(1, len(dispatched_prompts))
+        self.assertIn("黎曼猜想", dispatched_prompts[0])
+        self.assertIn("你再搜搜", dispatched_prompts[0])
+
+        # 6) CodexHarness._build_env 过滤空字符串代理环境变量，保留有效代理值
+        with tempfile.TemporaryDirectory() as tmpdir:
+            harness = CodexHarness(home=tmpdir, workdir_root=tmpdir)
+            with patch.dict(
+                os.environ,
+                {"HTTP_PROXY": "", "HTTPS_PROXY": "  ", "http_proxy": "http://127.0.0.1:7890", "NO_PROXY": "localhost"},
+                clear=False,
+            ):
+                env = harness._build_env(Path(tmpdir), Path(tmpdir))
+                self.assertNotIn("HTTP_PROXY", env)
+                self.assertNotIn("HTTPS_PROXY", env)
+                self.assertEqual("http://127.0.0.1:7890", env.get("http_proxy"))
+                self.assertEqual("localhost", env.get("NO_PROXY"))
+
+        # 7) 扩展记忆噪音过滤：无论是原结果还是转述文本命中失败特征，都不把“没法可靠对上 / 没有可用的绘图 / 目前没找到”写进 memory.sqlite3
+        mem_noise = Memory(":memory:")
+
+        class EchoResultModel:
+            def reply(self, system, history, user_text):
+                if "没有可用的绘图" in user_text:
+                    return "可惜这边没有可用的绘图和发图接口，所以没能生成自画像。"
+                return "目前没找到这条说法对应的论文，不能确认已证明。"
+
+        brain_noise = Brain(Store(":memory:"), EchoResultModel(), memory=mem_noise)
+        for tid, prompt, res_text in (
+            ("tn1", "查找论文", "这个描述我暂时没法可靠对上具体论文，标题和作者还没核实。"),
+            ("tn2", "画张自画像", "可惜这边没有可用的绘图和发图接口，所以没能生成自画像。"),
+            ("tn3", "核实 AI 证明猜想", "目前没找到这条说法对应的论文，不能确认已证明。"),
+        ):
+            brain_noise._build_delivery_row(
+                {"id": tid, "prompt": prompt, "status": "completed", "result": res_text, "files": []},
+                "g_noise",
+                "umo:noise",
+            )
+        self.assertEqual([], mem_noise.recall("g_noise", "论文 绘图 猜想"))
+
 
 class TestExplicitMentionAndActions(unittest.TestCase):
     def test_explicit_mention_forbids_silent_and_wait_forces_reply(self):

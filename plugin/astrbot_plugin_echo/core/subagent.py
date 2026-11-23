@@ -74,7 +74,7 @@ class SubAgentManager:
                 out = runner(task.prompt)
                 if isinstance(out, dict):
                     outcome = str(out.get("status") or "").strip().lower()
-                    result = str(out.get("text") or "").strip()[:800]
+                    result = str(out.get("text") or "").strip()[:1200]
                     partial = str(out.get("partial") or "").strip()[:400]
                     raw_files = out.get("files") or []
                     files = [f for f in raw_files if isinstance(f, dict) and f.get("path")]
@@ -88,7 +88,7 @@ class SubAgentManager:
                     else:
                         status, reason, error = "failed", "empty", (raw_err or "空结果")
                 else:
-                    result = str(out or "").strip()[:800]
+                    result = str(out or "").strip()[:1200]
                     if result:
                         status, reason, error = "completed", "ok", ""
                     else:
