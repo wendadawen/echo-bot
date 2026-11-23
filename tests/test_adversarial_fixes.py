@@ -591,5 +591,126 @@ class TestStateAndPipelineFixes(unittest.TestCase):
         self.assertTrue((ROOT / ".dockerignore").is_file())
 
 
+class TestGroupMemoryAndHeartbeat(unittest.TestCase):
+    def test_chinese_bigram_recall_and_unrelated_query_filtering(self):
+        mem = Memory(":memory:")
+        mem.add_point("g1", "event", "群里在聊归并排序和复杂度分析", now=1000.0)
+        mem.add_point("g1", "event", "MoE offloading 前沿论文调研完成", now=1000.0)
+        mem.add_episode("g1", "讨论归并排序怎么实现", now=1000.0)
+
+        hits1 = mem.recall("g1", "排序怎么写", limit=4, now=1001.0)
+        self.assertTrue(any("归并排序" in h for h in hits1))
+        hits2 = mem.recall("g1", "之前聊的MoE论文是啥", limit=4, now=1001.0)
+        self.assertTrue(any("MoE" in h for h in hits2))
+        # 完全无关问句不硬塞无关旧记忆
+        self.assertEqual([], mem.recall("g1", "今晚吃火锅吗", limit=4, now=1002.0))
+
+    def test_person_profile_merges_fields_and_skips_empty_row(self):
+        ps = PersonStore(":memory:")
+        ps.observe("g1", "1001", "阿伟")
+        self.assertEqual({}, ps.upsert_profile("g1", "1001", traits=""))
+        self.assertEqual({}, ps.profile("g1", "1001"))
+
+        ps.upsert_profile("g1", "1001", traits="喜欢 Rust")
+        ps.upsert_profile("g1", "1001", traits="熬夜写代码")
+        prof = ps.profile("g1", "1001")
+        self.assertIn("喜欢 Rust", prof["traits"])
+        self.assertIn("熬夜写代码", prof["traits"])
+
+    def test_summarize_window_transcript_relationship_and_jargon_guard(self):
+        store = Store(":memory:")
+        mem = Memory(":memory:")
+        ps = PersonStore(":memory:")
+
+        class MemModel:
+            def __init__(self):
+                self.prompts = []
+
+            def reply(self, system, history, user_text):
+                self.prompts.append(user_text)
+                return json.dumps({
+                    "episode": "阿伟和小美在讨论排序作业",
+                    "persons": [
+                        {"name": "阿伟", "category": "relationship", "content": "小美的同学"},
+                        {"name": "用户", "category": "person", "content": "占位符不应入库"},
+                    ],
+                    "relations": [],
+                    "points": [
+                        {"category": "jargon", "content": "询问MoE是什么"},
+                        {"category": "jargon", "content": "哈吉米=Gemini"},
+                        {"category": "event", "content": "两人约好周六一起写排序"},
+                    ],
+                }, ensure_ascii=False)
+
+        model = MemModel()
+        brain = Brain(store, model, memory=mem, persons=ps)
+        ps.observe("g1", "1001", "阿伟")
+        store.add_message("g1", "1001", "阿伟", "user", "我先旁观发一句，别忘啦", ts=100.0)
+        store.add_message("g1", "1002", "小美", "user", "周六一起写排序吗", ts=105.0)
+        store.add_message("g1", "bot", "大肥鱼", "bot", "好呀算我一个", ts=110.0)
+
+        transcript = brain._collect_summary_transcript("g1")
+        self.assertIn("我先旁观发一句", transcript)
+        self.assertIn("周六一起写排序吗", transcript)
+        self.assertIn("大肥鱼：好呀算我一个", transcript)
+
+        brain._summarize("g1", transcript)
+        self.assertEqual("小美的同学", ps.profile("g1", "1001")["relation"])
+        self.assertEqual([], mem.person("g1", "用户"))
+        jargon_map = mem.jargon("g1")
+        self.assertNotIn("询问MoE是什么", jargon_map)
+        self.assertEqual("Gemini", jargon_map.get("哈吉米"))
+
+    def test_context_builder_recalls_person_memory_across_renamed_aliases(self):
+        mem = Memory(":memory:")
+        ps = PersonStore(":memory:")
+        ps.observe("g1", "1001", "旧昵称", now=100.0)
+        ps.observe("g1", "1001", "新昵称", now=200.0)
+        mem.upsert_person("g1", "旧昵称", "preference", "喜欢喝冰美式")
+
+        cb = ContextBuilder("人设", mem, persons=ps)
+        batch = Batch("g1", items=[Item("在吗", "1001", "新昵称", True, "umo:1", 201.0)])
+        built = cb.build("g1", query="喝啥", user_name="新昵称", batch=batch)
+        self.assertIn("喜欢喝冰美式", built)
+
+    def test_completed_subagent_persists_takeaway_into_long_term_memory(self):
+        mem = Memory(":memory:")
+
+        class RewriteModel:
+            def reply(self, system, history, user_text):
+                return "动态子图主要有 vLLM 和 SGLang 两类调度策略。"
+
+        brain = Brain(Store(":memory:"), RewriteModel(), memory=mem)
+        brain.subagent = SubAgentManager()
+        tid = brain.subagent.submit("chat", "调研动态子图", lambda _: "调研完成：vLLM 与 SGLang 调度差异")
+        brain._task_targets[tid] = ("g1", "umo:1")
+        rows = []
+        for _ in range(40):
+            rows = brain.poll_subagents()
+            if rows:
+                break
+            time.sleep(0.05)
+        self.assertEqual(1, len(rows))
+        self.assertTrue(any("动态子图" in h for h in mem.recall("g1", "上次那个动态子图咋样")))
+
+    def test_heartbeat_backoff_and_spontaneous_delayed_record(self):
+        from astrbot_plugin_echo.core.heartbeat import Heartbeat
+
+        hb = Heartbeat(quiet=10, min_interval=10, daily_cap=1, active_hours=(0, 24))
+        hb.observe("g1", now=100.0)
+        self.assertTrue(hb.due("g1", now=200.0))
+        hb.backoff("g1", seconds=1800, now=200.0)
+        self.assertFalse(hb.due("g1", now=300.0))
+        self.assertTrue(hb.due("g1", now=2100.0))
+
+        store = Store(":memory:")
+        brain = Brain(store, MockModel())
+        line = brain.spontaneous("g1", "", False)
+        self.assertTrue(line)
+        self.assertEqual([], store.recent("g1", 10))
+        brain.record_spontaneous("g1", line)
+        self.assertEqual(line, store.recent("g1", 10)[-1]["text"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

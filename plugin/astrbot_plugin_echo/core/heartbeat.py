@@ -25,11 +25,17 @@ class Heartbeat:
         self._last_spoke = {}
         self._day = {}
         self._count = {}
+        self._retry_after = {}
 
     def observe(self, group_id, now=None):
         """有消息就刷新安静起点；主动说话后也刷新，避免刚说完又冷场。"""
         now = time.time() if now is None else now
         self._last_message[str(group_id)] = now
+
+    def backoff(self, group_id, seconds=1800, now=None):
+        """发送失败（如账号离线）时退避，避免每分钟重复生成幽灵消息。"""
+        now = time.time() if now is None else now
+        self._retry_after[str(group_id)] = now + max(60.0, float(seconds))
 
     def _today(self, now):
         return time.strftime("%Y-%m-%d", time.localtime(now))
@@ -37,6 +43,8 @@ class Heartbeat:
     def due(self, group_id, now=None):
         now = time.time() if now is None else now
         group_id = str(group_id)
+        if now < self._retry_after.get(group_id, 0.0):
+            return False
         last = self._last_message.get(group_id)
         if last is None or now - last < self.quiet:
             return False
@@ -58,6 +66,7 @@ class Heartbeat:
     def mark(self, group_id, now=None):
         now = time.time() if now is None else now
         group_id = str(group_id)
+        self._retry_after.pop(group_id, None)
         self._last_spoke[group_id] = now
         self._last_message[group_id] = now
         day = self._today(now)

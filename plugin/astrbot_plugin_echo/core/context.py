@@ -90,11 +90,28 @@ class ContextBuilder:
             rows = self.memory.recall(group_id, query) if self.memory else []
             return _wrap_background("本群记得：" + "；".join(rows)) if rows else ""
         if name == "person":
-            rows = self.memory.person(group_id, user_name) if (self.memory and user_name) else []
-            if not rows and self.memory and user_name:
+            if not self.memory:
+                return ""
+            candidate_names = []
+            if user_name:
+                candidate_names.append(str(user_name))
+            if self.persons and batch is not None:
+                items = getattr(batch, "items", None) or []
+                uid = getattr(items[-1], "user_id", "") if items else ""
+                if uid:
+                    for row in self.persons.aliases(group_id, uid):
+                        alias_name = str(row.get("name") or "").strip()
+                        if alias_name and alias_name not in candidate_names:
+                            candidate_names.append(alias_name)
+            rows = []
+            for alias_name in candidate_names[:4]:
+                for line in self.memory.person(group_id, alias_name):
+                    if line not in rows:
+                        rows.append(line)
+            if not rows and user_name:
                 rows = self.memory.relations(group_id, user_name)
             safe_name = clean_speaker_name(user_name) or user_name
-            return _wrap_background("关于[昵称：{}]：".format(safe_name) + "；".join(rows)) if rows else ""
+            return _wrap_background("关于[昵称：{}]：".format(safe_name) + "；".join(rows[:3])) if rows else ""
         if name == "person_profile":
             return _wrap_background(self._profile_block(group_id, batch))
         if name == "mentions":

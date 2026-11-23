@@ -18,7 +18,7 @@ from .heartbeat import PROMPT as HEARTBEAT_PROMPT
 from .jargon import apply as apply_jargon_context
 from .mentions import is_question
 from .memory import MEMORY_PROMPT, parse_memory_full
-from .messages import Message
+from .messages import Message, format_speaker_message
 from . import compaction, mentions
 from .harness import DEFAULT_TIMEOUT, cleanup_file_entry
 from .rhythm import Batch
@@ -594,10 +594,6 @@ class Brain:
         ]
         group_style = learn_style(style_texts, self._styles.get(group))
         self._styles[group] = group_style
-        if self.memory and not persisted:
-            for word in mine_jargon([i.text for i in batch.items],
-                                    self.memory.jargon(group)):
-                self.memory.add_jargon(group, word, word)
 
         system = self.context_builder.build(
             group, body_text, user_name, batch, history,
@@ -885,7 +881,7 @@ class Brain:
         self._last_reply_at[group] = time.time()
         return {"replied": True, "text": reply_text, "parts": [reply_text], "reason": "task"}
 
-    def spontaneous(self, group, umo=""):
+    def spontaneous(self, group, umo="", record=True):
         """群安静太久时主动开一句；失败、含敏感泄漏或像客服就保持沉默。"""
         if not self.model:
             return ""
@@ -901,8 +897,15 @@ class Brain:
         line = _scrub_internal_leaks(display_clean(lines[0].strip()), extra_secrets=self._secrets())[:60]
         if not line or any(word in line for word in FILTER_WORDS):
             return ""
-        self.store.add_message(group, "bot", "大肥鱼", "bot", line)
+        if record:
+            self.store.add_message(group, "bot", "大肥鱼", "bot", line)
         return line
+
+    def record_spontaneous(self, group, text):
+        """仅在平台真实发出主动开聊消息后入库，避免离线时往历史灌幽灵消息。"""
+        clean_text = str(text or "").strip()
+        if clean_text:
+            self.store.add_message(group, "bot", "大肥鱼", "bot", clean_text)
 
     @staticmethod
     def _format_file_size(num_bytes):
@@ -1073,6 +1076,12 @@ class Brain:
                 if item.get("path") not in kept_paths:
                     cleanup_file_entry(item.get("path", ""), outbox_root)
         self.store.add_message(group, "bot", "大肥鱼", "bot", text)
+        if ok and self.memory and short_prompt:
+            takeaway = _clip(re.sub(r"\s+", " ", text), 80)
+            if takeaway:
+                self.memory.add_point(
+                    group, "event", "完成「{}」：{}".format(short_prompt, takeaway)[:120]
+                )
         return {
             "group": group,
             "umo": umo,
@@ -1133,7 +1142,34 @@ class Brain:
                 )
         return rows
 
-    def _maybe_summarize(self, group, text):
+    def _collect_summary_transcript(self, group, fallback_text=""):
+        """收集自上次记忆摘要以来的整段对话（含旁观未回与己方发言），避免只靠最后一句摘要。"""
+        fallback = str(fallback_text or "").strip()
+        if not self.memory or not hasattr(self.store, "since"):
+            return fallback
+        last_ep = self.memory.last_episode_at(group)
+        rows = self.store.since(group, last_ep, limit=24)
+        if not rows:
+            return fallback
+        if not any(r.get("role") == "user" for r in rows):
+            return ""
+        lines = []
+        total_chars = 0
+        for row in rows:
+            body = _clip(re.sub(r"\s+", " ", str(row.get("text") or "").strip()), 160)
+            if not body:
+                continue
+            if row.get("role") == "bot":
+                line = "大肥鱼：" + body
+            else:
+                line = format_speaker_message(row.get("user_name") or "群友", body)
+            if total_chars + len(line) > 2400 and lines:
+                break
+            lines.append(line)
+            total_chars += len(line) + 1
+        return "\n".join(lines) if lines else fallback
+
+    def _maybe_summarize(self, group, text=""):
         """距上次摘要或尝试超过 10 分钟才跑一次，避免模型空回时每轮重试。"""
         if not self.memory:
             return
@@ -1141,17 +1177,37 @@ class Brain:
         last = max(self.memory.last_episode_at(group), self._last_summary_attempt.get(group, 0.0))
         if last and now - last < SUMMARY_INTERVAL:
             return
+        transcript = self._collect_summary_transcript(group, fallback_text=text)
+        if not transcript:
+            return
         if not self._summary_lock.acquire(blocking=False):
             return
         self._last_summary_attempt[group] = now
 
         def work():
             try:
-                self._summarize(group, text)
+                self._summarize(group, transcript)
             finally:
                 self._summary_lock.release()
 
         threading.Thread(target=work, name="echo-summary", daemon=True).start()
+
+    @staticmethod
+    def _parse_jargon_entry(content):
+        """仅当明确写出「词=解释」时才收入黑话表；拒绝整句或同义自我映射。"""
+        raw = str(content or "").strip()
+        for sep in ("=", "：", ":"):
+            if sep in raw:
+                term, alias = (part.strip() for part in raw.split(sep, 1))
+                if (
+                    1 <= len(term) <= 8
+                    and alias
+                    and term != alias
+                    and len(alias) <= 30
+                    and "询问" not in term
+                ):
+                    return term, alias
+        return None, None
 
     def _summarize(self, group, text):
         """每隔几批把对话压成 Episode / 记忆点 / 人物档案 / 关系。"""
@@ -1162,23 +1218,31 @@ class Brain:
         parsed = parse_memory_full(raw)
         if not parsed:
             return
+        generic_names = {"用户", "群友", "发言者", "对方", "我", "你", "大肥鱼", "回声"}
         episode, points, persons, relations = parsed
-        self.memory.add_episode(group, episode, source="chat")
+        if episode:
+            self.memory.add_episode(group, episode, source="chat")
         for category, content in points:
             if category == "jargon":
-                self.memory.add_jargon(group, content, content)
+                term, alias = self._parse_jargon_entry(content)
+                if term and alias:
+                    self.memory.add_jargon(group, term, alias)
             else:
                 self.memory.add_point(group, category, content)
         for name, category, content in persons:
-            self.memory.upsert_person(group, name, category, content)
+            clean_name = str(name or "").strip()
+            if not clean_name or clean_name in generic_names:
+                continue
+            self.memory.upsert_person(group, clean_name, category, content)
             if self.persons:
-                user_id = self.persons.resolve(group, name)
+                user_id = self.persons.resolve(group, clean_name)
                 if user_id:
                     field = {
                         "person": "traits",
                         "preference": "preferences",
                         "event": "events",
                         "relation": "relation",
+                        "relationship": "relation",
                     }.get(category, "traits")
                     self.persons.upsert_profile(group, user_id, **{field: content})
         for a, b, relation in relations:

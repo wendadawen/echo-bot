@@ -111,6 +111,16 @@ class Store:
             ).fetchall()
         return [dict(r) for r in reversed(rows)]
 
+    def since(self, group_id, ts=0.0, limit=30):
+        """按时间顺序取 ts 之后的群消息，供多轮记忆摘要窗口使用。"""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT * FROM messages WHERE group_id = ? AND ts > ? "
+                "ORDER BY seq DESC LIMIT ?",
+                (group_id, float(ts or 0.0), max(1, int(limit))),
+            ).fetchall()
+        return [dict(r) for r in reversed(rows)]
+
     def add_reminder(self, group_id, user_id, user_name, text, due_at, umo="", repeat="",
                      last_fired=""):
         with self._lock, self._db:

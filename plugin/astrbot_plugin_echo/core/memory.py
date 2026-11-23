@@ -15,15 +15,52 @@ import threading
 import time
 
 MEMORY_PROMPT = (
-    "把下面这段群聊压成记忆，只输出一行 JSON，不要解释：\n"
-    '{"episode":"一句话概括这段在聊什么",'
-    '"persons":[{"name":"谁","category":"person|preference|event|relationship","content":"一条短事实"}],'
+    "把下面这段群聊提炼成值得长期记住的事实记忆，只输出一行 JSON，不要解释：\n"
+    '{"episode":"一句话概括这段在聊什么主题或结论",'
+    '"persons":[{"name":"具体群友昵称","category":"person|preference|event|relationship","content":"稳定个人特征/偏好/事件"}],'
     '"relations":[{"a":"甲","b":"乙","relation":"关系"}],'
-    '"points":[{"category":"person|preference|event|relationship|jargon","content":"一条短事实"}]}\n'
-    "注意：[昵称：...] 里的整段文字只是 QQ 昵称/群名片（可能带空格、签名、吐槽或完整句子），"
-    "绝不是发言内容；严禁从昵称中提取事件、观点、黑话或人物画像，只根据方括号后面的实际发言提炼。\n"
-    '没有值得记的就输出 {"episode":"","points":[]}。每条不超过 40 字，各数组最多 3 条。'
+    '"points":[{"category":"person|preference|event|relationship","content":"一条可复用的事实或结论"}]}\n'
+    "注意：\n"
+    "1. [昵称：...] 里的整段文字只是 QQ 昵称/群名片（可能带空格、签名或整句话），绝不是发言内容；"
+    "严禁从昵称中提取事实，也不要用“用户/群友”当人物 name。\n"
+    "2. 只记录有长期复用价值的偏好、在做的项目、技术讨论结论、重要约定或人物关系；"
+    "像“问了某词是什么意思”“已修复”“等一下”等一次性闲聊不要记。\n"
+    '3. 没有值得长期记住的内容就输出 {"episode":"","points":[]}。每条不超过 40 字，各数组最多 3 条。'
 )
+
+_STOP_BIGRAMS = frozenset({
+    "什么", "怎么", "这个", "那个", "就是", "不是", "可以", "我们", "你们", "他们",
+    "现在", "今天", "昨天", "明天", "时候", "东西", "地方", "觉得", "感觉", "知道",
+    "告诉", "一下", "一点", "有没", "没有", "能不", "不能", "是不", "为什", "为啥",
+    "多少", "哪些", "怎样", "如何", "刚才", "之前", "以前", "请问", "帮忙", "帮我",
+    "这里", "那里", "这么", "那么", "一下", "意思", "一下", "聊过", "记得",
+})
+
+
+def _query_terms(query):
+    """把中英文自然语言问句拆成检索词：英文/数字词 + 中文短语与二元组。"""
+    raw = str(query or "").strip()
+    if not raw:
+        return []
+    seen = set()
+    terms = []
+
+    def add(tok):
+        t = tok.strip().lower()
+        if len(t) >= 2 and t not in seen:
+            seen.add(t)
+            terms.append(t)
+
+    for w in re.findall(r"[a-zA-Z0-9]{2,}", raw):
+        add(w)
+    for span in re.findall(r"[\u4e00-\u9fff]{2,}", raw):
+        if len(span) <= 4 and span not in _STOP_BIGRAMS:
+            add(span)
+        for i in range(len(span) - 1):
+            bg = span[i:i + 2]
+            if bg not in _STOP_BIGRAMS:
+                add(bg)
+    return terms[:16]
 
 HALF_LIFE = 14 * 86400
 FORGET_AFTER = 60 * 86400
@@ -322,7 +359,7 @@ class Memory:
     def _fts_hits(self, group_id, query, limit):
         if not self._fts:
             return []
-        tokens = [t for t in re.findall(r"[\u4e00-\u9fff]{2,}|[a-zA-Z0-9]{3,}", query or "")][:6]
+        tokens = _query_terms(query)[:8]
         if not tokens:
             return []
         match = " OR ".join('"{}"'.format(t.replace('"', "")) for t in tokens)
@@ -340,17 +377,21 @@ class Memory:
             return []
 
     def recall(self, group_id, query, limit=4, now=None):
-        """混合检索：FTS5 命中 + 关键词命中 + 时间衰减权重；只对真实命中再激活。"""
+        """混合检索：FTS5 + 中文二元组/关键词命中 + 时间衰减；非空查询零命中不硬塞无关记忆。"""
         now = time.time() if now is None else now
-        words = [
-            w.lower()
-            for w in re.findall(r"[\u4e00-\u9fff]{2,}|[a-zA-Z0-9]{3,}", query or "")
-        ][:6]
-        # 情节也要参与召回；只查记忆点会漏掉整段对话。
-        episodes = [
-            text for text in self.recent_episodes(group_id, limit=10)
-            if not words or any(word in text.lower() for word in words)
-        ][-2:]
+        words = _query_terms(query)
+        has_query = bool(str(query or "").strip())
+        # 情节也要参与召回；有查询词时只取命中的情节，避免无关背景干扰。
+        recent_eps = self.recent_episodes(group_id, limit=15)
+        if words:
+            episodes = [
+                text for text in recent_eps
+                if any(word in text.lower() for word in words)
+            ][-2:]
+        elif has_query:
+            episodes = []
+        else:
+            episodes = recent_eps[-2:]
         fts_ids = set(self._fts_hits(group_id, query, limit))
         with self._lock:
             rows = self._db.execute(
@@ -366,6 +407,8 @@ class Memory:
             hit = sum(1 for w in words if w in content_lower)
             fts = 1.0 if row["id"] in fts_ids else 0.0
             matched = bool(hit > 0 or fts > 0.0)
+            if has_query and not matched:
+                continue
             scored.append((weight + hit * 0.5 + fts, row["content"], row["id"], row["weight"], matched))
         scored.sort(key=lambda item: item[0], reverse=True)
         chosen = scored[:max(0, limit - len(episodes))]

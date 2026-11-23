@@ -205,20 +205,25 @@ class PersonStore:
             ).fetchone()
         return dict(row) if row else {}
 
-    def upsert_profile(self, group_id, user_id, now=None, **fields):
+    def upsert_profile(self, group_id, user_id, now=None, merge=True, **fields):
         user_id = str(user_id or "").strip()
         if not user_id:
             return {}
         now = time.time() if now is None else now
+        limits = (("traits", 600), ("preferences", 400), ("events", 600), ("relation", 200))
         with self._lock, self._db:
             current = self.profile(group_id, user_id)
-            merged = {
-                "traits": fields.get("traits", current.get("traits", "")),
-                "preferences": fields.get("preferences", current.get("preferences", "")),
-                "events": fields.get("events", current.get("events", "")),
-                "relation": fields.get("relation", current.get("relation", "")),
-                "intimacy": float(fields.get("intimacy", current.get("intimacy", 0.5))),
-            }
+            merged = {}
+            for key, cap in limits:
+                prev_val = current.get(key, "")
+                if key in fields and str(fields[key] or "").strip():
+                    incoming = str(fields[key] or "").strip()
+                    merged[key] = _merge_field(prev_val, incoming, cap) if merge else incoming[:cap]
+                else:
+                    merged[key] = prev_val
+            if not current and "intimacy" not in fields and not any(merged[k] for k, _ in limits):
+                return {}
+            merged["intimacy"] = float(fields.get("intimacy", current.get("intimacy", 0.5)))
             self._db.execute(
                 "INSERT INTO profiles(group_id, user_id, traits, preferences, events, "
                 "relation, intimacy, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "

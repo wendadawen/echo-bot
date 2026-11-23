@@ -476,7 +476,7 @@ class Echo(Star):
                         raise
                     except Exception as exc:
                         logger.error("批消息处理异常：%s", exc)
-                # 群安静太久时，偶尔主动开一句（默认很克制）。
+                # 群安静太久时，偶尔主动开一句（先发后记 + 失败退避，防离线刷屏）。
                 if now - self._heartbeat_at > 60:
                     self._heartbeat_at = now
                     for group in list(self.rhythm.groups()):
@@ -484,17 +484,22 @@ class Echo(Star):
                             continue
                         if self.modes.mode(group, now) != "normal":
                             continue
-                        text = await asyncio.to_thread(self.brain.spontaneous, group)
+                        text = await asyncio.to_thread(self.brain.spontaneous, group, "", False)
                         umo = self._last_umo.get(group) or ""
                         if text and umo and not self.rhythm.is_muted(group) and self.limiter.allow(group):
                             try:
+                                cleaned = clean(text)
                                 await self.context.send_message(
-                                    umo, MessageChain([Plain(clean(text))])
+                                    umo, MessageChain([Plain(cleaned)])
                                 )
+                                await asyncio.to_thread(self.brain.record_spontaneous, group, cleaned)
                                 self.limiter.record(group)
                                 self.heartbeat.mark(group, time.time())
                             except Exception as exc:
-                                logger.error("主动开聊发送失败：%s", exc)
+                                self.heartbeat.backoff(group, 1800)
+                                logger.error("主动开聊发送失败（%s）：%s", type(exc).__name__, exc)
+                        else:
+                            self.heartbeat.backoff(group, 1800)
                 # 每 6 小时清理一次过期表情文件。
                 if now - self._emoji_cleanup_at > 21600 and self.emoji_bank:
                     self._emoji_cleanup_at = now
