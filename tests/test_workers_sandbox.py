@@ -18,7 +18,7 @@ if str(PLUGIN_ROOT) not in sys.path:
 
 from astrbot_plugin_echo.domain import LLMMessage, ModelTurn, PendingDelivery, TaskRequest  # noqa: E402
 from astrbot_plugin_echo.store.repository import Repository  # noqa: E402
-from astrbot_plugin_echo.workers.backends.codex import CodexBackend  # noqa: E402
+from astrbot_plugin_echo.workers.backends import ChatAgentBackend, CodexBackend, select_backend  # noqa: E402
 from astrbot_plugin_echo.workers.manager import TaskManager  # noqa: E402
 from astrbot_plugin_echo.workers.sandbox import (  # noqa: E402
     DEFAULT_TIMEOUT,
@@ -408,6 +408,174 @@ print("ANSWER:完成", flush=True)
             cleanup_outbox(outbox, max_age=10, keep_paths={str(kept_f)})
             self.assertTrue(kept_f.exists())
             repo.close()
+
+
+class ChatAgentBackendAndRoutingTests(unittest.TestCase):
+    def test_select_backend_routes_gpt_to_codex_and_others_to_chat_agent(self):
+        with patch("os.path.exists", return_value=True):
+            self.assertIsInstance(
+                select_backend(api_base="http://127.0.0.1:8787/v1", api_key="k", model="gpt-6-luna"),
+                CodexBackend,
+            )
+            self.assertIsInstance(
+                select_backend(api_base="http://127.0.0.1:8787/v1", api_key="k", model="claude-haiku-5-5"),
+                ChatAgentBackend,
+            )
+            self.assertIsInstance(
+                select_backend(api_base="http://127.0.0.1:8787/v1", api_key="k", model="deepseek-chat"),
+                ChatAgentBackend,
+            )
+
+    def test_chat_agent_backend_runs_in_sandbox_strips_secrets_and_exports_outbox(self):
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        captured_requests = []
+
+        class _MockLLMHandler(BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                pass
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(length).decode("utf-8"))
+                captured_requests.append(body)
+                round_idx = len(captured_requests)
+                if round_idx == 1:
+                    resp = {
+                        "choices": [{
+                            "message": {
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "id": "tc_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "run_shell",
+                                            "arguments": json.dumps({
+                                                "command": (
+                                                    f"{sys.executable} -c "
+                                                    "'import os; print(\"LEAK\" if (\"ECHO_API_KEY\" in os.environ or \"ECHO_SEARCH_KEY\" in os.environ) else \"CLEAN\")'"
+                                                )
+                                            }),
+                                        },
+                                    },
+                                    {
+                                        "id": "tc_2",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "write_file",
+                                            "arguments": json.dumps({
+                                                "path": "outbox/result.html",
+                                                "content": "<h1>ok</h1>",
+                                            }),
+                                        },
+                                    },
+                                    {
+                                        "id": "tc_3",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "write_file",
+                                            "arguments": json.dumps({
+                                                "path": "../escape.txt",
+                                                "content": "bad",
+                                            }),
+                                        },
+                                    },
+                                ],
+                            }
+                        }]
+                    }
+                else:
+                    tool_msgs = [m["content"] for m in body["messages"] if m.get("role") == "tool"]
+                    status_tag = "CLEAN" if any("CLEAN" in t for t in tool_msgs) else "FAIL"
+                    resp = {"choices": [{"message": {"content": f"处理完毕（{status_tag}），文件 result.html 已生成。"}}]}
+                raw = json.dumps(resp, ensure_ascii=False).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+        server = HTTPServer(("127.0.0.1", 0), _MockLLMHandler)
+        port = server.server_address[1]
+        th = threading.Thread(target=server.serve_forever, daemon=True)
+        th.start()
+
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                work = Path(tmp) / "work"
+                outbox = Path(tmp) / "outbox"
+                runner = SandboxRunner(work, outbox, timeout=180)
+                backend = ChatAgentBackend(
+                    api_base=f"http://127.0.0.1:{port}/v1",
+                    api_key="sk-secret-key-999999",
+                    model="claude-haiku-5-5",
+                    search_provider="tavily",
+                    search_api_key="tvly-secret-88888",
+                )
+                steps = []
+                res = runner.run(
+                    TaskRequest(group_id="g1", umo="u1", prompt="看图并生成报告", images=(TINY_PNG,)),
+                    backend,
+                    on_progress=steps.append,
+                    extra_secrets=("sk-secret-key-999999", "tvly-secret-88888"),
+                )
+                self.assertEqual(res.status, "ok")
+                self.assertIn("CLEAN", res.text)
+                self.assertNotIn("LEAK", res.text)
+                self.assertEqual(len(res.files), 1)
+                self.assertEqual(res.files[0]["name"], "result.html")
+                self.assertFalse((Path(tmp) / "escape.txt").exists())
+                self.assertGreaterEqual(len(steps), 2)
+                self.assertEqual(list(work.iterdir()), [])
+                # 首轮请求含 inline image_url 且不带 temperature / max_tokens
+                self.assertNotIn("temperature", captured_requests[0])
+                self.assertNotIn("max_tokens", captured_requests[0])
+                self.assertEqual(captured_requests[0]["messages"][1]["content"][1]["type"], "image_url")
+                # 越界写逃逸已被拒绝并回传给模型
+                tool_replies = [m["content"] for m in captured_requests[1]["messages"] if m.get("role") == "tool"]
+                self.assertTrue(any("写入失败" in t for t in tool_replies), tool_replies)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_chat_agent_cancel_event(self):
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        class _SlowHandler(BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                pass
+
+            def do_POST(self):
+                time.sleep(2.5)
+                try:
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(b"{}")
+                except OSError:
+                    pass
+
+        server = HTTPServer(("127.0.0.1", 0), _SlowHandler)
+        port = server.server_address[1]
+        th = threading.Thread(target=server.serve_forever, daemon=True)
+        th.start()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                runner = SandboxRunner(Path(tmp) / "work", Path(tmp) / "outbox", timeout=180)
+                backend = ChatAgentBackend(
+                    api_base=f"http://127.0.0.1:{port}/v1",
+                    api_key="sk-test-cancel",
+                    model="claude-haiku-5-5",
+                )
+                cancel = threading.Event()
+                threading.Timer(0.25, cancel.set).start()
+                t0 = time.monotonic()
+                res = runner.run(TaskRequest(group_id="g1", umo="u1", prompt="测试取消"), backend, cancel_event=cancel)
+                self.assertLess(time.monotonic() - t0, 3.0)
+                self.assertEqual(res.status, "cancelled")
+        finally:
+            server.shutdown()
+            server.server_close()
 
 
 if __name__ == "__main__":

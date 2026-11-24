@@ -31,7 +31,14 @@ from .domain import SendFile, SendText
 from .engine.agent import EchoAgent, HELP_TEXT
 from .engine.scheduler import Scheduler
 from .store import EmojiStore, Repository, cleanup_runtime_caches
-from .workers import CodexBackend, DEFAULT_TIMEOUT, SandboxRunner, TaskManager, cleanup_file_entry, cleanup_outbox
+from .workers import (
+    DEFAULT_TIMEOUT,
+    SandboxRunner,
+    TaskManager,
+    cleanup_file_entry,
+    cleanup_outbox,
+    select_backend,
+)
 
 PLUGIN_NAME = "astrbot_plugin_echo"
 DEFAULT_HISTORY_LIMIT = 30
@@ -80,11 +87,24 @@ class Echo(Star):
         outbox_dir = str(directory / "outbox")
         self._outbox_root = outbox_dir
         self.sandbox = SandboxRunner(workdir_root=workdir_root, outbox_root=outbox_dir, timeout=raw_timeout)
-        self.backend = CodexBackend(api_base=api_base, api_key=api_key, model=model_name)
+        self.backend = select_backend(
+            api_base=api_base,
+            api_key=api_key,
+            model=model_name,
+            search_provider=self.search_provider,
+        )
+
+        def _extra_secrets() -> tuple[str, ...]:
+            out = list(self.llm.extra_secrets() or ())
+            skey = str(getattr(self.search_provider, "api_key", "") or "").strip()
+            if len(skey) >= 8:
+                out.append(skey)
+            return tuple(out)
+
         self.task_manager = (
             None
             if isinstance(self.llm, MockLLMClient)
-            else TaskManager(self.sandbox, self.backend, repo=self.repo, extra_secrets_fn=self.llm.extra_secrets)
+            else TaskManager(self.sandbox, self.backend, repo=self.repo, extra_secrets_fn=_extra_secrets)
         )
         cleanup_outbox(outbox_dir, keep_paths=self.repo.pending_delivery_paths())
 

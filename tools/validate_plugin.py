@@ -27,6 +27,7 @@ REQUIRED = [
     "workers/sandbox.py",
     "workers/manager.py",
     "workers/backends/__init__.py",
+    "workers/backends/chat_agent.py",
     "workers/backends/codex.py",
     "engine/__init__.py",
     "engine/safety.py",

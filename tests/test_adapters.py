@@ -32,7 +32,7 @@ from astrbot_plugin_echo.adapters.llm import (  # noqa: E402
     OpenAICompatClient,
     strip_thinking,
 )
-from astrbot_plugin_echo.adapters.search import HttpSearchProvider  # noqa: E402
+from astrbot_plugin_echo.adapters.search import HttpSearchProvider, search_bing_cn  # noqa: E402
 from astrbot_plugin_echo.domain import (  # noqa: E402
     ImagePart,
     LLMMessage,
@@ -274,6 +274,58 @@ class SearchProviderTests(unittest.TestCase):
         self.assertEqual(hits[0].title, "文档")
         req_sent = mocked.call_args[0][0]
         self.assertEqual(req_sent.full_url, "https://api.tavily.com/search")
+
+    def test_quota_exhaustion_cooldown_and_bing_cn_fallback(self):
+        bing_html = (
+            '<html><body><ol id="b_results">'
+            '<li class="b_algo"><h2><a href="https://weather.example.cn/sh">上海今日天气</a></h2>'
+            '<div class="b_caption"><p>今天晴转多云，13℃。</p></div></li>'
+            '</ol></body></html>'
+        )
+        captcha_html = "<html><body>Please verify you are human (CAPTCHA)</body></html>"
+
+        sp = HttpSearchProvider(provider="tavily", api_key="tvly-123456")
+        called_urls = []
+
+        def fake_urlopen(req, timeout=12):
+            called_urls.append(req.full_url)
+            if "tavily.com" in req.full_url:
+                raise urllib.error.HTTPError(
+                    req.full_url, 429, "Too Many Requests", {}, io.BytesIO(b"quota exceeded")
+                )
+            resp = MagicMock()
+            resp.read.return_value = bing_html.encode("utf-8")
+            resp.__enter__.return_value = resp
+            resp.__exit__.return_value = False
+            return resp
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            hits1 = sp.search("上海天气", limit=3)
+            self.assertTrue(sp.in_primary_cooldown())
+            hits2 = sp.search("苏州天气", limit=3)
+
+        self.assertEqual(len(hits1), 1)
+        self.assertEqual(hits1[0].title, "上海今日天气")
+        self.assertIn("13℃", hits1[0].snippet)
+        self.assertEqual(len(hits2), 1)
+        # 第一次调 Tavily(429) + Bing CN，第二次在冷却期内跳过 Tavily 直接走 Bing CN
+        self.assertEqual(sum("tavily" in u for u in called_urls), 1)
+        self.assertEqual(sum("cn.bing.com" in u for u in called_urls), 2)
+
+        # 遇到验证码反爬页立即收手返回空
+        def fake_captcha(req, timeout=10):
+            resp = MagicMock()
+            resp.read.return_value = captcha_html.encode("utf-8")
+            resp.__enter__.return_value = resp
+            resp.__exit__.return_value = False
+            return resp
+
+        with patch("urllib.request.urlopen", side_effect=fake_captcha):
+            self.assertEqual(search_bing_cn("test"), [])
+
+        # provider="bing" 免 Key 直接可用
+        bing_sp = HttpSearchProvider(provider="bing")
+        self.assertTrue(bing_sp.available())
 
 
 class InboundAndSenderTests(unittest.TestCase):
