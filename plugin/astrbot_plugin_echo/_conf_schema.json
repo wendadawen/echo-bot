@@ -15,13 +15,7 @@
     "description": "模型 ID",
     "type": "string",
     "default": "gpt-4o-mini",
-    "hint": "由所填接口决定可用取值。"
-  },
-  "reminder_enabled": {
-    "description": "启用定时提醒",
-    "type": "bool",
-    "default": true,
-    "hint": "关闭后 /提醒 仍可登记，但不会主动发送。"
+    "hint": "支持原生 tools 与多模态的现代模型效果最佳（如 gpt-6-luna/gpt-4o），弱模型会自动兼容降级。"
   },
   "history_limit": {
     "description": "上下文聊天记录条数",
@@ -34,5 +28,23 @@
     "type": "int",
     "default": 300,
     "hint": "后台查资料、写代码、生成文件的单次最长等待秒数，默认 300（范围 180-600）。"
+  },
+  "search_provider": {
+    "description": "轻量联网搜索服务（可选）",
+    "type": "string",
+    "default": "",
+    "hint": "可选 tavily / exa / generic；留空且未填 search_api_base 时自动隐藏直搜工具。"
+  },
+  "search_api_base": {
+    "description": "搜索接口地址（可选）",
+    "type": "string",
+    "default": "",
+    "hint": "可选搜索 endpoint URL，也可通过 BOT_SEARCH_API_BASE 设置。"
+  },
+  "search_api_key": {
+    "description": "搜索 API Key（可选）",
+    "type": "string",
+    "default": "",
+    "hint": "可选搜索服务密钥，也可通过 BOT_SEARCH_API_KEY 设置。"
   }
 }

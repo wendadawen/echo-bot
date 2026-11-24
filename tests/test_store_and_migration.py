@@ -1,0 +1,373 @@
+"""store 层测试：统一 SQLite 仓库、FTS5/双字群记忆、表情包筛选与 v1 迁移。"""
+
+import sqlite3
+import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+from unittest.mock import MagicMock
+
+ROOT = Path(__file__).resolve().parents[1]
+PLUGIN_ROOT = ROOT / "plugin"
+if str(PLUGIN_ROOT) not in sys.path:
+    sys.path.insert(0, str(PLUGIN_ROOT))
+
+from astrbot_plugin_echo.domain import PendingDelivery  # noqa: E402
+from astrbot_plugin_echo.store.emoji_store import (  # noqa: E402
+    EmojiStore,
+    acceptable,
+    analyze_emoji,
+)
+from astrbot_plugin_echo.store.repository import Repository  # noqa: E402
+
+TINY_PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+TINY_GIF = b"GIF89a\x01\x00\x01\x00\x00\x00\x00;"
+
+
+class RepositoryTests(unittest.TestCase):
+    def setUp(self):
+        self.repo = Repository(":memory:")
+
+    def tearDown(self):
+        self.repo.close()
+
+    def test_messages_history_and_prune(self):
+        for i in range(65):
+            self.repo.add_message(
+                "g1", "1001", "阿明", "user", f"第{i}条消息", ts=1000.0 + i, msg_id=f"m{i}"
+            )
+        recent = self.repo.recent_messages("g1", limit=10)
+        self.assertEqual(len(recent), 10)
+        self.assertEqual(recent[0]["msg_id"], "m55")
+        self.assertEqual(recent[-1]["msg_id"], "m64")
+
+        since = self.repo.messages_since("g1", ts=1060.0, limit=10)
+        self.assertEqual([r["msg_id"] for r in since], ["m61", "m62", "m63", "m64"])
+
+        deleted = self.repo.prune_messages(keep_per_group=50)
+        self.assertEqual(deleted, 15)
+        self.assertEqual(self.repo.stats("g1")["messages"], 50)
+
+    def test_episodes_and_fts_chinese_bigram_recall(self):
+        self.repo.add_episode("g1", "小和提到周末要在苏州实验室做实验", now=1000.0, source="chat", external_id="ep1")
+        self.repo.add_episode("g1", "重复ID不该插入", now=1001.0, source="chat", external_id="ep1")
+        self.assertEqual(self.repo.stats("g1")["episodes"], 1)
+
+        self.repo.add_memory("g1", "event", "小和正在苏州实验室调试超导样品", now=1000.0)
+        self.repo.add_memory("g1", "preference", "阿明最喜欢喝冰美式咖啡", now=1000.0, protected=True)
+        self.repo.add_memory("g1", "jargon", "kk=快看看", now=1000.0)
+
+        hits = self.repo.recall_memories("g1", "苏州实验室", limit=5, now=1005.0)
+        self.assertTrue(any("苏州实验室" in h for h in hits), hits)
+
+        # 非空无关查询不应硬塞无关记忆
+        unrelated = self.repo.recall_memories("g1", "微积分期末考", limit=5, now=1005.0)
+        self.assertEqual(unrelated, [])
+
+        self.assertEqual(self.repo.group_jargon("g1"), {"kk": "快看看"})
+
+    def test_person_identity_merge_across_rename(self):
+        self.repo.observe_person("g1", "10001", "阿明", now=100.0)
+        self.repo.observe_person("g1", "10001", "阿明改名了", now=200.0)
+        self.repo.upsert_person(
+            "g1", "10001", now=200.0, traits="爱吐槽", preferences="冰美式"
+        )
+        self.repo.upsert_person(
+            "g1", "10001", now=210.0, traits="写Python", relation="实验室同学"
+        )
+
+        self.assertEqual(self.repo.resolve_person("g1", "阿明"), "10001")
+        self.assertEqual(self.repo.resolve_person("g1", "阿明改名了"), "10001")
+        self.assertEqual(self.repo.resolve_person("g1", "10001"), "10001")
+        self.assertIsNone(self.repo.resolve_person("g1", "不存在的路人甲"))
+
+        aliases = self.repo.person_aliases("g1", "10001")
+        self.assertEqual(set(aliases), {"阿明", "阿明改名了"})
+        summary = self.repo.person_summary("g1", "10001")
+        self.assertIn("爱吐槽", summary)
+        self.assertIn("写Python", summary)
+        self.assertIn("冰美式", summary)
+        self.assertIn("实验室同学", summary)
+
+    def test_image_cache_and_conv_state(self):
+        self.assertEqual(self.repo.get_image_cache("abc"), "")
+        self.repo.put_image_cache("abc", "一只戴墨镜的柴犬", group_id="g1")
+        self.assertEqual(self.repo.get_image_cache("abc"), "一只戴墨镜的柴犬")
+
+        self.repo.save_conv_state(
+            "g1",
+            {
+                "topics": ["讨论重构", "调试Docker", "t3", "t4", "t5", "t6"],
+                "progress": ["已迁移存储"],
+                "pending": ["跑测试"],
+            },
+        )
+        state = self.repo.get_conv_state("g1")
+        self.assertEqual(len(state["topics"]), 5)
+        self.assertEqual(state["progress"], ["已迁移存储"])
+        self.assertEqual(state["pending"], ["跑测试"])
+
+    def test_reload_safe_pending_delivery_after_close(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "echo.sqlite3"
+            repo = Repository(db_path)
+            repo.close()
+
+            delivery = PendingDelivery(
+                task_id="t123",
+                group_id="g1",
+                umo="qq:group:g1",
+                prompt="分析日志",
+                status="done",
+                reason="done",
+                result="发现3个报错",
+                files=({"path": str(Path(tmp) / "report.md"), "name": "report.md"},),
+                created_at=1234.5,
+            )
+            self.assertTrue(repo.save_pending_delivery(delivery))
+
+            reopened = Repository(db_path)
+            try:
+                items = reopened.list_pending_deliveries()
+                self.assertEqual(len(items), 1)
+                self.assertEqual(items[0].task_id, "t123")
+                self.assertEqual(items[0].result, "发现3个报错")
+                self.assertEqual(
+                    reopened.pending_delivery_paths(), {str(Path(tmp) / "report.md")}
+                )
+                self.assertTrue(reopened.delete_pending_delivery("t123"))
+                self.assertEqual(reopened.list_pending_deliveries(), [])
+            finally:
+                reopened.close()
+
+    def test_monitor_events_and_error_window(self):
+        self.repo.record_event("g1", "reply", ok=True, latency=1.2, tokens=100, now=1000.0)
+        self.repo.record_event("g1", "model_error", ok=False, latency=5.0, detail="timeout", now=1050.0)
+        self.assertEqual(self.repo.recent_error_count("g1", window_seconds=120.0, now=1100.0), 1)
+        self.assertEqual(self.repo.recent_error_count("g1", window_seconds=120.0, now=1300.0), 0)
+        stats = self.repo.monitor_stats("g1", hours=24, now=1100.0)
+        self.assertEqual(stats["total"], 2)
+        self.assertEqual(stats["errors"], 1)
+        self.assertEqual(stats["tokens"], 100)
+
+
+class EmojiStoreTests(unittest.TestCase):
+    def test_acceptable_and_analyze_gate(self):
+        self.assertFalse(acceptable(""))
+        self.assertFalse(acceptable("非表情"))
+        self.assertFalse(acceptable("这是一张二维码截图"))
+        self.assertFalse(acceptable("猫猫笑", b"x" * (2 * 1024 * 1024 + 1)))
+        self.assertTrue(acceptable("一只猫翻白眼", TINY_PNG))
+
+        llm = MagicMock()
+        llm.describe_image.return_value = "无语|一只猫翻白眼"
+        desc, label = analyze_emoji(llm, TINY_PNG)
+        self.assertEqual(label, "无语")
+        self.assertEqual(desc, "一只猫翻白眼")
+
+        llm.describe_image.return_value = "非表情"
+        desc, label = analyze_emoji(llm, TINY_PNG)
+        self.assertEqual((desc, label), ("非表情", "非表情"))
+
+    def test_collect_negative_cache_pick_and_cleanup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = EmojiStore(tmp, limit=10, max_age_days=30)
+            llm = MagicMock()
+            llm.describe_image.side_effect = ["非表情", "开心|熊猫头鼓掌", "无语|猫猫摊手"]
+
+            # 截图被拒收并写入负缓存，二次传入同图不重复调 VLM
+            self.assertEqual(store.collect("g1", TINY_PNG, llm), "")
+            self.assertEqual(store.collect("g1", TINY_PNG, llm), "")
+            self.assertEqual(llm.describe_image.call_count, 1)
+
+            # 真表情被收录并按关键词命中，带防连发轮换
+            b1 = TINY_GIF + b"1"
+            b2 = TINY_GIF + b"2"
+            self.assertEqual(store.collect("g1", b1, llm), "开心")
+            self.assertEqual(store.collect("g1", b2, llm), "无语")
+            store.collect_face("g1", "178", "滑稽")
+
+            self.assertTrue(store.has_entries("g1"))
+            self.assertIn("开心", store.tags("g1"))
+            picked_happy = store.pick("g1", "开心")
+            self.assertIsInstance(picked_happy, Path)
+
+            # 同关键词连挑多轮（仅一条开心时也能返回）
+            self.assertEqual(store.pick("g1", "滑稽"), "face:178")
+
+            # 超期文件清理
+            for entry in store._index["g1"]:
+                entry["ts"] = time.time() - 40 * 86400
+            store.cleanup(max_age_days=30)
+            self.assertFalse(store.has_entries("g1"))
+
+
+class LegacyMigrationTests(unittest.TestCase):
+    def test_lossless_idempotent_migration_from_v1_dbs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            t0 = time.time() - 3600.0
+
+            # 1) 旧版 echo.sqlite3 (无 msg_id 列 + pending_deliveries)
+            with sqlite3.connect(root / "echo.sqlite3") as c:
+                c.executescript(
+                    f"""
+                    CREATE TABLE messages (
+                        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                        group_id TEXT NOT NULL,
+                        user_id TEXT NOT NULL,
+                        user_name TEXT NOT NULL,
+                        role TEXT NOT NULL,
+                        text TEXT NOT NULL,
+                        ts REAL NOT NULL
+                    );
+                    INSERT INTO messages VALUES (1, 'g1', '101', '大明', 'user', '在干嘛', {t0});
+                    INSERT INTO messages VALUES (2, 'g1', 'bot', '大肥鱼', 'assistant', '摸鱼中', {t0 + 1});
+                    """
+                )
+
+            # 2) 旧版 persons.sqlite3 (同时含 individuals + identities + profiles)
+            with sqlite3.connect(root / "persons.sqlite3") as c:
+                c.executescript(
+                    f"""
+                    CREATE TABLE individuals (
+                        user_id TEXT PRIMARY KEY,
+                        msg_count INTEGER NOT NULL DEFAULT 0,
+                        first_seen REAL NOT NULL,
+                        last_seen REAL NOT NULL
+                    );
+                    CREATE TABLE identities (
+                        group_id TEXT NOT NULL,
+                        user_id TEXT NOT NULL,
+                        name TEXT NOT NULL,
+                        kind TEXT NOT NULL DEFAULT 'nick',
+                        hits INTEGER NOT NULL DEFAULT 1,
+                        updated_at REAL NOT NULL,
+                        PRIMARY KEY (group_id, user_id, name)
+                    );
+                    CREATE TABLE profiles (
+                        group_id TEXT NOT NULL,
+                        user_id TEXT NOT NULL,
+                        traits TEXT NOT NULL DEFAULT '',
+                        preferences TEXT NOT NULL DEFAULT '',
+                        events TEXT NOT NULL DEFAULT '',
+                        relation TEXT NOT NULL DEFAULT '',
+                        intimacy REAL NOT NULL DEFAULT 0.5,
+                        updated_at REAL NOT NULL,
+                        PRIMARY KEY (group_id, user_id)
+                    );
+                    INSERT INTO individuals VALUES ('101', 42, {t0 - 50}, {t0});
+                    INSERT INTO identities VALUES ('g1', '101', '大明', 'nick', 10, {t0});
+                    INSERT INTO profiles VALUES ('g1', '101', '夜猫子', '乌龙茶', '考研中', '群友', 0.8, {t0});
+                    """
+                )
+
+            # 3) 旧版 memory.sqlite3
+            with sqlite3.connect(root / "memory.sqlite3") as c:
+                c.executescript(
+                    f"""
+                    CREATE TABLE episodes (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        group_id TEXT NOT NULL,
+                        text TEXT NOT NULL,
+                        created_at REAL NOT NULL,
+                        source TEXT NOT NULL DEFAULT '',
+                        external_id TEXT NOT NULL DEFAULT '',
+                        state TEXT NOT NULL DEFAULT 'ready'
+                    );
+                    CREATE TABLE memory_points (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        group_id TEXT NOT NULL,
+                        category TEXT NOT NULL,
+                        content TEXT NOT NULL,
+                        weight REAL NOT NULL DEFAULT 1.0,
+                        last_hit REAL NOT NULL,
+                        state TEXT NOT NULL DEFAULT 'active',
+                        protected INTEGER NOT NULL DEFAULT 0
+                    );
+                    CREATE TABLE jargon (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        group_id TEXT NOT NULL,
+                        word TEXT NOT NULL,
+                        alias TEXT NOT NULL
+                    );
+                    CREATE TABLE relations (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        group_id TEXT NOT NULL,
+                        a TEXT NOT NULL,
+                        b TEXT NOT NULL,
+                        relation TEXT NOT NULL,
+                        weight REAL NOT NULL DEFAULT 1.0,
+                        valid_from REAL NOT NULL,
+                        valid_to REAL
+                    );
+                    CREATE TABLE person_profiles (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        group_id TEXT NOT NULL,
+                        user_name TEXT NOT NULL,
+                        category TEXT NOT NULL,
+                        content TEXT NOT NULL,
+                        last_hit REAL NOT NULL
+                    );
+                    INSERT INTO episodes VALUES (1, 'g1', '昨晚一起联机打游戏', {t0}, 'chat', '', 'ready');
+                    INSERT INTO memory_points VALUES (1, 'g1', 'event', '周末要去苏州实验室', 2.0, {t0}, 'active', 1);
+                    INSERT INTO jargon VALUES (1, 'g1', 'yyds', '永远的神');
+                    INSERT INTO relations VALUES (1, 'g1', '大明', '小和', '同门师兄弟', 2.0, {t0}, NULL);
+                    INSERT INTO relations VALUES (2, 'g1', '大明', '路人', '已过时关系', 1.0, {t0 - 200}, {t0 - 100});
+                    INSERT INTO person_profiles VALUES (1, 'g1', '大明', 'preferences', '喜欢冰镇可乐', {t0 + 10});
+                    """
+                )
+
+            # 4) 旧版 monitor.sqlite3
+            with sqlite3.connect(root / "monitor.sqlite3") as c:
+                c.executescript(
+                    f"""
+                    CREATE TABLE events (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        group_id TEXT NOT NULL,
+                        kind TEXT NOT NULL,
+                        ok INTEGER NOT NULL,
+                        latency REAL NOT NULL,
+                        tokens INTEGER NOT NULL,
+                        detail TEXT NOT NULL,
+                        ts REAL NOT NULL
+                    );
+                    INSERT INTO events VALUES (1, 'g1', 'reply', 1, 1.5, 80, '', {t0});
+                    """
+                )
+
+            repo = Repository(root / "echo.sqlite3")
+            try:
+                stats = repo.stats("g1")
+                self.assertEqual(stats["messages"], 2)
+                self.assertEqual(stats["episodes"], 1)
+                # memory_points(1) + jargon(1) + active relation(1) = 3
+                self.assertEqual(stats["memories"], 3)
+                self.assertEqual(stats["persons"], 1)
+
+                # 验证 individuals 的 msg_count 与 profiles 的 traits/preferences 都保留且未被 INSERT OR IGNORE 覆盖丢失
+                summary = repo.person_summary("g1", "101")
+                self.assertIn("夜猫子", summary)
+                self.assertIn("乌龙茶", summary)
+                self.assertIn("冰镇可乐", summary)
+                self.assertIn("同门师兄弟", " ".join(repo.recall_memories("g1", "小和 同门")))
+                self.assertEqual(repo.group_jargon("g1"), {"yyds": "永远的神"})
+                self.assertEqual(repo.monitor_stats("g1", hours=24)["total"], 1)
+                self.assertEqual(repo.recent_messages("g1")[0]["msg_id"], "")
+            finally:
+                repo.close()
+
+            # 二次打开必须完全幂等
+            repo2 = Repository(root / "echo.sqlite3")
+            try:
+                again = repo2.migrate_legacy_dbs(root)
+                self.assertEqual(again, {"episodes": 0, "memories": 0, "aliases": 0, "persons": 0, "events": 0})
+                self.assertEqual(repo2.stats("g1")["memories"], 3)
+                self.assertEqual(repo2.stats("g1")["persons"], 1)
+            finally:
+                repo2.close()
+
+
+if __name__ == "__main__":
+    unittest.main()
