@@ -11,6 +11,7 @@ from .messages import format_history_time, format_speaker_message
 
 DEFAULT_API_BASE = "https://api.openai.com/v1"
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+DEFAULT_MODEL_TIMEOUT = 90
 
 
 def _read_bounded(resp, limit=MAX_RESPONSE_BYTES):
@@ -81,7 +82,7 @@ class OpenAIModel(BaseModel):
 
     name = "openai"
 
-    def __init__(self, api_key, api_base, model, timeout=40):
+    def __init__(self, api_key, api_base, model, timeout=DEFAULT_MODEL_TIMEOUT):
         self.api_key = str(api_key or "").strip()
         base = str(api_base or DEFAULT_API_BASE).strip()
         if not base.startswith(("http://", "https://")):

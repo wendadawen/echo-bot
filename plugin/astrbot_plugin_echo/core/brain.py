@@ -854,6 +854,7 @@ class Brain:
             group, body_text, user_name, batch, history,
             persona=persona, style=group_style,
         )
+        scene = getattr(batch, "scene", "group")
         capabilities = dict(self.capabilities)
         capabilities["view_image"] = bool(getattr(batch, "images", None))
         has_emoji = True if (
@@ -861,6 +862,11 @@ class Brain:
         ) else bool(self.emoji_bank and self.emoji_bank.stats(group).get(group))
         capabilities["send_face"] = bool(capabilities.get("send_face", True) and has_emoji)
         capabilities["schedule"] = bool(capabilities.get("schedule", True) and self.reminders_enabled)
+        allow_subagent = bool(
+            capabilities.get("subagent", True)
+            and ((info.mentioned and not info.retold) or scene == "private")
+        )
+        capabilities["subagent"] = allow_subagent
         if info.mentioned and not info.retold:
             capabilities["silent"] = False
             capabilities["wait"] = False
@@ -927,6 +933,8 @@ class Brain:
             if action == "read_result":
                 return False, self.tool_loop.results.get(group_id, payload)
             if action == "subagent":
+                if not allow_subagent:
+                    return False, "没有明确 @ 或点名你，不能启动后台工具"
                 dispatched = self._dispatch_task(
                     group_id, payload, getattr(batch, "umo", "")
                 )
@@ -938,7 +946,7 @@ class Brain:
         started = time.time()
         decision = self.tool_loop.run(
             system, history, text, executor, group,
-            scene=getattr(batch, "scene", "group"),
+            scene=scene,
             capabilities=capabilities,
         )
         elapsed = time.time() - started
@@ -980,6 +988,8 @@ class Brain:
                         "reason": "face", "rounds": rounds_used}
             return {"replied": False, "text": "", "reason": "silent", "rounds": rounds_used}
         if action == "subagent":
+            if not allow_subagent:
+                return {"replied": False, "text": "", "reason": "silent", "rounds": rounds_used}
             dispatched = self._dispatch_task(
                 group, reply, getattr(batch, "umo", ""),
                 ack_text=decision.get("reply", ""),
@@ -1000,7 +1010,8 @@ class Brain:
         promised_lookup = any(hint in reply for hint in _PROMISE_LOOKUP_HINTS)
         unsupported_cap = any(k in body_text for k in _UNSUPPORTED_CAP_HINTS)
         if (
-            not running_tasks
+            allow_subagent
+            and not running_tasks
             and not is_unsafe(body_text)
             and not unsupported_cap
             and (uncertain or promised_lookup or any(hint in reply for hint in REFUSAL_HINTS))

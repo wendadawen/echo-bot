@@ -58,7 +58,7 @@ ACTION_PROMPT = (
     "遇到此类请求直接 reply 拒绝，绝不要说“先列清单/只读查看”，也绝不要派 subagent。\n"
     "本系统没有文生图/绘图 API、不能语音/打电话；遇到画图/自画像/调用绘图 API 的请求，"
     "直接 reply 说明做不到，绝不要派 subagent。\n"
-    "不要因为怕答错就 silent，怕答错就用 subagent。\n"
+    "有人点名问你时，不要因为怕答错就 silent，怕答错就用 subagent；没人 @ 或点名你、只是旁听时绝不要用 subagent，拿不准就 silent。\n"
     "一批里有多条在问你，就在一条回复里分别接住，不要只挑最后一条；"
     "实在接不下时，优先回 @ 你、问得最具体的那条，其余用半句带过。\n"
     '例：{"action":"reply","text":"少来这套"}'
@@ -157,6 +157,8 @@ def validate(action, payload, scene="group", capabilities=None, reply=""):
     if action not in available(scene, capabilities):
         if action in ("silent", "wait") and capabilities is not None and not capabilities.get("silent", True):
             return False, "有人明确点到了你，请直接 reply 或 subagent，不要 silent 或 wait"
+        if action == "subagent" and capabilities is not None and not capabilities.get("subagent", True):
+            return False, "没有明确 @ 或点名你，不能启动后台工具，请直接 reply 或 silent"
         return False, "这个动作在当前场景不可用"
     spec = ACTION_SPECS[action]
     if spec[1] == "text" and not payload and action not in ("view_image", "read_result"):

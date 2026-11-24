@@ -28,7 +28,8 @@ from astrbot_plugin_echo.core.harness import CodexHarness  # noqa: E402
 from astrbot_plugin_echo.core.memory import MEMORY_PROMPT, Memory, parse_memory_full  # noqa: E402
 from astrbot_plugin_echo.core.messages import Message  # noqa: E402
 from astrbot_plugin_echo.core.models import (  # noqa: E402
-    DEFAULT_API_BASE, MockModel, OpenAIModel, _extract_message_text, build_model, resolve_model_config,
+    DEFAULT_API_BASE, DEFAULT_MODEL_TIMEOUT, MockModel, OpenAIModel,
+    _extract_message_text, build_model, resolve_model_config,
 )
 from astrbot_plugin_echo.core.monitor import Monitor  # noqa: E402
 from astrbot_plugin_echo.core.person_info import PersonStore, _merge_field  # noqa: E402
@@ -1371,3 +1372,114 @@ class TestMemoryPersonsContextMonitorAttentionAndInfra(unittest.TestCase):
             self.assertIn("NAPCAT_WEBUI_TOKEN", boot_text)
             up_text = (ROOT / "scripts" / "up.sh").read_text(encoding="utf-8")
             self.assertLess(up_text.index("for _k in BASE_IMAGE"), up_text.index('if [[ "$mode_cn" -eq 1 ]]'))
+
+    def test_model_timeout_90s_and_subagent_blocked_without_explicit_mention(self):
+        # 1) 默认 HTTP 超时放宽到 90s，reply 与 vision_reply 均使用 timeout=90
+        self.assertEqual(90, DEFAULT_MODEL_TIMEOUT)
+        oa = OpenAIModel("k", "http://localhost/v1", "m")
+        self.assertEqual(90, oa.timeout)
+        seen_timeouts = []
+
+        class _FakeResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return json.dumps({"choices": [{"message": {"content": "收到"}}]}).encode("utf-8")
+
+        def _fake_urlopen(req, timeout=None):
+            seen_timeouts.append(timeout)
+            return _FakeResp()
+
+        with patch("urllib.request.urlopen", side_effect=_fake_urlopen):
+            self.assertEqual("收到", oa.reply("sys", [], "hi"))
+            self.assertEqual("收到", oa.vision_reply("看图", "data:image/png;base64,AAAA"))
+        self.assertEqual([90, 90], seen_timeouts)
+
+        # 2) 未 @ 群聊问句：不暴露 subagent 动作；即使模型硬输出 subagent / 不知道 / 我查一下 / 查不了，也绝不启动后台工具
+        now = time.time()
+        for reply_text in (
+            '{"action":"subagent","text":"查一下实验室还是小和的"}',
+            "这个我不知道",
+            "我查一下再告诉你",
+            "我这边查不了实时内容",
+        ):
+            seen_systems = []
+            submitted = []
+
+            class _PassiveModel:
+                def reply(self, system, history, user_text):
+                    seen_systems.append(system)
+                    return reply_text
+
+            brain = Brain(Store(":memory:"), _PassiveModel())
+            brain.subagent = SubAgentManager()
+            brain.subagent.submit = lambda kind, prompt, runner, **kw: (submitted.append(prompt) or "tid-no")
+            batch = Batch(
+                "g1",
+                items=[Item("实验室，还是小和的？", "u1", "神之殒", False, "umo:1", now)],
+                started=now,
+                deadline=now,
+            )
+            res = brain.handle_batch(batch)
+            self.assertNotIn("- subagent：", seen_systems[0])
+            self.assertIn("只是旁听时绝不要用 subagent", seen_systems[0])
+            self.assertNotEqual("task", res["reason"])
+            self.assertEqual([], submitted)
+            if reply_text.startswith("{"):
+                self.assertGreater(len(seen_systems), 1)
+                self.assertIn("[校验失败] 没有明确 @ 或点名你，不能启动后台工具", seen_systems[1])
+                self.assertEqual("silent", res["reason"])
+
+        # 3) 转述提及（retold=True）即使带 @/自称，也不允许启动 subagent
+        submitted_retold = []
+
+        class _RetoldModel:
+            def reply(self, system, history, user_text):
+                return "这个我不知道"
+
+        brain_retold = Brain(Store(":memory:"), _RetoldModel())
+        brain_retold.subagent = SubAgentManager()
+        brain_retold.subagent.submit = lambda kind, prompt, runner, **kw: (submitted_retold.append(prompt) or "tid-retold")
+        retold_batch = Batch(
+            "g1",
+            items=[Item("他们说你大肥鱼知道吗？", "u1", "阿伟", True, "umo:1", now)],
+            started=now,
+            deadline=now,
+        )
+        retold_res = brain_retold.handle_batch(retold_batch)
+        self.assertTrue(retold_batch.mention_info.retold)
+        self.assertNotEqual("task", retold_res["reason"])
+        self.assertEqual([], submitted_retold)
+
+        # 4) 群聊明确 @ 且非转述，以及私聊（scene="private"）仍允许启动 subagent
+        submitted_ok = []
+
+        class _SubModel:
+            def reply(self, system, history, user_text):
+                return '{"action":"subagent","text":"查一下苏州今天天气"}'
+
+        brain_ok = Brain(Store(":memory:"), _SubModel())
+        brain_ok.subagent = SubAgentManager()
+        brain_ok.subagent.submit = lambda kind, prompt, runner, **kw: (submitted_ok.append(prompt) or "tid-ok")
+        group_at_res = brain_ok.handle_batch(Batch(
+            "g1",
+            items=[Item("苏州今天几度？", "u1", "阿伟", True, "umo:1", now)],
+            started=now,
+            deadline=now,
+        ))
+        self.assertEqual("task", group_at_res["reason"])
+        self.assertEqual(1, len(submitted_ok))
+
+        priv_res = brain_ok.handle_batch(Batch(
+            "p1",
+            items=[Item("帮我查查苏州今天几度", "u1", "阿伟", False, "umo:p1", now)],
+            started=now,
+            deadline=now,
+            scene="private",
+        ))
+        self.assertEqual("task", priv_res["reason"])
+        self.assertEqual(2, len(submitted_ok))
