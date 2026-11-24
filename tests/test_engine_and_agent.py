@@ -61,7 +61,10 @@ class _SeqLLM:
             return ModelTurn(text='{"episode":"","points":[],"persons":[],"state":{"topics":[],"progress":[],"pending":[]}}')
         self.recorded_calls.append({"messages": list(messages), "tool_names": [t.name for t in tools]})
         if self.turns:
-            return self.turns.pop(0)
+            nxt = self.turns.pop(0)
+            if isinstance(nxt, BaseException):
+                raise nxt
+            return nxt
         return ModelTurn(text="嗯嗯")
 
     def describe_image(self, image_bytes, prompt, timeout=None):
@@ -419,6 +422,94 @@ class EchoAgentTests(unittest.TestCase):
         stats_row2 = repo._db.execute("SELECT detail FROM monitor_events WHERE kind='reply' ORDER BY id DESC LIMIT 1").fetchone()
         self.assertEqual(stats_row2["detail"], "tools=web_search")
         agent.wait_background(2.0)
+        repo.close()
+
+    def test_model_error_replies_natural_notice_only_when_addressed_and_clears_repeat_guard(self):
+        repo = Repository(":memory:")
+        sch = Scheduler()
+        overload_err = RuntimeError(
+            'HTTP 529: {"error":{"type":"overloaded_error","code":"pool_overloaded","message":"号池负载过高，稍后再试"}}'
+        )
+        llm = _SeqLLM([overload_err, ModelTurn(text="刚才看清了，这是只橘猫。")], ignore_summary=True)
+        agent = EchoAgent(repo, llm, sch)
+
+        # 1) 显式 @ 触发 529 过载：不重试、回自然提示、不入 messages 历史、记录 model_error、放行立即重发
+        b1 = Batch(
+            "g1",
+            [ChatEvent("g1", "u1", "神之殒", "@大肥鱼 图里是谁", msg_id="m_529", ts=100.0, mentioned=True)],
+        )
+        r1 = agent.handle_batch(b1)
+        self.assertEqual(len(llm.recorded_calls), 1)
+        self.assertTrue(r1["replied"])
+        self.assertEqual(r1["reason"], "model_error")
+        self.assertEqual(len(r1["actions"]), 1)
+        self.assertIsInstance(r1["actions"][0], SendText)
+        notice_529 = r1["actions"][0].text
+        self.assertEqual(notice_529, "刚才接口这边有点挤，等几秒再喊我试试。")
+        self.assertNotIn("529", notice_529)
+        self.assertNotIn("pool_overloaded", notice_529)
+        self.assertEqual(sch.last_reply_at("g1"), 0.0)
+        hist = repo.recent_messages("g1", limit=10)
+        self.assertFalse(any(m.get("role") == "bot" for m in hist))
+        self.assertEqual(repo.recent_error_count("g1", 120.0), 1)
+
+        # 紧接着（30 秒防重窗口内）重发完全相同的文本消息，不应被防重吞掉
+        b_retry = Batch(
+            "g1",
+            [ChatEvent("g1", "u1", "神之殒", "@大肥鱼 图里是谁", msg_id="m_retry", ts=101.0, mentioned=True)],
+        )
+        r_ok = agent.handle_batch(b_retry)
+        self.assertEqual(r_ok["reason"], "reply")
+        self.assertEqual(r_ok["actions"][0].text, "刚才看清了，这是只橘猫。")
+
+        # 2) 超时/一般报错文案映射 + 报错期间有他人插话时自动引用触发消息 + 私聊也回复提示
+        class _InterveningTimeoutLLM:
+            def chat(self, messages, tools=(), timeout=None):
+                repo.add_message("g1", "u2", "路人", "user", "插入一句无关闲聊", ts=205.0, msg_id="m_other")
+                raise TimeoutError("timed out reading upstream")
+
+            def describe_image(self, image_bytes, prompt, timeout=None):
+                return ""
+
+            def extra_secrets(self):
+                return ()
+
+        agent_to = EchoAgent(repo, _InterveningTimeoutLLM(), sch)
+        r_to = agent_to.handle_batch(
+            Batch("g1", [ChatEvent("g1", "u1", "神之殒", "@大肥鱼 查个东西", msg_id="m_to", ts=200.0, mentioned=True)])
+        )
+        self.assertTrue(r_to["replied"])
+        self.assertEqual(r_to["actions"][0].text, "刚才网络卡了一下没连上，稍后再喊我试试。")
+        self.assertEqual(r_to["actions"][0].reply_to_msg_id, "m_to")
+
+        llm_misc = _SeqLLM([RuntimeError("unexpected upstream boom")], ignore_summary=True)
+        agent_misc = EchoAgent(repo, llm_misc, sch)
+        r_priv = agent_misc.handle_batch(
+            Batch(
+                "private:u1",
+                [ChatEvent("private:u1", "u1", "神之殒", "在吗", msg_id="m_p1", ts=210.0, scene="private", mentioned=True)],
+                scene="private",
+            )
+        )
+        self.assertTrue(r_priv["replied"])
+        self.assertEqual(r_priv["actions"][0].text, "刚才我这边卡壳了一下，稍后再喊我试试。")
+
+        # 3) 未 @ 闲聊与转述 mention(retold=True) 触发 model_error 仍保持静默
+        llm_silent = _SeqLLM([overload_err, overload_err], ignore_summary=True)
+        agent_silent = EchoAgent(repo, llm_silent, sch)
+        r_un = agent_silent.handle_batch(
+            Batch("g1", [ChatEvent("g1", "u2", "路人", "随便聊聊", msg_id="m_un", ts=220.0, mentioned=False)])
+        )
+        self.assertEqual(r_un["reason"], "model_error")
+        self.assertFalse(r_un["replied"])
+        self.assertEqual(r_un["actions"], [])
+
+        r_retold = agent_silent.handle_batch(
+            Batch("g1", [ChatEvent("g1", "u2", "路人", "他们说大肥鱼昨天翻车了", msg_id="m_rt", ts=221.0, mentioned=True, retold=True)])
+        )
+        self.assertEqual(r_retold["reason"], "model_error")
+        self.assertFalse(r_retold["replied"])
+        self.assertEqual(r_retold["actions"], [])
         repo.close()
 
 

@@ -313,9 +313,11 @@ class Echo(Star):
             result = await asyncio.to_thread(self.agent.handle_batch, batch)
             if result.get("reason") == "model_error":
                 logger.error("模型调用失败：%s", result.get("error") or "未知错误")
+            actions = result.get("actions") or ()
+            if not actions:
                 return
             self._last_bot_group = gid
-            for act in result.get("actions") or ():
+            for act in actions:
                 try:
                     await self.sender.send(act)
                 except Exception as exc:

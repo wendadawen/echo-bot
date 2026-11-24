@@ -79,6 +79,40 @@ def _repeat_key(group_id: str, user_id: str, text: str) -> tuple[str, str, str]:
     return (str(group_id), str(user_id), clean)
 
 
+_OVERLOAD_ERROR_KEYWORDS = (
+    "529",
+    "429",
+    "503",
+    "overloaded",
+    "pool_overloaded",
+    "rate_limit",
+    "rate limit",
+    "too many requests",
+    "capacity",
+    "号池负载",
+)
+_NETWORK_ERROR_KEYWORDS = (
+    "timeout",
+    "timed out",
+    "urlopen",
+    "connection",
+    "remote end closed",
+    "reset by peer",
+    "502",
+    "504",
+)
+
+
+def _format_model_error_notice(exc: Exception) -> str:
+    """将上游模型异常映射为简短自然的群聊提示，不泄露状态码或内部错误原文。"""
+    msg = str(exc or "").lower()
+    if any(k in msg for k in _OVERLOAD_ERROR_KEYWORDS):
+        return "刚才接口这边有点挤，等几秒再喊我试试。"
+    if any(k in msg for k in _NETWORK_ERROR_KEYWORDS):
+        return "刚才网络卡了一下没连上，稍后再喊我试试。"
+    return "刚才我这边卡壳了一下，稍后再喊我试试。"
+
+
 def _parse_jargon(content: str) -> Optional[tuple[str, str]]:
     raw = str(content or "").strip()
     for sep in ("=", "：", ":"):
@@ -302,6 +336,13 @@ class EchoAgent:
         self._scheduler.record_bot_reply(gid, now=time.time())
         return [SendText(gid, umo, notice)]
 
+    def _resolve_quote_mid(self, gid: str, scene: str, anchor: Any) -> str:
+        """群聊思考或报错期间若已有插话，自动引用触发该轮的原始消息 ID。"""
+        if scene == "group" and anchor and anchor.msg_id:
+            latest = self._repo.recent_messages(gid, limit=12)
+            return should_quote_reply(anchor.msg_id, anchor.user_id, latest)
+        return ""
+
     def handle_batch(self, batch: Batch) -> dict[str, Any]:
         """核心单批决策入口，返回 `{replied, actions, reason, error}`。"""
         gid = batch.group_id
@@ -334,6 +375,7 @@ class EchoAgent:
 
         # 3) 重复文本消息 30 秒内防重（仅对显式无图相同短句防刷）
         now = time.time()
+        repeat_keys: list[str] = []
         if not batch.has_image:
             repeat_keys = [
                 _repeat_key(gid, i.user_id, i.text)
@@ -410,7 +452,19 @@ class EchoAgent:
             except Exception as exc:
                 elapsed = time.monotonic() - started
                 self._repo.record_event(gid, "model_error", ok=False, latency=elapsed, detail=str(exc))
-                return {"replied": False, "actions": [], "reason": "model_error", "error": str(exc)}
+                for k in repeat_keys:
+                    self._repeat_seen.pop(k, None)
+                if (batch.mentioned and not batch.retold) or batch.scene == "private":
+                    quote_mid = self._resolve_quote_mid(gid, batch.scene, anchor)
+                    notice = _format_model_error_notice(exc)
+                    return {
+                        "replied": True,
+                        "actions": [SendText(gid, umo, notice, reply_to_msg_id=quote_mid)],
+                        "reason": "model_error",
+                        "error": str(exc),
+                        "text": notice,
+                    }
+                return {"replied": False, "actions": [], "reason": "model_error", "error": str(exc), "text": ""}
 
             if not turn.tool_calls:
                 reply_text = str(turn.text or "").strip()
@@ -609,10 +663,7 @@ class EchoAgent:
             self._last_bot_reply.clear()
 
         # 智能 QQ 引用判断（处理模型思考期间是否有人插话）
-        quote_mid = ""
-        if batch.scene == "group" and anchor and anchor.msg_id:
-            latest = self._repo.recent_messages(gid, limit=12)
-            quote_mid = should_quote_reply(anchor.msg_id, anchor.user_id, latest)
+        quote_mid = self._resolve_quote_mid(gid, batch.scene, anchor)
 
         prov: list[str] = []
         if saw_images:
