@@ -323,9 +323,88 @@ class SearchProviderTests(unittest.TestCase):
         with patch("urllib.request.urlopen", side_effect=fake_captcha):
             self.assertEqual(search_bing_cn("test"), [])
 
-        # provider="bing" 免 Key 直接可用
-        bing_sp = HttpSearchProvider(provider="bing")
-        self.assertTrue(bing_sp.available())
+        # provider="bing" / "free" / "so360" 免 Key 直接可用
+        for free_mode in ("bing", "free", "so360"):
+            self.assertTrue(HttpSearchProvider(provider=free_mode).available())
+
+    def test_multi_tier_cascade_and_standalone_search_import(self):
+        import importlib.util
+
+        so360_html = (
+            '<html><body><ul>'
+            '<li class="res-list"><h3><a href="https://redirect.example" data-mdurl="https://docs.astrbot.app">AstrBot 文档</a></h3>'
+            '<p class="res-desc">多协议机器人开发文档</p></li>'
+            '</ul></body></html>'
+        )
+        bing_global_html = (
+            '<html><body><ol id="b_results">'
+            '<li class="b_algo"><h2><a href="https://www.example.com/en">Global Hit</a></h2>'
+            '<p>Fallback global result</p></li>'
+            '</ol></body></html>'
+        )
+        captcha_html = "<html><body>安全验证 CAPTCHA</body></html>"
+
+        sp = HttpSearchProvider(provider="tavily", api_key="tvly-123456")
+        called = []
+
+        def fake_urlopen(req, timeout=12):
+            called.append(req.full_url)
+            if "tavily.com" in req.full_url:
+                raise urllib.error.HTTPError(req.full_url, 429, "Too Many Requests", {}, io.BytesIO(b"limit"))
+            resp = MagicMock()
+            if "cn.bing.com" in req.full_url:
+                resp.read.return_value = captcha_html.encode("utf-8")
+            elif "so.com" in req.full_url:
+                resp.read.return_value = so360_html.encode("utf-8")
+            else:
+                resp.read.return_value = bing_global_html.encode("utf-8")
+            resp.__enter__.return_value = resp
+            resp.__exit__.return_value = False
+            return resp
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            # Tavily 429 -> Bing CN CAPTCHA -> 360 命中
+            h1 = sp.search("AstrBot 文档")
+            self.assertEqual(h1[0].title, "AstrBot 文档")
+            self.assertEqual(h1[0].url, "https://docs.astrbot.app")
+            self.assertTrue(sp.in_primary_cooldown())
+            self.assertTrue(sp.in_cooldown("bing_cn"))
+
+            # 第二次搜索跳过冷却中的 Tavily 与 Bing CN，直接走 360
+            h2 = sp.search("AstrBot 第二次")
+            self.assertEqual(len(h2), 1)
+            self.assertEqual(sum("tavily" in u for u in called), 1)
+            self.assertEqual(sum("cn.bing.com" in u for u in called), 1)
+            self.assertEqual(sum("so.com" in u for u in called), 2)
+
+            # 360 也遇验证码时自动切到 Bing 国际
+            called_g = []
+
+            def fake_global(req, timeout=12):
+                called_g.append(req.full_url)
+                resp = MagicMock()
+                if "www.bing.com" in req.full_url:
+                    resp.read.return_value = bing_global_html.encode("utf-8")
+                else:
+                    resp.read.return_value = captcha_html.encode("utf-8")
+                resp.__enter__.return_value = resp
+                resp.__exit__.return_value = False
+                return resp
+
+            with patch("urllib.request.urlopen", side_effect=fake_global):
+                sp_free = HttpSearchProvider(provider="free")
+                h3 = sp_free.search("global test")
+            self.assertEqual(h3[0].title, "Global Hit")
+            self.assertTrue(sp_free.in_cooldown("bing_cn"))
+            self.assertTrue(sp_free.in_cooldown("so360"))
+            self.assertEqual(sum("www.bing.com" in u for u in called_g), 1)
+
+        # 独立单文件导入 adapters/search.py（模拟沙箱子进程 import echo_search）
+        search_file = PLUGIN_ROOT / "astrbot_plugin_echo" / "adapters" / "search.py"
+        spec = importlib.util.spec_from_file_location("echo_search", search_file)
+        standalone = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(standalone)
+        self.assertTrue(standalone.HttpSearchProvider(provider="free").available())
 
 
 class InboundAndSenderTests(unittest.TestCase):

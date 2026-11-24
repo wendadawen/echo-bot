@@ -426,6 +426,20 @@ class ChatAgentBackendAndRoutingTests(unittest.TestCase):
                 ChatAgentBackend,
             )
 
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / ".chat_agent"
+            backend = ChatAgentBackend(api_base="http://127.0.0.1:8787/v1", api_key="k", model="claude-haiku-5-5")
+            backend.prepare_home(home)
+            self.assertTrue((home / "agent_loop.py").is_file())
+            self.assertTrue((home / "echo_search.py").is_file())
+            self.assertEqual(
+                (home / "echo_search.py").read_text(encoding="utf-8"),
+                (PLUGIN_ROOT / "astrbot_plugin_echo" / "adapters" / "search.py").read_text(encoding="utf-8"),
+            )
+            loop_src = (home / "agent_loop.py").read_text(encoding="utf-8")
+            self.assertNotIn("class SearchRunner", loop_src)
+            self.assertNotIn("def bing_search_cn", loop_src)
+
     def test_chat_agent_backend_runs_in_sandbox_strips_secrets_and_exports_outbox(self):
         from http.server import BaseHTTPRequestHandler, HTTPServer
 

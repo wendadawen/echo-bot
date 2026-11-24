@@ -33,7 +33,7 @@
     "description": "轻量联网搜索服务（可选）",
     "type": "string",
     "default": "",
-    "hint": "可选 tavily / exa / bing / generic；主接口额度耗尽或限流时自动切 Bing CN 免费兜底，全部留空时隐藏直搜工具。"
+    "hint": "可选 tavily / exa / free / bing / so360 / generic；主接口额度耗尽会自动按 Bing CN -> 360 -> Bing 国际接力兜底，全部留空时隐藏直搜工具。"
   },
   "search_api_base": {
     "description": "搜索接口地址（可选）",

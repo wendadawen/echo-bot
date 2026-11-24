@@ -15,13 +15,15 @@ from typing import Optional, Sequence
 
 from ..sandbox import MAX_OUTPUT, atomic_write_text_no_follow
 
+_SEARCH_MODULE_PATH = Path(__file__).resolve().parents[2] / "adapters" / "search.py"
+
 _TASK_SYSTEM_PROMPT = (
     "你是运行在隔离工作区中的后台执行助手，负责查证资料、执行计算/代码、分析 `./inbox/` 中的图片或生成文件并写进 `./outbox/`。\n"
     "安全铁律：\n"
     "1. 只能访问和修改当前工作目录（及 `./inbox/` 只读输入、`./outbox/` 导出目录）；严禁探测、列出、读取或写入容器系统路径（`/`, `/etc`, `/proc`, `/var`, `/home`, `/AstrBot`, `/tmp` 等）、`mount` 挂载点、进程列表或环境变量。\n"
     "2. 禁止启动常驻服务、监听端口、后台守护进程或死循环；遇到越界要求直接拒绝。\n"
     "3. 需要交付 HTML / Markdown / CSV / 代码 / 图表等文件时，写入 `./outbox/文件名`（不要建子目录，最多 3 个文件，严禁放配置/密钥/数据库）。\n"
-    "4. 查实时事实优先调 `web_search`（Tavily 额度不足会自动切换国内 Bing CN 免费兜底）；普通简单查询没查到有效信息时不要生成无意义的说明文件。\n"
+    "4. 查实时事实优先调 `web_search`（主引擎限流或无额度会自动按 Bing CN → 360 → Bing 国际接力兜底）；普通简单查询没查到有效信息时不要生成无意义的说明文件。\n"
     "5. 最终回复仅交出 3-5 句准确结论与生成的文件名（如有），不要输出容器本地路径，不要编造未核实的数据。"
 )
 
@@ -31,7 +33,6 @@ _AGENT_LOOP_SCRIPT = r'''#!/usr/bin/env python3
 
 import argparse
 import base64
-import html
 import json
 import os
 import re
@@ -41,20 +42,14 @@ import subprocess
 import sys
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 from pathlib import Path
+
+import echo_search
 
 SYSTEM_PROMPT = __SYSTEM_PROMPT_JSON__
 MAX_STEPS = 12
 MAX_RESP_BYTES = 2 * 1024 * 1024
-QUOTA_HTTP_CODES = (402, 429, 432)
-QUOTA_WORDS = ("quota", "limit", "credit", "usage", "rate", "exceeded", "insufficient")
-CAPTCHA_MARKERS = ("captcha", "verify you are human", "cf-challenge")
-BING_UA = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-)
 FORBIDDEN_CMD_RE = re.compile(
     r"(?:/etc/passwd|/etc/shadow|/(?:AstrBot|proc|sys|root)(?:/|\b)|\b(?:mount|findmnt|lsblk|printenv)\b|rm\s+-[a-z]*rf\s+/)",
     re.I,
@@ -112,7 +107,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "web_search",
-            "description": "联网搜索实时新闻、资料或官方文档（自动在主搜索引擎不可用时切换 Bing CN 兜底）。",
+            "description": "联网搜索实时新闻、资料或官方文档（自动在主引擎不可用时按 Bing CN / 360 / Bing 国际接力兜底）。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -223,110 +218,6 @@ def run_shell_tool(root, command, timeout_sec, deadline):
     return "exit={}\n{}".format(rc, body) if body else "exit={}".format(rc)
 
 
-def _strip_html(raw):
-    return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", str(raw or "")))).strip()
-
-
-def bing_search_cn(query, top_n):
-    url = "https://cn.bing.com/search?q={}&setlang=zh-CN".format(urllib.parse.quote(query))
-    req = urllib.request.Request(url, headers={"User-Agent": BING_UA, "Accept-Language": "zh-CN,zh;q=0.9"})
-    try:
-        with urllib.request.urlopen(req, timeout=10) as r:
-            page = r.read(300_000).decode("utf-8", errors="ignore")
-    except Exception as exc:
-        return [], str(exc)
-    if any(m in page.lower() for m in CAPTCHA_MARKERS):
-        return [], "captcha"
-    hits = []
-    for block in re.findall(r'<li[^>]+class="[^"]*\bb_algo\b[^"]*"[^>]*>(.*?)</li>', page, re.S):
-        m = re.search(r"<h2[^>]*>.*?<a[^>]+href=\"([^\"]+)\"[^>]*>(.*?)</a>", block, re.S)
-        if not m:
-            continue
-        href = html.unescape(m.group(1)).strip()
-        title = _strip_html(m.group(2))[:100]
-        p = re.search(r"<p[^>]*>(.*?)</p>", block, re.S)
-        snip = _strip_html(p.group(1))[:280] if p else ""
-        if title or snip:
-            hits.append((title or href, snip, href))
-            if len(hits) >= top_n:
-                break
-    return hits, ""
-
-
-class SearchRunner:
-    def __init__(self, provider, base, key):
-        self.provider = provider
-        self.base = base
-        self.key = key
-        self.cooldown_until = 0.0
-
-    def has_primary(self):
-        if self.provider == "bing":
-            return False
-        if self.base.startswith(("http://", "https://")):
-            return True
-        return bool(self.key and self.provider in ("tavily", "exa"))
-
-    def search(self, query, limit=5):
-        q = str(query or "").strip()
-        if not q:
-            return "空搜索词"
-        top_n = max(1, min(8, int(limit or 5)))
-        hits = []
-        if self.has_primary() and time.monotonic() >= self.cooldown_until:
-            try:
-                hits = self._search_primary(q, top_n)
-            except urllib.error.HTTPError as exc:
-                body = ""
-                try:
-                    body = exc.read(1024).decode("utf-8", errors="ignore").lower()
-                except Exception:
-                    pass
-                if exc.code in QUOTA_HTTP_CODES or (exc.code == 403 and any(w in body for w in QUOTA_WORDS)):
-                    self.cooldown_until = time.monotonic() + 1800.0
-            except Exception:
-                pass
-        if not hits:
-            hits, _ = bing_search_cn(q, top_n)
-        if not hits:
-            return "未检索到可用结果"
-        return "\n".join("- {}：{} ({})".format(t, s, u) for t, s, u in hits)
-
-    def _search_primary(self, q, top_n):
-        headers = {"Content-Type": "application/json"}
-        if self.provider == "exa" or ("exa" in self.base):
-            url = self.base or "https://api.exa.ai/search"
-            if not url.endswith("/search"):
-                url += "/search"
-            if self.key:
-                headers["x-api-key"] = self.key
-            payload = {"query": q, "numResults": top_n, "contents": {"text": {"maxCharacters": 300}}}
-        elif self.provider == "tavily" or ("tavily" in self.base) or (self.key and not self.base):
-            url = self.base or "https://api.tavily.com/search"
-            if not url.endswith("/search"):
-                url += "/search"
-            payload = {"query": q, "max_results": top_n, "search_depth": "basic"}
-            if self.key:
-                payload["api_key"] = self.key
-        else:
-            url = self.base
-            if self.key:
-                headers["Authorization"] = "Bearer " + self.key
-            payload = {"query": q, "limit": top_n}
-        req = urllib.request.Request(url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"), headers=headers, method="POST")
-        with urllib.request.urlopen(req, timeout=12) as resp:
-            data = json.loads(resp.read(1024 * 1024).decode("utf-8"))
-        out = []
-        for r in (data.get("results") or data.get("items") or [])[:top_n]:
-            if isinstance(r, dict):
-                t = str(r.get("title") or "").strip()[:100]
-                s = str(r.get("content") or r.get("snippet") or r.get("text") or "").strip()[:280]
-                u = str(r.get("url") or r.get("link") or "").strip()
-                if t or s:
-                    out.append((t or u, s, u))
-        return out
-
-
 def call_llm(url, api_key, model, messages, use_tools=True, timeout_sec=60):
     headers = {"Content-Type": "application/json"}
     if api_key:
@@ -366,7 +257,16 @@ def main():
     clean_base = api_base.rstrip("/")
     chat_url = clean_base if clean_base.endswith("/chat/completions") else clean_base + "/chat/completions"
     root = Path.cwd().resolve()
-    searcher = SearchRunner(search_provider, search_base, search_key)
+    eff_provider = (
+        search_provider
+        if ((search_provider and search_provider != "auto") or search_base or search_key)
+        else "free"
+    )
+    searcher = echo_search.HttpSearchProvider(
+        provider=eff_provider,
+        api_base=search_base,
+        api_key=search_key,
+    )
 
     started = time.monotonic()
     deadline = started + max(30, int(args.timeout or 300))
@@ -467,7 +367,10 @@ def main():
                     result = "写入失败：{}".format(exc)
             elif tname == "web_search":
                 emit_progress("正在联网搜索资料…")
-                result = searcher.search(targs.get("query", ""), targs.get("limit", 5))
+                hits = searcher.search(targs.get("query", ""), targs.get("limit", 5))
+                result = "\n".join(
+                    "- {}：{} ({})".format(h.title, h.snippet, h.url) for h in hits
+                ) or "未检索到可用结果"
             else:
                 result = "未知工具：{}".format(tname)
 
@@ -526,6 +429,10 @@ class ChatAgentBackend:
         if home_dir.is_symlink():
             return
         home_dir.mkdir(parents=True, exist_ok=True)
+        search_dst = home_dir / "echo_search.py"
+        if search_dst.is_symlink():
+            search_dst.unlink(missing_ok=True)
+        atomic_write_text_no_follow(search_dst, _SEARCH_MODULE_PATH.read_text(encoding="utf-8"), mode=0o644)
         script_path = home_dir / "agent_loop.py"
         if script_path.is_symlink():
             script_path.unlink(missing_ok=True)
