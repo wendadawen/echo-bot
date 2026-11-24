@@ -336,8 +336,6 @@ class OpenAICompatClient:
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": encoded_msgs,
-            "temperature": 0.8,
-            "max_tokens": 1024,
         }
         if use_native_tools:
             payload["tools"] = self._encode_tools(tools)
@@ -354,11 +352,12 @@ class OpenAICompatClient:
                     return parsed
             return turn
         except urllib.error.HTTPError as exc:
-            body = ""
+            raw_body = ""
             try:
-                body = exc.read().decode("utf-8", errors="ignore").lower()
+                raw_body = exc.read().decode("utf-8", errors="ignore").strip()
             except Exception:
                 pass
+            body = raw_body.lower()
             if exc.code in (400, 422):
                 retried = False
                 if use_native_tools and any(k in body for k in ("tool", "function", "tool_choice")):
@@ -369,7 +368,7 @@ class OpenAICompatClient:
                     retried = True
                 if retried:
                     return self.chat(messages, tools=tools, timeout=timeout)
-            raise
+            raise RuntimeError("HTTP {}: {}".format(exc.code, raw_body[:240] or exc.reason)) from exc
 
     def describe_image(self, image_bytes: bytes, prompt: str, timeout: Optional[int] = None) -> str:
         if not image_bytes:
@@ -383,7 +382,6 @@ class OpenAICompatClient:
                     {"type": "image_url", "image_url": {"url": _data_uri(image_bytes)}},
                 ],
             }],
-            "max_tokens": 300,
         }
         data = self._post(payload, timeout=timeout)
         choices = data.get("choices") or []

@@ -173,9 +173,34 @@ class LLMClientTests(unittest.TestCase):
         self.assertEqual(turn.tool_calls[0].arguments, {"text": "颜色是大红"})
         self.assertEqual(turn.usage_tokens, 55)
         self.assertIn("tools", seen_payloads[0])
+        self.assertNotIn("temperature", seen_payloads[0])
+        self.assertNotIn("max_tokens", seen_payloads[0])
         user_blocks = seen_payloads[0]["messages"][1]["content"]
         self.assertEqual(user_blocks[1]["type"], "image_url")
         self.assertTrue(user_blocks[1]["image_url"]["url"].startswith("data:image/png;base64,"))
+
+        desc_payloads = []
+
+        def fake_desc_urlopen(req, timeout=90):
+            desc_payloads.append(json.loads(req.data.decode("utf-8")))
+            return _fake_urlopen_response({"choices": [{"message": {"content": "一只红猫"}}]})
+
+        with patch("urllib.request.urlopen", side_effect=fake_desc_urlopen):
+            desc = client.describe_image(TINY_PNG, "描述图")
+        self.assertEqual(desc, "一只红猫")
+        self.assertNotIn("temperature", desc_payloads[0])
+        self.assertNotIn("max_tokens", desc_payloads[0])
+
+        def fake_err_urlopen(req, timeout=90):
+            raise urllib.error.HTTPError(
+                req.full_url, 400, "Bad Request", {}, io.BytesIO(b"model overloaded upstream error")
+            )
+
+        with patch("urllib.request.urlopen", side_effect=fake_err_urlopen):
+            with self.assertRaises(RuntimeError) as ctx_err:
+                client.chat((LLMMessage(role="user", content="hi"),), tools=())
+        self.assertIn("HTTP 400", str(ctx_err.exception))
+        self.assertIn("model overloaded upstream error", str(ctx_err.exception))
 
     def test_auto_fallback_when_tools_and_vision_unsupported(self):
         client = OpenAICompatClient("sk-12345678", "https://example.com/v1", "small-model")
