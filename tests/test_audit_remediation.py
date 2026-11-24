@@ -1483,3 +1483,229 @@ class TestMemoryPersonsContextMonitorAttentionAndInfra(unittest.TestCase):
         ))
         self.assertEqual("task", priv_res["reason"])
         self.assertEqual(2, len(submitted_ok))
+
+    def test_sticker_fail_closed_raw_meta_quoted_exclusion_and_vlm_non_emoji(self):
+        import struct
+        from unittest.mock import MagicMock
+
+        stub_mods, comp, _ = _make_astrbot_stubs()
+        sys.modules.pop("astrbot_plugin_echo.main", None)
+        with patch.dict(sys.modules, stub_mods):
+            echo_main = importlib.import_module("astrbot_plugin_echo.main")
+
+        png_small = (
+            b"\x89PNG\r\n\x1a\n"
+            + struct.pack(">II", 120, 90)
+            + b"\x08\x06\x00\x00\x00"
+            + b"0" * 64
+        )
+        jpg_small = b"\xff\xd8\xff\xe0" + b"JFIF" + b"0" * 64
+        gif_small = b"GIF89a" + b"\x10\x00\x10\x00\x80\x00\x00" + b"0" * 64
+
+        class _StrippedImage(comp.Image):
+            """模拟真实 AstrBot Image：只保留 url/file/path，丢弃 sub_type/summary。"""
+
+            def __init__(self, url="", file="", path=""):
+                self.file = file
+                self.url = url
+                self.path = path
+
+        stripped = _StrippedImage(url="https://cdn.example.com/a.png")
+        # 1) _is_sticker_image 单测
+        self.assertFalse(echo_main._is_sticker_image(stripped, png_small, {"sub_type": 0}))
+        self.assertFalse(echo_main._is_sticker_image(stripped, jpg_small, {"sub_type": 0}))
+        self.assertFalse(echo_main._is_sticker_image(stripped, gif_small, {"sub_type": 0}))
+        # 无元数据：静态小 PNG / JPG 截图一律拒收，<=500KB GIF 动图放行
+        self.assertFalse(echo_main._is_sticker_image(stripped, png_small))
+        self.assertFalse(echo_main._is_sticker_image(stripped, jpg_small))
+        self.assertTrue(echo_main._is_sticker_image(stripped, gif_small))
+        # raw_meta 明确标注表情包：即使 Image 组件本身没属性也放行
+        self.assertTrue(echo_main._is_sticker_image(stripped, png_small, {"sub_type": 1, "summary": "[动画表情]"}))
+        self.assertTrue(echo_main._is_sticker_image(stripped, jpg_small, {"sub_type": "2"}))
+        self.assertFalse(echo_main._is_sticker_image(stripped, png_small, {"summary": "[图片]"}))
+
+        # 2) on_group_message 集成：stripped Image + raw_message / 引用图绝不进 emoji_bank
+        class _FakeContext:
+            async def send_message(self, umo, chain):
+                pass
+
+        class _FakeModel:
+            def reply(self, system, history, user_text):
+                return '{"action":"reply","text":"收到"}'
+
+        class _FakeEvent:
+            def __init__(self, gid, text, parts, at_or_wake=False, raw_message=None):
+                self.gid = gid
+                self.text = text
+                self.parts = list(parts)
+                self._at = at_or_wake
+                self.unified_msg_origin = f"aiocqhttp:GroupMessage:{gid}"
+                self.bot = None
+                self.message_obj = types.SimpleNamespace(
+                    raw_message=raw_message if raw_message is not None else {"post_type": "message"},
+                    message_str=text,
+                    message=self.parts,
+                )
+
+            def get_sender_id(self):
+                return "1001"
+
+            def get_sender_name(self):
+                return "阿伟"
+
+            def get_self_id(self):
+                return "999999"
+
+            def get_group_id(self):
+                return self.gid
+
+            def get_platform_name(self):
+                return "aiocqhttp"
+
+            def get_messages(self):
+                return self.parts
+
+            def get_message_str(self):
+                return self.text
+
+            def is_at_or_wake_command(self):
+                return self._at
+
+            def should_call_llm(self, flag):
+                return None
+
+            def stop_event(self):
+                return None
+
+        async def _run_integration():
+            with tempfile.TemporaryDirectory() as tmpdir:
+                with patch.dict(sys.modules, stub_mods):
+                    with patch.object(echo_main.StarTools, "get_data_dir", lambda *a, **kw: tmpdir):
+                        echo = echo_main.Echo(_FakeContext(), config={})
+                    fake_m = _FakeModel()
+                    echo.model = fake_m
+                    echo.brain.model = fake_m
+                    echo.brain.tool_loop.model = fake_m
+                    for tname in ("_reminder_task", "_chat_task"):
+                        task = getattr(echo, tname, None)
+                        if task is not None:
+                            task.cancel()
+                            setattr(echo, tname, None)
+
+                    collect_calls = []
+
+                    def _spy_collect(gid, data, model, limit=None):
+                        collect_calls.append((gid, data))
+                        return "呆萌"
+
+                    with patch.object(echo, "_download", new=MagicMock(return_value=png_small)), patch.object(
+                        echo.emoji_bank, "collect", side_effect=_spy_collect
+                    ):
+                        # 2a) 普通截图 raw_message sub_type=0 -> 挂到 rhythm，但不收进 emoji_bank
+                        ev_screen = _FakeEvent(
+                            "1093318711",
+                            "",
+                            [_StrippedImage(url="https://cdn.example.com/screen.png")],
+                            raw_message={
+                                "message": [
+                                    {
+                                        "type": "image",
+                                        "data": {
+                                            "url": "https://cdn.example.com/screen.png",
+                                            "sub_type": 0,
+                                            "summary": "",
+                                        },
+                                    }
+                                ]
+                            },
+                        )
+                        async for _ in echo.on_group_message(ev_screen):
+                            pass
+                        await asyncio.gather(*list(echo._bg_tasks), return_exceptions=True)
+                        self.assertEqual([], collect_calls)
+                        self.assertTrue(echo.rhythm._images.get("aiocqhttp:1093318711"))
+                        echo.rhythm._images.clear()
+
+                        # 2b) 群友发的真表情包 raw_message sub_type=1 -> 既挂图又收进 emoji_bank
+                        ev_sticker = _FakeEvent(
+                            "1093318711",
+                            "",
+                            [_StrippedImage(url="https://cdn.example.com/sticker.png")],
+                            raw_message={
+                                "message": [
+                                    {
+                                        "type": "image",
+                                        "data": {
+                                            "url": "https://cdn.example.com/sticker.png",
+                                            "sub_type": 1,
+                                            "summary": "[动画表情]",
+                                        },
+                                    }
+                                ]
+                            },
+                        )
+                        async for _ in echo.on_group_message(ev_sticker):
+                            pass
+                        await asyncio.gather(*list(echo._bg_tasks), return_exceptions=True)
+                        self.assertEqual(1, len(collect_calls))
+                        echo.rhythm._images.clear()
+                        collect_calls.clear()
+
+                        # 2c) 引用消息中的图片（即使带 subType=1）只供看图，绝不入表情库
+                        ev_quote = _FakeEvent(
+                            "1093318711",
+                            "看下引用的图",
+                            [
+                                comp.Reply(
+                                    sender_id="1002",
+                                    sender_nickname="神之殒",
+                                    chain=[comp.Image(url="https://cdn.example.com/q.png", subType=1)],
+                                ),
+                                comp.At("999999"),
+                                comp.Plain(" 看下引用的图"),
+                            ],
+                            at_or_wake=True,
+                        )
+                        async for _ in echo.on_group_message(ev_quote):
+                            pass
+                        await asyncio.gather(*list(echo._bg_tasks), return_exceptions=True)
+                        self.assertEqual([], collect_calls)
+                        self.assertTrue(echo.rhythm._images.get("aiocqhttp:1093318711"))
+
+        asyncio.run(_run_integration())
+
+        # 3) vision.EmojiBank：VLM 返回“非表情”拦截并缓存 ok:False；失效文件条目自动从 index.json 清理
+        self.assertFalse(vision.acceptable("非表情"))
+        self.assertFalse(vision.acceptable("非表情|普通网页截图"))
+
+        class _NonEmojiVisionModel:
+            def __init__(self, reply_text):
+                self.calls = 0
+                self.reply_text = reply_text
+
+            def vision_reply(self, prompt, image_uri):
+                self.calls += 1
+                return self.reply_text
+
+        with tempfile.TemporaryDirectory() as folder:
+            bank = vision.EmojiBank(folder)
+            m_non = _NonEmojiVisionModel("非表情")
+            self.assertEqual("", bank.collect("g1", png_small, m_non))
+            self.assertEqual("", bank.collect("g1", png_small, m_non))
+            self.assertEqual(1, m_non.calls)
+            self.assertEqual(0, bank.stats("g1").get("g1", 0))
+
+            m_non2 = _NonEmojiVisionModel("非表情|一张聊天截图")
+            self.assertEqual("", bank.collect("g1", jpg_small, m_non2))
+            self.assertEqual(1, m_non2.calls)
+            self.assertEqual(0, bank.stats("g1").get("g1", 0))
+
+            # 正常表情入库后，若磁盘文件被删，重载时自动清掉失效索引
+            m_ok = _NonEmojiVisionModel("无语|猫翻白眼")
+            self.assertEqual("无语", bank.collect("g1", gif_small, m_ok))
+            self.assertEqual(1, bank.stats("g1").get("g1", 0))
+            saved_path = Path(bank._index["g1"][0]["path"])
+            saved_path.unlink()
+            reloaded = vision.EmojiBank(folder)
+            self.assertEqual(0, reloaded.stats("g1").get("g1", 0))
+            self.assertEqual([], reloaded._index.get("g1", []))

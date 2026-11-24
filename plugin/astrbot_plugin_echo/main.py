@@ -114,23 +114,59 @@ def _looks_like_image(data: bytes) -> bool:
     return False
 
 
-def _is_sticker_image(part, data: bytes) -> bool:
-    """区分表情包与普通截图/照片，避免大截图混入表情包仓库。"""
-    sub_type = getattr(part, "subType", None)
+def _raw_image_metas(raw_msg):
+    """从 OneBot/NapCat raw_message 提取 image 消息段原始元数据（保留 sub_type/summary）。"""
+    if not isinstance(raw_msg, dict) or not isinstance(raw_msg.get("message"), list):
+        return []
+    metas = []
+    for seg in raw_msg["message"]:
+        if isinstance(seg, dict) and seg.get("type") == "image" and isinstance(seg.get("data"), dict):
+            metas.append(seg["data"])
+    return metas
+
+
+def _match_raw_image_meta(part, raw_metas, index):
+    """按 url / file 精确匹配 raw_message 中的 image 元数据，匹配不到再按顺序回退。"""
+    if not raw_metas:
+        return None
+    part_url = str(getattr(part, "url", "") or "").strip()
+    part_file = str(getattr(part, "file", "") or "").strip()
+    for meta in raw_metas:
+        m_url = str(meta.get("url") or "").strip()
+        m_file = str(meta.get("file") or "").strip()
+        if (part_url and m_url and part_url == m_url) or (part_file and m_file and part_file == m_file):
+            return meta
+    if 0 <= index < len(raw_metas):
+        return raw_metas[index]
+    return None
+
+
+def _is_sticker_image(part, data: bytes, raw_meta=None) -> bool:
+    """严格区分表情包与普通截图/照片（fail-closed）：
+    AstrBot 的 Image 组件会丢弃 NapCat 的 sub_type/summary，因此优先读 raw_meta。
+    """
+    meta = raw_meta if isinstance(raw_meta, dict) else {}
+    sub_type = meta.get("sub_type")
+    if sub_type is None:
+        sub_type = meta.get("subType")
+    if sub_type is None:
+        sub_type = getattr(part, "subType", None)
     if sub_type is None:
         sub_type = getattr(part, "sub_type", None)
-    summary = str(getattr(part, "summary", "") or "")
-    if "表情" in summary or str(sub_type or "") in ("1", "2", "sticker", "emoji"):
+    summary = str(meta.get("summary") or getattr(part, "summary", "") or "").strip()
+
+    if sub_type is not None and str(sub_type).strip() == "0":
+        return False
+    if sub_type is not None and str(sub_type).strip().lower() in ("1", "2", "sticker", "emoji", "mface"):
         return True
-    if sub_type is not None and str(sub_type) == "0":
+    if "表情" in summary:
+        return True
+    if summary in ("[图片]", "图片"):
         return False
-    if len(data) > 300 * 1024:
-        return False
-    if data.startswith(b"\x89PNG\r\n\x1a\n") and len(data) >= 24:
-        w, h = struct.unpack(">II", data[16:24])
-        if max(w, h) > 800:
-            return False
-    return True
+    # 无协议元数据时默认拒绝静态图（截图/照片/图表），仅放行 <=500KB 的 GIF 动图。
+    if data.startswith((b"GIF87a", b"GIF89a")) and len(data) <= 500 * 1024:
+        return True
+    return False
 
 
 class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -382,13 +418,23 @@ class Echo(Star):
         collected_images = 0
         face_tags = []
         mface_tags = []
+        raw_img_metas = _raw_image_metas(raw_msg)
+        img_idx = 0
 
-        def _track_image(part_obj, attach_flag):
+        def _track_image(part_obj, attach_flag, raw_meta=None, allow_emoji=True):
             nonlocal collected_images
             if collected_images >= 2:
                 return
             collected_images += 1
-            bg = self._spawn_bg(self._collect_image(group_id, part_obj, attach=attach_flag))
+            bg = self._spawn_bg(
+                self._collect_image(
+                    group_id,
+                    part_obj,
+                    attach=attach_flag,
+                    raw_meta=raw_meta,
+                    allow_emoji=allow_emoji,
+                )
+            )
             self._pending_images[group_id].append(bg)
             bg.add_done_callback(
                 lambda t, g=group_id: self._pending_images[g].remove(t)
@@ -408,12 +454,14 @@ class Echo(Star):
                     face_tags.append("[QQ表情:{}]".format(tag_label))
             elif isinstance(part, Image):
                 has_image = True
-                _track_image(part, True)
+                meta = _match_raw_image_meta(part, raw_img_metas, img_idx)
+                img_idx += 1
+                _track_image(part, True, raw_meta=meta, allow_emoji=True)
             elif isinstance(part, Reply) and mentioned:
                 for qseg in getattr(part, "chain", None) or []:
                     if isinstance(qseg, Image):
                         has_image = True
-                        _track_image(qseg, True)
+                        _track_image(qseg, True, allow_emoji=False)
 
         # AstrBot aiocqhttp 适配器会跳过 QQ 商城表情 (mface)，这里从 raw_message 补回文案与图片 URL。
         if isinstance(raw_msg, dict) and isinstance(raw_msg.get("message"), list):
@@ -432,6 +480,8 @@ class Echo(Star):
                                 subType="1", summary=msum,
                             ),
                             True,
+                            raw_meta={"sub_type": "1", "summary": msum or "表情"},
+                            allow_emoji=True,
                         )
 
         media_prefix = " ".join(face_tags + mface_tags).strip()
@@ -499,7 +549,7 @@ class Echo(Star):
         except Exception as exc:
             logger.info("表情收集失败：%s", exc)
 
-    async def _collect_image(self, group_id, part, attach=True):
+    async def _collect_image(self, group_id, part, attach=True, raw_meta=None, allow_emoji=True):
         if not self.emoji_bank and not attach:
             return
         url = str(getattr(part, "url", "") or "").strip()
@@ -545,7 +595,7 @@ class Echo(Star):
             return
         if attach:
             self.rhythm.attach_image(group_id, data)
-        if self.emoji_bank and _is_sticker_image(part, data):
+        if allow_emoji and self.emoji_bank and _is_sticker_image(part, data, raw_meta=raw_meta):
             # VLM 入库标注放到独立后台任务，绝不阻塞 _pending_images 的看图放行。
             self._spawn_bg(self._save_emoji(group_id, data))
 

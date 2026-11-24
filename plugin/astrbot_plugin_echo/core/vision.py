@@ -20,7 +20,8 @@ from pathlib import Path
 DESCRIBE_PROMPT = "用一两句话客观说清这张图/表情的主体、画面细节和可见文字，不要解释、不要标点堆砌。"
 TAG_PROMPT = "给这个表情一个两到四字的情绪标签，只输出标签。"
 ANALYZE_PROMPT = (
-    "先给出2到4字的情绪标签，再用竖线|隔开一句话描述这张图/表情在表达什么，"
+    "先判断这是不是聊天表情包/梗图/动图；如果是普通截图、聊天记录、网页、图表、表格、代码、文档、证件或普通生活实拍照片，"
+    "只输出：非表情。如果是表情包，再给出2到4字的情绪标签，用竖线|隔开一句话描述它在表达什么，"
     "不要解释、不要多余标点。例：无语|一只猫翻白眼"
 )
 GRID_PROMPT = (
@@ -28,6 +29,7 @@ GRID_PROMPT = (
     "不要解释。要表达的情绪是：{}"
 )
 FILTER_WORDS = ("二维码", "付款码", "身份证", "验证码", "密码", "银行卡号")
+NON_EMOJI_WORDS = ("非表情", "不是表情")
 FACE_LABELS = {
     "0": "惊讶", "1": "撇嘴", "2": "色", "3": "发呆", "4": "得意", "5": "流泪",
     "6": "害羞", "7": "闭嘴", "8": "睡", "9": "大哭", "10": "尴尬", "11": "发怒",
@@ -113,18 +115,24 @@ def analyze(model, image_bytes):
         return "", "随手"
     if not raw:
         return "", "随手"
+    if raw.startswith(NON_EMOJI_WORDS):
+        return "非表情", "非表情"
     if "|" in raw or "｜" in raw:
         parts = re.split(r"[|｜]", raw, maxsplit=1)
         label = (parts[0] or "").strip()[:8] or "随手"
         desc = (parts[1] or "").strip() or label
+        if label in NON_EMOJI_WORDS or desc.startswith(NON_EMOJI_WORDS):
+            return "非表情", "非表情"
         return desc, label
     return raw, raw[:8] or "随手"
 
 
 def acceptable(description, image_bytes=None):
-    """内容过滤（fail-closed）：空描述或命中敏感词/超限一律拦下。"""
+    """内容过滤（fail-closed）：空描述、非表情或命中敏感词/超限一律拦下。"""
     text = str(description or "").strip()
     if not text:
+        return False
+    if any(word in text for word in NON_EMOJI_WORDS):
         return False
     if any(word in text for word in FILTER_WORDS):
         return False
@@ -238,7 +246,7 @@ class EmojiBank:
                     if item.get("face_id") and not item.get("path"):
                         continue
                     path_str = str(item.get("path") or "")
-                    if not path_str:
+                    if not path_str or self._safe_path(path_str) is None:
                         drop_indices.add(idx)
                         changed_index = True
                         continue
