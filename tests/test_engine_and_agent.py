@@ -30,6 +30,7 @@ from astrbot_plugin_echo.engine.context import (  # noqa: E402
     ContextAssembler,
     build_msg_alias_map,
     compact_history,
+    format_provenance_note,
     should_quote_reply,
 )
 from astrbot_plugin_echo.engine.safety import (  # noqa: E402
@@ -49,11 +50,15 @@ TINY_PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
 
 
 class _SeqLLM:
-    def __init__(self, turns):
+    def __init__(self, turns, *, ignore_summary: bool = False):
         self.turns = list(turns)
+        self.ignore_summary = ignore_summary
         self.recorded_calls = []
 
     def chat(self, messages, tools=(), timeout=None):
+        sys_msg = str(messages[0].content or "") if messages else ""
+        if self.ignore_summary and "记忆整理员" in sys_msg:
+            return ModelTurn(text='{"episode":"","points":[],"persons":[],"state":{"topics":[],"progress":[],"pending":[]}}')
         self.recorded_calls.append({"messages": list(messages), "tool_names": [t.name for t in tools]})
         if self.turns:
             return self.turns.pop(0)
@@ -135,6 +140,20 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(len(followup.images), 1)
         self.assertEqual(followup.images[0].sha256, "hash1")
 
+        # 60 秒内提到“人物/截图”的追问会复用上一轮看过的图；无关闲聊或超过 60 秒不会复用
+        ref_follow = Batch("g1", [ChatEvent("g1", "u2", "乙", "夸夸这个人物", ts=530.0, mentioned=True)])
+        sch.merge_recent_images(ref_follow, now=535.0)
+        self.assertEqual(len(ref_follow.images), 1)
+        self.assertEqual(ref_follow.images[0].sha256, "hash1")
+
+        unrelated = Batch("g1", [ChatEvent("g1", "u2", "乙", "晚饭吃啥", ts=540.0, mentioned=True)])
+        sch.merge_recent_images(unrelated, now=540.0)
+        self.assertEqual(unrelated.images, [])
+
+        expired = Batch("g1", [ChatEvent("g1", "u2", "乙", "夸夸这个人物", ts=600.0, mentioned=True)])
+        sch.merge_recent_images(expired, now=600.0)
+        self.assertEqual(expired.images, [])
+
 
 class ContextTests(unittest.TestCase):
     def test_context_isolation_aliases_quote_and_compaction(self):
@@ -192,6 +211,26 @@ class ContextTests(unittest.TestCase):
             {"msg_id": "m_b", "user_id": "102", "role": "user"},
         ]
         self.assertEqual(should_quote_reply("m_a", "101", intervened), "m_a")
+
+        # format_provenance_note 与历史溯源标注只附在 bot 轮次上
+        self.assertEqual(format_provenance_note("seen_image"), "[系统注：本条回复时你已实际查看当轮原图]")
+        self.assertEqual(format_provenance_note("tools=web_search"), "[系统注：本条回复基于当时 web_search 实查结果]")
+        self.assertIn(
+            "实际查看当轮原图并调用过 web_search 实查",
+            format_provenance_note("seen_image;tools=web_search"),
+        )
+        _, bot_line = ContextAssembler.format_history_row(
+            {"role": "bot", "text": "截图里是娄文启", "meta": "seen_image", "ts": 190.0},
+            {},
+            200.0,
+        )
+        self.assertIn("[系统注：本条回复时你已实际查看当轮原图]", bot_line)
+        _, user_line = ContextAssembler.format_history_row(
+            {"role": "user", "user_name": "小明", "text": "真的吗", "meta": "seen_image", "ts": 195.0},
+            {},
+            200.0,
+        )
+        self.assertNotIn("[系统注：", user_line)
         repo.close()
 
 
@@ -331,6 +370,56 @@ class EchoAgentTests(unittest.TestCase):
             # 噪音未进记忆
             self.assertEqual(repo.recall_memories("g1", "无法联网"), [])
             repo.close()
+
+    def test_provenance_persisted_across_turns_prevents_self_retraction(self):
+        repo = Repository(":memory:")
+        sch = Scheduler()
+        search = MagicMock()
+        search.available.return_value = True
+        search.search.return_value = [SearchHit("中国科大娄文启", "软件学院相关信息", "https://example.edu.cn")]
+
+        llm = _SeqLLM(
+            [
+                ModelTurn(text="截图写的是娄文启，中国科大软件学院相关负责人。"),
+                ModelTurn(tool_calls=(ToolCall("w1", "web_search", {"query": "娄文启"}),)),
+                ModelTurn(text="已帮你夸完啦！"),
+            ],
+            ignore_summary=True,
+        )
+        agent = EchoAgent(repo, llm, sch, search_provider=search)
+
+        # Turn 1: 带原图回答
+        img = MediaRef(data=TINY_PNG, sha256="lou_shot")
+        b1 = Batch(
+            "g1",
+            [ChatEvent("g1", "u1", "神之殒", "@大肥鱼 这是谁", msg_id="m_img1", ts=100.0, mentioned=True, images=(img,))],
+            images=[img],
+        )
+        r1 = agent.handle_batch(b1)
+        self.assertEqual(r1["reason"], "reply")
+        recent_after_1 = repo.recent_messages("g1", limit=5)
+        self.assertEqual(recent_after_1[-1]["meta"], "seen_image")
+        stats_row = repo._db.execute("SELECT detail FROM monitor_events WHERE kind='reply' ORDER BY id DESC LIMIT 1").fetchone()
+        self.assertEqual(stats_row["detail"], "seen_image")
+
+        # Turn 2: 无图追问并触发 web_search -> 历史里带入系统溯源注记，且二次持久化带 tools=web_search
+        b2 = Batch(
+            "g1",
+            [ChatEvent("g1", "u1", "神之殒", "@大肥鱼 查查娄文启并夸他", msg_id="m_q2", ts=110.0, mentioned=True)],
+        )
+        r2 = agent.handle_batch(b2)
+        self.assertEqual(r2["reason"], "reply")
+        turn2_history_texts = [str(m.content) for m in llm.recorded_calls[1]["messages"]]
+        self.assertTrue(
+            any("[系统注：本条回复时你已实际查看当轮原图]" in txt for txt in turn2_history_texts),
+            turn2_history_texts,
+        )
+        recent_after_2 = repo.recent_messages("g1", limit=5)
+        self.assertEqual(recent_after_2[-1]["meta"], "tools=web_search")
+        stats_row2 = repo._db.execute("SELECT detail FROM monitor_events WHERE kind='reply' ORDER BY id DESC LIMIT 1").fetchone()
+        self.assertEqual(stats_row2["detail"], "tools=web_search")
+        agent.wait_background(2.0)
+        repo.close()
 
 
 if __name__ == "__main__":

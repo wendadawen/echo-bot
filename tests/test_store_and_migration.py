@@ -49,6 +49,10 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual(deleted, 15)
         self.assertEqual(self.repo.stats("g1")["messages"], 50)
 
+        self.repo.add_message("g1", "bot", "大肥鱼", "bot", "看到娄文启了", ts=1100.0, meta="seen_image;tools=web_search")
+        latest = self.repo.recent_messages("g1", limit=1)[-1]
+        self.assertEqual(latest["meta"], "seen_image;tools=web_search")
+
     def test_episodes_and_fts_chinese_bigram_recall(self):
         self.repo.add_episode("g1", "小和提到周末要在苏州实验室做实验", now=1000.0, source="chat", external_id="ep1")
         self.repo.add_episode("g1", "重复ID不该插入", now=1001.0, source="chat", external_id="ep1")
@@ -355,6 +359,7 @@ class LegacyMigrationTests(unittest.TestCase):
                 self.assertEqual(repo.group_jargon("g1"), {"yyds": "永远的神"})
                 self.assertEqual(repo.monitor_stats("g1", hours=24)["total"], 1)
                 self.assertEqual(repo.recent_messages("g1")[0]["msg_id"], "")
+                self.assertEqual(repo.recent_messages("g1")[0]["meta"], "")
             finally:
                 repo.close()
 

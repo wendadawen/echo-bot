@@ -392,10 +392,16 @@ class EchoAgent:
 
         started = time.monotonic()
         total_tokens = 0
+        tools_used: list[str] = []
+        saw_images = bool(inline_imgs)
         reply_text = ""
         attach_mood = ""
         terminal_actions: Optional[list[OutboundAction]] = None
         terminal_reason = "reply"
+
+        def _record_tool(tool_name: str) -> None:
+            if tool_name and tool_name not in tools_used:
+                tools_used.append(tool_name)
 
         for _ in range(MAX_TOOL_ROUNDS):
             try:
@@ -492,6 +498,7 @@ class EchoAgent:
 
                 if name == "task_status":
                     info = self._tasks.status(gid) if self._tasks else None
+                    _record_tool(name)
                     msg = (
                         "任务「{}」已运行 {:.0f} 秒，最新进展：{}".format(info.prompt, info.elapsed, info.progress)
                         if info else "当前本群没有正在运行的后台任务。"
@@ -504,6 +511,7 @@ class EchoAgent:
                         llm_messages.append(LLMMessage(role="tool", tool_call_id=tc.id, name=name, content="未点名不可停止后台任务。"))
                         continue
                     stopped = self._tasks.stop(gid) if self._tasks else False
+                    _record_tool(name)
                     msg = "已立即停止当前后台任务。" if stopped else "当前没有正在运行的后台任务。"
                     llm_messages.append(LLMMessage(role="tool", tool_call_id=tc.id, name=name, content=msg))
                     continue
@@ -511,6 +519,7 @@ class EchoAgent:
                 if name == "recall_memory":
                     q = str(args.get("query") or "").strip()
                     rows = self._repo.recall_memories(gid, q, limit=6)
+                    _record_tool(name)
                     llm_messages.append(LLMMessage(
                         role="tool", tool_call_id=tc.id, name=name,
                         content="；".join(rows) if rows else "没查到相关长期记忆",
@@ -521,6 +530,7 @@ class EchoAgent:
                     target_name = str(args.get("name") or "").strip()
                     uid = self._repo.resolve_person(gid, target_name)
                     summary = self._repo.person_summary(gid, uid) if uid else ""
+                    _record_tool(name)
                     llm_messages.append(LLMMessage(
                         role="tool", tool_call_id=tc.id, name=name,
                         content=summary or "没记着这人的特别档案",
@@ -532,6 +542,7 @@ class EchoAgent:
                     cat = str(args.get("category") or "event").strip()
                     if content and not is_transient_memory_noise(content) and not is_unsafe(content):
                         self._repo.add_memory(gid, cat, content)
+                        _record_tool(name)
                         msg = "记下了：" + content
                     else:
                         msg = "这条临时或敏感内容不用记。"
@@ -543,6 +554,7 @@ class EchoAgent:
                     if self._search and self._search.available() and q:
                         try:
                             hits = self._search.search(q, limit=4)
+                            _record_tool(name)
                             txt = "\n".join(
                                 "- {}：{} ({})".format(h.title, h.snippet, h.url) for h in hits
                             ) or "未搜索到相关结果"
@@ -602,7 +614,14 @@ class EchoAgent:
             latest = self._repo.recent_messages(gid, limit=12)
             quote_mid = should_quote_reply(anchor.msg_id, anchor.user_id, latest)
 
-        self._repo.add_message(gid, "bot", "大肥鱼", "bot", cleaned)
+        prov: list[str] = []
+        if saw_images:
+            prov.append("seen_image")
+        if tools_used:
+            prov.append("tools=" + ",".join(tools_used))
+        meta_str = ";".join(prov)
+
+        self._repo.add_message(gid, "bot", "大肥鱼", "bot", cleaned, meta=meta_str)
         now_done = time.time()
         self._scheduler.record_bot_reply(
             gid,
@@ -613,7 +632,7 @@ class EchoAgent:
         self._maybe_summarize(gid)
 
         tokens = total_tokens or (estimate_tokens(system) + estimate_tokens(batch_prompt) + estimate_tokens(cleaned))
-        self._repo.record_event(gid, "reply", ok=True, latency=elapsed, tokens=tokens)
+        self._repo.record_event(gid, "reply", ok=True, latency=elapsed, tokens=tokens, detail=meta_str)
 
         actions: list[OutboundAction] = [SendText(gid, umo, cleaned, reply_to_msg_id=quote_mid)]
         if attach_mood and has_emoji and self._emoji is not None:

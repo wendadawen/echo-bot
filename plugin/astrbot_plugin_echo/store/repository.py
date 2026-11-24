@@ -176,7 +176,8 @@ class Repository:
                     role TEXT NOT NULL,
                     text TEXT NOT NULL,
                     ts REAL NOT NULL,
-                    msg_id TEXT NOT NULL DEFAULT ''
+                    msg_id TEXT NOT NULL DEFAULT '',
+                    meta TEXT NOT NULL DEFAULT ''
                 );
                 CREATE INDEX IF NOT EXISTS idx_messages_group_seq
                     ON messages(group_id, seq);
@@ -269,6 +270,8 @@ class Repository:
             msg_cols = {r["name"] for r in self._db.execute("PRAGMA table_info(messages)")}
             if "msg_id" not in msg_cols:
                 self._db.execute("ALTER TABLE messages ADD COLUMN msg_id TEXT NOT NULL DEFAULT ''")
+            if "meta" not in msg_cols:
+                self._db.execute("ALTER TABLE messages ADD COLUMN meta TEXT NOT NULL DEFAULT ''")
             try:
                 self._db.execute(
                     "CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts "
@@ -569,6 +572,7 @@ class Repository:
         text: str,
         ts: Optional[float] = None,
         msg_id: str = "",
+        meta: str = "",
     ) -> int:
         stamp = time.time() if ts is None else float(ts)
         with self._lock:
@@ -576,8 +580,8 @@ class Repository:
                 return 0
             with self._db:
                 cur = self._db.execute(
-                    "INSERT INTO messages(group_id, user_id, user_name, role, text, ts, msg_id) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO messages(group_id, user_id, user_name, role, text, ts, msg_id, meta) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         str(group_id),
                         str(user_id or "unknown"),
@@ -586,6 +590,7 @@ class Repository:
                         str(text),
                         stamp,
                         str(msg_id or ""),
+                        str(meta or "")[:120],
                     ),
                 )
                 return int(cur.lastrowid or 0)

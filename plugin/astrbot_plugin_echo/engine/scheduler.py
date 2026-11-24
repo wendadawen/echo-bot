@@ -10,9 +10,12 @@ from typing import Optional
 from ..domain import Batch, ChatEvent, MediaRef
 
 IMAGE_TTL = 120.0
+VIEWED_IMAGE_TTL = 60.0
 ACTIVE_WINDOW = 120.0
 WINDOW_COOLDOWN = 3.0
 IDLE_COOLDOWN = 20.0
+
+_IMAGE_REF_HINTS = ("图", "截图", "照片", "画面", "上图", "这张", "那张", "人物")
 
 _FOLLOWUP_CONFIRMS = frozenset({
     "查找吧", "查吧", "来吧", "好呀", "好啊", "行吧", "继续", "快查",
@@ -40,6 +43,7 @@ class Scheduler:
         self.image_wait = float(image_wait)
         self._pending: dict[str, Batch] = {}
         self._recent_images: dict[str, list[tuple[float, MediaRef]]] = {}
+        self._last_viewed_images: dict[str, tuple[float, list[MediaRef]]] = {}
         self._last_input: dict[str, float] = {}
         self._last_reply_at: dict[str, float] = {}
         self._last_reply_user: dict[str, str] = {}
@@ -134,17 +138,33 @@ class Scheduler:
         return ready
 
     def merge_recent_images(self, batch: Batch, now: Optional[float] = None) -> None:
-        fresh = self.pop_recent_images(batch.group_id, now=now)
-        if not fresh:
+        cur = time.time() if now is None else float(now)
+        gid = str(batch.group_id)
+        fresh = self.pop_recent_images(gid, now=cur)
+        if fresh:
+            seen = {m.sha256 for m in batch.images if m.sha256}
+            for m in fresh:
+                if m.sha256 and m.sha256 in seen:
+                    continue
+                batch.images.append(m)
+                if m.sha256:
+                    seen.add(m.sha256)
+            batch.images = batch.images[-4:]
+
+        if batch.images:
+            self._last_viewed_images[gid] = (cur, list(batch.images[-2:]))
             return
-        seen = {m.sha256 for m in batch.images if m.sha256}
-        for m in fresh:
-            if m.sha256 and m.sha256 in seen:
-                continue
-            batch.images.append(m)
-            if m.sha256:
-                seen.add(m.sha256)
-        batch.images = batch.images[-4:]
+
+        prev = self._last_viewed_images.get(gid)
+        if not prev:
+            return
+        viewed_at, viewed_imgs = prev
+        if cur - viewed_at > VIEWED_IMAGE_TTL:
+            self._last_viewed_images.pop(gid, None)
+            return
+        body = (batch.body_text or "").strip()
+        if body and any(h in body for h in _IMAGE_REF_HINTS):
+            batch.images = list(viewed_imgs)
 
     def chime_probability(self, batch: Batch, now: Optional[float] = None) -> float:
         """计算未 @ 群聊的主动接茬概率：政策 3A「极克制地偶尔接茬」。"""

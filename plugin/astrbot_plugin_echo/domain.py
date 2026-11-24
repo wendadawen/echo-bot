@@ -475,6 +475,7 @@ class MemoryRepository(Protocol):
         text: str,
         ts: Optional[float] = None,
         msg_id: str = "",
+        meta: str = "",
     ) -> int: ...
 
     def recent_messages(self, group_id: str, limit: int = 30) -> list[dict[str, Any]]: ...
