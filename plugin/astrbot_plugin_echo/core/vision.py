@@ -176,6 +176,7 @@ class EmojiBank:
         self.max_age_days = max_age_days
         self._lock = threading.RLock()
         self._inflight = set()
+        self._last_picked = {}
         self._index = {}
         if self.index_path.exists():
             try:
@@ -464,6 +465,25 @@ class EmojiBank:
                 continue
         return out
 
+    def tags(self, group_id, limit=12):
+        """返回本群当前可用表情标签（最新优先、去重）。"""
+        with self._lock:
+            entries = list(self._index.get(group_id) or [])
+        out = []
+        seen = set()
+        for item in reversed(entries):
+            if not isinstance(item, dict):
+                continue
+            if not (item.get("face_id") or self._safe_path(item.get("path")) is not None):
+                continue
+            tag = str(item.get("tag") or "").strip()
+            if tag and tag not in seen:
+                seen.add(tag)
+                out.append(tag)
+                if len(out) >= limit:
+                    break
+        return out
+
     def pick(self, group_id, keyword="", model=None):
         """有模型时做语义网格挑选；没有图片时也可以挑 QQ 内置表情。"""
         with self._lock:
@@ -475,18 +495,32 @@ class EmojiBank:
         if not entries:
             return None
         terms = self._keyword_terms(keyword)
+        scored_matched = False
         if terms:
-            matched = [
-                item for item in entries
-                if any(
-                    word in "{} {}".format(
-                        item.get("tag", ""), item.get("description", "")
-                    ).lower()
+            scored = []
+            for item in entries:
+                hay = "{} {}".format(
+                    item.get("tag", ""), item.get("description", "")
+                ).lower()
+                score = sum(
+                    1.0 if len(word) >= 2 else 0.3
                     for word in terms
+                    if word in hay
                 )
-            ]
-            if matched:
-                entries = matched
+                if score > 0:
+                    scored.append((score, float(item.get("ts") or 0.0), item))
+            if scored:
+                scored_matched = True
+                max_score = max(row[0] for row in scored)
+                threshold = max_score * 0.6
+                entries = [
+                    row[2]
+                    for row in sorted(
+                        (r for r in scored if r[0] >= threshold),
+                        key=lambda r: (r[0], r[1]),
+                        reverse=True,
+                    )
+                ]
         images = [item for item in entries if self._safe_path(item.get("path")) is not None]
         if model is not None and len(images) > 1:
             candidates = []
@@ -501,14 +535,33 @@ class EmojiBank:
             if len(candidates) > 1:
                 index = grid_pick(model, candidates, keyword or "随手")
                 if index is not None and 0 <= index < len(candidates):
-                    return candidates[index][0]
-        pool = sorted(
-            images + [item for item in entries if item.get("face_id")],
-            key=lambda x: float(x.get("ts") or 0.0),
-        )
+                    chosen = candidates[index][0]
+                    self._last_picked[group_id] = str(chosen)
+                    return chosen
+        if scored_matched:
+            pool = entries[:8]
+        else:
+            pool = sorted(
+                entries,
+                key=lambda x: float(x.get("ts") or 0.0),
+            )[-8:]
         if not pool:
             return None
-        picked = random.choice(pool[-8:])
+        last_key = self._last_picked.get(group_id)
+        if last_key and len(pool) > 1:
+            filtered = [
+                item for item in pool
+                if (
+                    ("face:" + str(item["face_id"])) if item.get("face_id") else str(item.get("path"))
+                ) != last_key
+            ]
+            if filtered:
+                pool = filtered
+        picked = random.choice(pool)
+        picked_key = (
+            ("face:" + str(picked["face_id"])) if picked.get("face_id") else str(picked["path"])
+        )
+        self._last_picked[group_id] = picked_key
         if picked.get("face_id"):
             return "face:" + str(picked["face_id"])
         return Path(picked["path"])

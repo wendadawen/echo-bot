@@ -1709,3 +1709,162 @@ class TestMemoryPersonsContextMonitorAttentionAndInfra(unittest.TestCase):
             reloaded = vision.EmojiBank(folder)
             self.assertEqual(0, reloaded.stats("g1").get("g1", 0))
             self.assertEqual([], reloaded._index.get("g1", []))
+
+    def test_reply_attach_emoji_mood_hints_cooldown_and_anti_repeat(self):
+        import struct
+        from astrbot_plugin_echo.core.actions import ACTION_PROMPT
+
+        # 1) actions.parse_full / validate / ACTION_PROMPT
+        self.assertIn("send_face", ACTION_PROMPT)
+        self.assertIn('"emoji"', ACTION_PROMPT)
+        p1 = parse_full('{"action":"reply","text":"笑死","emoji":"无语"}')
+        self.assertEqual("无语", p1["emoji"])
+        p2 = parse_full('{"action":"reply","text":"离谱","attach_emoji":"呆萌"}')
+        self.assertEqual("呆萌", p2["emoji"])
+        self.assertFalse(validate("reply", "你好", emoji="坏\x00词")[0])
+
+        class _StaticTagModel:
+            def __init__(self, tag, desc):
+                self.tag = tag
+                self.desc = desc
+
+            def vision_reply(self, prompt, uri):
+                return f"{self.tag}|{self.desc}"
+
+        png1 = b"\x89PNG\r\n\x1a\n" + struct.pack(">II", 32, 32) + b"\x08\x06\x00\x00\x00" + b"A" * 32
+        png2 = b"\x89PNG\r\n\x1a\n" + struct.pack(">II", 32, 32) + b"\x08\x06\x00\x00\x00" + b"B" * 32
+        png3 = b"\x89PNG\r\n\x1a\n" + struct.pack(">II", 32, 32) + b"\x08\x06\x00\x00\x00" + b"C" * 32
+
+        with tempfile.TemporaryDirectory() as folder:
+            bank = vision.EmojiBank(folder)
+            bank.collect("g1", png1, _StaticTagModel("无语", "小猫翻白眼"))
+            bank.collect("g1", png2, _StaticTagModel("无语", "小狗无语凝视"))
+            bank.collect("g1", png3, _StaticTagModel("呆呆", "企鹅呆呆地望着你，语气平静"))
+            bank.collect_face("g1", "178", "斜眼笑")
+
+            tags = bank.tags("g1", limit=10)
+            self.assertEqual("斜眼笑", tags[0])
+            self.assertIn("无语", tags)
+            self.assertIn("呆呆", tags)
+
+            # 精确匹配“无语”应压过仅含单字“语”的低分项；且连续两次不会挑同一张图
+            pick1 = bank.pick("g1", "无语", None)
+            pick2 = bank.pick("g1", "无语", None)
+            self.assertIn("无语", next(e["tag"] for e in bank._index["g1"] if e.get("path") == str(pick1)))
+            self.assertIn("无语", next(e["tag"] for e in bank._index["g1"] if e.get("path") == str(pick2)))
+            self.assertNotEqual(str(pick1), str(pick2))
+
+            # 2) Brain.handle_batch 注入本群可用情绪 + reply 附带表情 + 90s 冷却 + 私聊不附带
+            seen_systems = []
+
+            class _EmojiAttachModel:
+                def __init__(self):
+                    self.n = 0
+
+                def reply(self, system, history, user_text):
+                    seen_systems.append(system)
+                    self.n += 1
+                    return json.dumps(
+                        {"action": "reply", "text": f"笑死这也太离谱了{self.n}", "emoji": "斜眼笑"},
+                        ensure_ascii=False,
+                    )
+
+            mon = Monitor(":memory:")
+            brain = Brain(Store(":memory:"), _EmojiAttachModel(), emoji_bank=bank, monitor=mon)
+            now = time.time()
+            r1 = brain.handle_batch(Batch(
+                "g1",
+                items=[Item("哈哈哈哈你看他", "u1", "阿伟", True, "umo:1", now)],
+                started=now,
+                deadline=now,
+            ))
+            self.assertIn("本群表情库可用情绪", seen_systems[0])
+            self.assertIn("无语", seen_systems[0])
+            self.assertTrue(r1["replied"])
+            self.assertEqual("178", r1.get("attach_face"))
+            mon_rows = mon._db.execute("SELECT kind, detail FROM events WHERE group_id='g1'").fetchall()
+            self.assertTrue(any(e["kind"] == "send_face" and e["detail"] == "attach:斜眼笑" for e in mon_rows))
+
+            # 90s 冷却内连续回复：文本正常发，附带表情被克制掉
+            r2 = brain.handle_batch(Batch(
+                "g1",
+                items=[Item("再来一句", "u1", "阿伟", True, "umo:1", now + 5)],
+                started=now + 5,
+                deadline=now + 5,
+            ))
+            self.assertTrue(r2["replied"])
+            self.assertNotIn("attach_face", r2)
+            self.assertNotIn("attach_image", r2)
+
+            # 冷却过后（调早记录）再次允许附带图片表情
+            brain._last_emoji_at["g1"] = now - 200
+            brain.model = type("_ImgAttachM", (), {
+                "reply": lambda self, s, h, u: '{"action":"reply","text":"真无语了","emoji":"无语"}'
+            })()
+            r3 = brain.handle_batch(Batch(
+                "g1",
+                items=[Item("你评价一下", "u1", "阿伟", True, "umo:1", now + 20)],
+                started=now + 20,
+                deadline=now + 20,
+            ))
+            self.assertTrue(r3["replied"])
+            self.assertTrue(Path(r3.get("attach_image", "")).exists())
+
+            # 私聊场景绝不附带表情
+            brain._last_emoji_at.clear()
+            priv = brain.handle_batch(Batch(
+                "p1",
+                items=[Item("在干嘛", "u1", "阿伟", False, "umo:p1", now + 30)],
+                started=now + 30,
+                deadline=now + 30,
+                scene="private",
+            ))
+            self.assertTrue(priv["replied"])
+            self.assertNotIn("attach_image", priv)
+            self.assertNotIn("attach_face", priv)
+
+            # 3) Echo._process_batch 先发文本回复、紧接着发出 attach_image / attach_face
+            stub_mods, comp, _ = _make_astrbot_stubs()
+            sys.modules.pop("astrbot_plugin_echo.main", None)
+            with patch.dict(sys.modules, stub_mods):
+                echo_main = importlib.import_module("astrbot_plugin_echo.main")
+
+            sent_msgs = []
+
+            class _SpyCtx:
+                async def send_message(self, umo, chain):
+                    sent_msgs.append((umo, chain.chain))
+
+            async def _test_send():
+                with patch.dict(sys.modules, stub_mods):
+                    with patch.object(echo_main.StarTools, "get_data_dir", lambda *a, **kw: folder):
+                        echo = echo_main.Echo(_SpyCtx(), config={})
+                    for tname in ("_reminder_task", "_chat_task"):
+                        task = getattr(echo, tname, None)
+                        if task is not None:
+                            task.cancel()
+                            setattr(echo, tname, None)
+                    echo.emoji_bank = bank
+                    echo.brain.emoji_bank = bank
+                    saved_img = str(Path(bank._index["g1"][0]["path"]))
+                    fake_res_img = {
+                        "replied": True, "text": "笑死", "parts": ["笑死"], "cleaned": True,
+                        "attach_image": saved_img,
+                    }
+                    b1 = Batch("g1", items=[Item("hi", "u1", "阿伟", True, "umo:g1", now)], started=now, deadline=now, approved=True)
+                    with patch.object(echo.brain, "handle_batch", return_value=fake_res_img):
+                        await echo._process_batch(b1)
+                    fake_res_face = {
+                        "replied": True, "text": "不错", "parts": ["不错"], "cleaned": True,
+                        "attach_face": "178",
+                    }
+                    b2 = Batch("g2", items=[Item("hi2", "u1", "阿伟", True, "umo:g2", now)], started=now, deadline=now, approved=True)
+                    with patch.object(echo.brain, "handle_batch", return_value=fake_res_face):
+                        await echo._process_batch(b2)
+
+            asyncio.run(_test_send())
+            self.assertEqual(4, len(sent_msgs))
+            self.assertEqual("笑死", sent_msgs[0][1][0].text)
+            self.assertTrue(sent_msgs[1][1][0].file.startswith("file://"))
+            self.assertEqual("不错", sent_msgs[2][1][0].text)
+            self.assertEqual(178, sent_msgs[3][1][0].id)

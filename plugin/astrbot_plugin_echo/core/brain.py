@@ -111,6 +111,7 @@ FILTER_WORDS = (
 )
 
 REPEAT_WINDOW = 30
+ATTACH_EMOJI_COOLDOWN = 90.0
 SUMMARY_INTERVAL = 600
 DEFAULT_HISTORY_LIMIT = 30
 MIN_HISTORY_LIMIT = 1
@@ -595,6 +596,7 @@ class Brain:
         self._last_reply_user = {}
         self._last_reply_offered = {}
         self._last_bot_reply = {}
+        self._last_emoji_at = {}
         self.context_builder = ContextBuilder(
             self.persona, memory, {}, attention=attention,
             modes=modes, persons=persons, store=store, schedules=schedule,
@@ -862,6 +864,10 @@ class Brain:
         ) else bool(self.emoji_bank and self.emoji_bank.stats(group).get(group))
         capabilities["send_face"] = bool(capabilities.get("send_face", True) and has_emoji)
         capabilities["schedule"] = bool(capabilities.get("schedule", True) and self.reminders_enabled)
+        if capabilities["send_face"] and self.emoji_bank and hasattr(self.emoji_bank, "tags"):
+            avail_tags = self.emoji_bank.tags(group, limit=12)
+            if avail_tags:
+                system = system + "\n\n本群表情库可用情绪（供 send_face 或 reply 的 emoji 字段挑选）：" + "、".join(avail_tags)
         allow_subagent = bool(
             capabilities.get("subagent", True)
             and ((info.mentioned and not info.retold) or scene == "private")
@@ -1083,9 +1089,33 @@ class Brain:
                       + compaction.estimate_tokens(reply))
             self.monitor.record(group, "reply", ok=True, latency=elapsed,
                                 tokens=tokens, detail=action)
-        return {"replied": True, "text": reply, "reason": action,
-                "elapsed": elapsed, "parts": parts,
-                "delays": planned.delays or [0.2], "cleaned": True, "rounds": rounds_used}
+        out = {
+            "replied": True,
+            "text": reply,
+            "reason": action,
+            "elapsed": elapsed,
+            "parts": parts,
+            "delays": planned.delays or [0.2],
+            "cleaned": True,
+            "rounds": rounds_used,
+        }
+        emoji_kw = str(decision.get("emoji") or "").strip()
+        if (
+            emoji_kw
+            and capabilities.get("send_face")
+            and self.emoji_bank
+            and now_ts - self._last_emoji_at.get(group, 0.0) >= ATTACH_EMOJI_COOLDOWN
+        ):
+            picked = self.emoji_bank.pick(group, emoji_kw, None)
+            if picked:
+                self._last_emoji_at[group] = now_ts
+                if self.monitor:
+                    self.monitor.record(group, "send_face", ok=True, latency=0.0, detail="attach:" + emoji_kw)
+                if str(picked).startswith("face:"):
+                    out["attach_face"] = str(picked).split(":", 1)[1]
+                else:
+                    out["attach_image"] = str(picked)
+        return out
 
     def view_rate(self, batch):
         """按语境给查看概率：主动邀约跟进 / 120 秒内连续对话 85%，表情接梗 75%，问句 50%。"""

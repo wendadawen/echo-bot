@@ -49,6 +49,9 @@ ACTION_PROMPT = (
     "决定要查或要做就必须直接选 action=\"subagent\"。\n"
     "- 群友发了图、引用了图或问图里是什么且 view_image 可用 → 先用 view_image 看清画面，再结合结果 reply，绝不要没看图就说没收到图；\n"
     "- 纯闲聊、情绪、玩笑、稳定常识、群内已知信息 → reply，最多两句；\n"
+    "- 斗图、接梗、群友直接要表情包，或只想纯发一个表情回应且 send_face 可用 → send_face（text 填 2-4 字情绪词，如“无语”“呆萌”）；\n"
+    '  用 reply 闲聊、吐槽、开玩笑且 send_face 可用时，可偶尔额外带 "emoji" 字段（2-4 字情绪词）在文字后顺手配一张表情包，'
+    '例：{"action":"reply","text":"笑死，这也太离谱了","emoji":"无语"}；严肃问答、技术排查或报错时不要带 emoji，也不要每句都带。\n'
     "- 确实不该接话 → silent。\n"
     "群聊支持生成并发送本地文件（HTML/代码/文档等）到群里，但无法部署到公网/IP、"
     "无法起常驻或监听服务、也无法用后台线程绕过超时；"
@@ -147,12 +150,13 @@ def parse_full(raw):
             limit = _payload_limit(action)
             text = str(raw_val if raw_val is not None else "").strip()[:limit]
             reply = str(data.get("reply") or "").strip()[:120]
-            return {"action": action, "text": text, "seconds": data.get("seconds"), "reply": reply}
+            emoji = str(data.get("emoji") or data.get("attach_emoji") or "").strip()[:30]
+            return {"action": action, "text": text, "seconds": data.get("seconds"), "reply": reply, "emoji": emoji}
         idx = max(pos + 1, end)
     return None
 
 
-def validate(action, payload, scene="group", capabilities=None, reply=""):
+def validate(action, payload, scene="group", capabilities=None, reply="", emoji=""):
     """参数校验：防住明显不合法的动作、超长与控制字符输入。"""
     if action not in available(scene, capabilities):
         if action in ("silent", "wait") and capabilities is not None and not capabilities.get("silent", True):
@@ -165,7 +169,7 @@ def validate(action, payload, scene="group", capabilities=None, reply=""):
         return False, "缺少参数"
     if len(payload) > _payload_limit(action):
         return False, "参数过长"
-    if _CTRL_PATTERN.search(payload) or (reply and _CTRL_PATTERN.search(str(reply))):
+    if _CTRL_PATTERN.search(payload) or (reply and _CTRL_PATTERN.search(str(reply))) or (emoji and _CTRL_PATTERN.search(str(emoji))):
         return False, "参数含控制字符"
     if action == "wait":
         try:
@@ -288,7 +292,10 @@ class ToolLoop:
                 # 模型按普通口语直答时当作普通回复。
                 return {"action": "reply", "text": str(raw or "").strip()[:MAX_REPLY_TEXT], "rounds": rounds}
             action, payload = full["action"], full["text"]
-            ok, reason = validate(action, payload, scene, capabilities=caps, reply=full.get("reply", ""))
+            ok, reason = validate(
+                action, payload, scene, capabilities=caps,
+                reply=full.get("reply", ""), emoji=full.get("emoji", ""),
+            )
             if not ok:
                 observations.append("[校验失败] {}".format(reason))
                 continue
@@ -303,6 +310,13 @@ class ToolLoop:
                 out = {"action": action, "text": payload, "rounds": rounds}
                 if full.get("reply"):
                     out["reply"] = full["reply"]
+                if (
+                    action == "reply"
+                    and full.get("emoji")
+                    and scene == "group"
+                    and (caps is None or caps.get("send_face", True))
+                ):
+                    out["emoji"] = full["emoji"]
                 return out
             done, result = executor(group_id, action, payload)
             text = condense(result)

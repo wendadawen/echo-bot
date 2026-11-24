@@ -733,20 +733,15 @@ class Echo(Star):
             if not result.get("replied") or self.rhythm.is_muted(group):
                 return
             if result.get("face"):
-                try:
-                    face = Face(id=int(result["face"]))
-                except (TypeError, ValueError):
-                    face = None
-                if face is not None and self.limiter.allow(group):
-                    await self.context.send_message(batch.umo, MessageChain([face]))
-                    self.limiter.record(group)
-                    hb = getattr(self, "heartbeat", None)
-                    if hb is not None:
-                        hb.observe(group)
+                await self._send_face_id(group, batch.umo, result["face"])
             elif result.get("image"):
                 await self._send_image(group, batch.umo, result["image"])
             else:
                 await self._send_reply(group, batch.umo, result)
+                if result.get("attach_face"):
+                    await self._send_face_id(group, batch.umo, result["attach_face"])
+                elif result.get("attach_image"):
+                    await self._send_image(group, batch.umo, result["attach_image"])
 
     async def _chat_loop(self):
         """防抖到期 → 并发按群隔离决策 → 单条发送；同时推进 wait/静默/主动开聊/清理/子任务投递。"""
@@ -891,6 +886,21 @@ class Echo(Star):
         if not single or not self.limiter.allow(group):
             return
         await self.context.send_message(umo, MessageChain([Plain(single)]))
+        self.limiter.record(group)
+        hb = getattr(self, "heartbeat", None)
+        if hb is not None:
+            hb.observe(group)
+
+    async def _send_face_id(self, group, umo, face_id):
+        if not umo or face_id is None or str(face_id).strip() == "":
+            return
+        try:
+            face = Face(id=int(face_id))
+        except (TypeError, ValueError):
+            return
+        if not self.limiter.allow(group):
+            return
+        await self.context.send_message(umo, MessageChain([face]))
         self.limiter.record(group)
         hb = getattr(self, "heartbeat", None)
         if hb is not None:
