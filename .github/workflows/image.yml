@@ -15,8 +15,26 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  verify:
+    name: 发布前门禁自检
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 运行校验、编译、单测与模拟
+        run: |
+          python tools/validate_plugin.py
+          python -m compileall -q plugin tests tools
+          python -m unittest discover -s tests -p "test_*.py" -v
+          python tools/simulate.py
+          docker compose config -q
+          bash -n scripts/*.sh docker/*.sh
+
   build:
     name: 构建并推送双架构镜像
+    needs: verify
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

@@ -1,5 +1,6 @@
-"""校验插件目录结构、元数据与配置 schema。只用标准库。"""
+"""校验插件目录结构、元数据、配置 schema 与全模块语法。只用标准库。"""
 
+import ast
 import json
 import re
 import sys
@@ -33,6 +34,7 @@ REQUIRED = [
     "store/emoji_classifier.py",
     "store/emoji_store.py",
     "workers/__init__.py",
+    "workers/fs_guard.py",
     "workers/sandbox.py",
     "workers/presenter.py",
     "workers/manager.py",
@@ -53,9 +55,18 @@ META_FIELDS = ["name", "display_name", "desc", "version", "author", "repo", "ast
 
 def main():
     errors = []
+    if (PLUGIN / "core").exists():
+        errors.append("存在遗留目录 core/，v2 重构后不应保留")
+
     for rel in REQUIRED:
         if not (PLUGIN / rel).is_file():
             errors.append("缺少文件：{}".format(rel))
+
+    for py_path in sorted(PLUGIN.rglob("*.py")):
+        try:
+            ast.parse(py_path.read_text(encoding="utf-8"), filename=str(py_path))
+        except (OSError, SyntaxError) as exc:
+            errors.append("语法错误 {}：{}".format(py_path.relative_to(PLUGIN), exc))
 
     metadata = (PLUGIN / "metadata.yaml").read_text(encoding="utf-8")
     for field in META_FIELDS:

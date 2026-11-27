@@ -4,6 +4,7 @@ import asyncio
 import json
 import sys
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
@@ -450,6 +451,76 @@ class IncidentReplayTests(unittest.TestCase):
                 self.assertEqual(sum(1 for r in after_rows if r.get("msg_id") == "m_ing_1"), 1)
                 non_sys = [str(m.content or "") for m in spy.chat_calls[0]["messages"] if m.role != "system"]
                 self.assertEqual(sum(1 for c in non_sys if "你好大肥鱼" in c), 1)
+
+        asyncio.run(scenario())
+
+    def test_12_real_chat_loop_delivery_and_graceful_terminate(self):
+        async def scenario():
+            with tempfile.TemporaryDirectory() as tmp:
+                from astrbot_plugin_echo.domain import ModelTurn, PendingDelivery
+                from astrbot_plugin_echo.workers import CodexBackend, SandboxRunner, TaskManager
+
+                spy = _SpyLLM([ModelTurn(text="主聊响应"), ModelTurn(text="后台已完成整理")])
+                echo, ctx = self._build_echo(Path(tmp), spy)
+                echo.scheduler.mention_cap = 0.05
+                echo.scheduler.quiet_delay = 0.05
+                echo.task_manager = TaskManager(
+                    SandboxRunner(Path(tmp) / "w", Path(tmp) / "outbox"),
+                    CodexBackend(binary="/bin/sh"),
+                    repo=echo.repo,
+                )
+                echo.agent._tasks = echo.task_manager
+
+                await echo.initialize()
+                try:
+                    ev = _make_event(
+                        [_At(qq="8888"), _Plain("在不在呀")],
+                        text="在不在呀",
+                        raw_msg={"message_id": "m_loop_1", "message": []},
+                    )
+                    await _drive_event(echo, ev)
+
+                    deadline = time.monotonic() + 3.0
+                    while time.monotonic() < deadline and ctx.send_message.call_count < 1:
+                        await asyncio.sleep(0.05)
+                    self.assertGreaterEqual(ctx.send_message.call_count, 1)
+
+                    attempts = [0]
+                    delivered_texts = []
+
+                    async def _flaky_send(umo, chain):
+                        attempts[0] += 1
+                        if attempts[0] == 1:
+                            raise RuntimeError("transient send error")
+                        text = getattr(chain.chain[-1], "text", "") if getattr(chain, "chain", None) else ""
+                        delivered_texts.append(text)
+                        return None
+
+                    ctx.send_message = AsyncMock(side_effect=_flaky_send)
+                    echo.repo.save_pending_delivery(PendingDelivery(
+                        task_id="d_loop_retry",
+                        group_id="aiocqhttp:10086",
+                        umo="aiocqhttp:GroupMessage:10086",
+                        prompt="整理结果",
+                        status="completed",
+                        reason="ok",
+                        result="后台已完成整理",
+                    ))
+
+                    deadline2 = time.monotonic() + 4.0
+                    while time.monotonic() < deadline2 and (
+                        not delivered_texts or echo.repo.list_pending_deliveries()
+                    ):
+                        await asyncio.sleep(0.05)
+
+                    self.assertGreaterEqual(attempts[0], 2)
+                    self.assertEqual(len(delivered_texts), 1)
+                    self.assertEqual(echo.repo.list_pending_deliveries(), [])
+                finally:
+                    await echo.terminate()
+
+                self.assertIsNone(echo._chat_task)
+                self.assertTrue(echo.repo._closed)
 
         asyncio.run(scenario())
 

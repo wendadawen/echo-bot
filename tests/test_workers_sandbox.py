@@ -1,7 +1,9 @@
-"""workers 层测试：安全沙箱隔离、降权/进程组强杀、CodexBackend 与 TaskManager 生命周期。"""
+"""workers 层测试：安全沙箱隔离、降权/prlimit/进程组强杀、宿主编排零密钥后端、CodexBackend 与 TaskManager 生命周期。"""
 
+import contextlib
 import json
 import os
+import resource
 import signal
 import sys
 import tempfile
@@ -16,9 +18,9 @@ PLUGIN_ROOT = ROOT / "plugin"
 if str(PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(PLUGIN_ROOT))
 
-from astrbot_plugin_echo.domain import LLMMessage, ModelTurn, PendingDelivery, TaskRequest  # noqa: E402
+from astrbot_plugin_echo.domain import LLMMessage, ModelTurn, PendingDelivery, SearchHit, TaskRequest  # noqa: E402
 from astrbot_plugin_echo.store.repository import Repository  # noqa: E402
-from astrbot_plugin_echo.workers.backends import ChatAgentBackend, CodexBackend, select_backend  # noqa: E402
+from astrbot_plugin_echo.workers.backends import ChatAgentBackend, CodexBackend, codex as codex_mod, select_backend  # noqa: E402
 from astrbot_plugin_echo.workers.manager import TaskManager  # noqa: E402
 from astrbot_plugin_echo.workers.sandbox import (  # noqa: E402
     DEFAULT_TIMEOUT,
@@ -34,6 +36,18 @@ from astrbot_plugin_echo.workers.sandbox import (  # noqa: E402
 )
 
 TINY_PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+
+
+@contextlib.contextmanager
+def _sandbox_tempdir():
+    """确保 Linux root 下运行 setpriv nobody 测试时临时父目录具备可穿越权限 (0711)。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            try:
+                os.chmod(tmp, 0o711)
+            except OSError:
+                pass
+        yield tmp
 
 
 class _FakePythonBackend:
@@ -137,12 +151,38 @@ class SandboxSecurityTests(unittest.TestCase):
                 atomic_write_text_no_follow(sdir / "x.txt", "new")
 
             runner = SandboxRunner(root / "work", root / "outbox", timeout=240)
-            with patch.object(SandboxRunner, "use_setpriv", return_value=True):
+            with (
+                patch.object(SandboxRunner, "use_setpriv", return_value=True),
+                patch.object(SandboxRunner, "use_prlimit", return_value=False),
+            ):
                 wrapped = runner._wrap_command(["codex", "exec"])
             self.assertEqual(
                 wrapped[:5],
                 ["/usr/bin/setpriv", "--reuid=65534", "--regid=65534", "--clear-groups", "--no-new-privs"],
             )
+            with (
+                patch.object(SandboxRunner, "use_setpriv", return_value=True),
+                patch.object(SandboxRunner, "use_prlimit", return_value=True),
+            ):
+                wrapped_pl = runner._wrap_command(["codex", "exec"], cpu_limit=240)
+            self.assertEqual(
+                wrapped_pl[:5],
+                ["/usr/bin/setpriv", "--reuid=65534", "--regid=65534", "--clear-groups", "--no-new-privs"],
+            )
+            self.assertTrue(wrapped_pl[5].endswith("prlimit"))
+            self.assertIn("--cpu=240", wrapped_pl)
+            self.assertEqual(wrapped_pl[-3:], ["--", "codex", "exec"])
+
+            with patch("resource.getrlimit", return_value=(1024, 2048)):
+                self.assertEqual(SandboxRunner._clamp_rlimit(resource.RLIMIT_NOFILE, 9999), 2048)
+            with patch("resource.getrlimit", return_value=(resource.RLIM_INFINITY, resource.RLIM_INFINITY)):
+                self.assertEqual(SandboxRunner._clamp_rlimit(resource.RLIMIT_NOFILE, 9999), 9999)
+
+            with (
+                patch.dict(os.environ, {"ECHO_SANDBOX_REQUIRE_ISOLATION": "1"}),
+                patch.object(SandboxRunner, "use_setpriv", return_value=False),
+            ):
+                self.assertFalse(runner.available(_FakePythonBackend("")))
 
             with patch.dict(
                 os.environ,
@@ -179,15 +219,27 @@ class CodexBackendTests(unittest.TestCase):
             self.assertIn('wire_api = "responses"', cfg)
             self.assertIn('base_url = "http://127.0.0.1:8787/v1"', cfg)
             self.assertIn('env_key = "ECHO_API_KEY"', cfg)
+            self.assertIn("[shell_environment_policy]", cfg)
+            self.assertIn('inherit = "core"', cfg)
+            self.assertIn('exclude = ["*KEY*", "*TOKEN*", "*SECRET*"]', cfg)
 
             backend.prepare_home(home)
             self.assertEqual((home / "config.toml").read_text(encoding="utf-8"), cfg)
 
             img1 = Path(tmp) / "input_1.png"
-            cmd = backend.build_command("分析这张图", Path(tmp), Path(tmp) / "outbox", [img1], timeout=300)
+            with patch.object(codex_mod, "supports_workspace_write_sandbox", return_value=True):
+                self.assertEqual(codex_mod.resolve_sandbox_mode(), "workspace-write")
+                cmd = backend.build_command("分析这张图", Path(tmp), Path(tmp) / "outbox", [img1], timeout=300)
+            self.assertIn("--ephemeral", cmd)
             self.assertIn("--sandbox", cmd)
+            self.assertEqual(cmd[cmd.index("--sandbox") + 1], "workspace-write")
             idx = cmd.index("-i")
             self.assertEqual(cmd[idx + 1], str(img1))
+
+            with patch.object(codex_mod, "supports_workspace_write_sandbox", return_value=False):
+                self.assertEqual(codex_mod.resolve_sandbox_mode(), "danger-full-access")
+            with patch.dict(os.environ, {"ECHO_CODEX_SANDBOX_MODE": "read-only"}):
+                self.assertEqual(codex_mod.resolve_sandbox_mode(), "read-only")
 
             self.assertEqual(
                 backend.parse_line(json.dumps({"type": "item.started", "item": {"type": "web_search"}})),
@@ -225,7 +277,7 @@ except OSError:
 inbox_exists = (Path("inbox") / "input_1.png").is_file()
 print(f"ANSWER:完成 inbox={inbox_exists}", flush=True)
 """
-        with tempfile.TemporaryDirectory() as tmp:
+        with _sandbox_tempdir() as tmp:
             work = Path(tmp) / "work"
             outbox = Path(tmp) / "outbox"
             runner = SandboxRunner(work, outbox, timeout=180)
@@ -254,7 +306,7 @@ print("ANSWER:已经查到前半段结论", flush=True)
 subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
 time.sleep(30)
 """
-        with tempfile.TemporaryDirectory() as tmp:
+        with _sandbox_tempdir() as tmp:
             runner = SandboxRunner(Path(tmp) / "work", Path(tmp) / "outbox", timeout=180)
             runner.timeout = 1
             backend = _FakePythonBackend(script)
@@ -274,7 +326,7 @@ import time
 print("PROGRESS:准备长跑", flush=True)
 time.sleep(30)
 """
-        with tempfile.TemporaryDirectory() as tmp:
+        with _sandbox_tempdir() as tmp:
             runner = SandboxRunner(Path(tmp) / "work", Path(tmp) / "outbox", timeout=180)
             backend = _FakePythonBackend(script)
             cancel = threading.Event()
@@ -286,7 +338,7 @@ time.sleep(30)
             self.assertEqual(res.status, "cancelled")
 
     def test_wave1_unavailable_drain_stderr_and_cancel_after_exit(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with _sandbox_tempdir() as tmp:
             work = Path(tmp) / "work"
             outbox = Path(tmp) / "outbox"
             runner = SandboxRunner(work, outbox, timeout=30)
@@ -348,7 +400,7 @@ print("PROGRESS:第1步检索中", flush=True)
 time.sleep(2.0)
 print("ANSWER:完成", flush=True)
 """
-        with tempfile.TemporaryDirectory() as tmp:
+        with _sandbox_tempdir() as tmp:
             db = Path(tmp) / "echo.sqlite3"
             repo = Repository(db)
             runner = SandboxRunner(Path(tmp) / "work", Path(tmp) / "outbox", timeout=180)
@@ -475,7 +527,7 @@ import time
 print("PROGRESS:准备休眠", flush=True)
 time.sleep(10)
 """
-        with tempfile.TemporaryDirectory() as tmp:
+        with _sandbox_tempdir() as tmp:
             repo = Repository(Path(tmp) / "echo.sqlite3")
             runner = SandboxRunner(Path(tmp) / "work", Path(tmp) / "outbox", timeout=60)
             mgr = TaskManager(runner, _FakePythonBackend(script), repo=repo)
@@ -494,6 +546,15 @@ time.sleep(10)
 
 class ChatAgentBackendAndRoutingTests(unittest.TestCase):
     def test_select_backend_routes_gpt_to_codex_and_others_to_chat_agent(self):
+        class _DummySearch:
+            provider = "tavily"
+            api_base = "https://search.example/v1"
+            api_key = "tvly-key"
+
+            def search(self, query, limit=5):
+                return []
+
+        dummy_search = _DummySearch()
         with patch("os.path.exists", return_value=True):
             self.assertIsInstance(
                 select_backend(api_base="http://127.0.0.1:8787/v1", api_key="k", model="gpt-6-luna"),
@@ -503,29 +564,32 @@ class ChatAgentBackendAndRoutingTests(unittest.TestCase):
                 select_backend(api_base="http://127.0.0.1:8787/v1", api_key="k", model="claude-haiku-5-5"),
                 ChatAgentBackend,
             )
-            self.assertIsInstance(
-                select_backend(api_base="http://127.0.0.1:8787/v1", api_key="k", model="deepseek-chat"),
-                ChatAgentBackend,
+            routed = select_backend(
+                api_base="http://127.0.0.1:8787/v1",
+                api_key="k",
+                model="deepseek-chat",
+                search_provider=dummy_search,
             )
+            self.assertIsInstance(routed, ChatAgentBackend)
+            self.assertIs(routed._search_client, dummy_search)
 
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp) / ".chat_agent"
             backend = ChatAgentBackend(api_base="http://127.0.0.1:8787/v1", api_key="k", model="claude-haiku-5-5")
             backend.prepare_home(home)
-            self.assertTrue((home / "agent_loop.py").is_file())
-            self.assertTrue((home / "echo_search.py").is_file())
-            self.assertEqual(
-                (home / "echo_search.py").read_text(encoding="utf-8"),
-                (PLUGIN_ROOT / "astrbot_plugin_echo" / "adapters" / "search.py").read_text(encoding="utf-8"),
-            )
-            loop_src = (home / "agent_loop.py").read_text(encoding="utf-8")
-            self.assertNotIn("class SearchRunner", loop_src)
-            self.assertNotIn("def bing_search_cn", loop_src)
+            self.assertFalse(home.exists())
+            self.assertEqual(backend.env_overrides(Path(tmp), home), {})
 
     def test_chat_agent_backend_runs_in_sandbox_strips_secrets_and_exports_outbox(self):
         from http.server import BaseHTTPRequestHandler, HTTPServer
 
         captured_requests = []
+        search_queries = []
+
+        class _FakeSearcher:
+            def search(self, query, limit=5):
+                search_queries.append((query, limit))
+                return [SearchHit(title="测试命中", snippet="宿主机搜索正常", url="https://example.com")]
 
         class _MockLLMHandler(BaseHTTPRequestHandler):
             def log_message(self, format, *args):
@@ -550,7 +614,7 @@ class ChatAgentBackendAndRoutingTests(unittest.TestCase):
                                             "arguments": json.dumps({
                                                 "command": (
                                                     f"{sys.executable} -c "
-                                                    "'import os; print(\"LEAK\" if (\"ECHO_API_KEY\" in os.environ or \"ECHO_SEARCH_KEY\" in os.environ) else \"CLEAN\")'"
+                                                    "'import os; bad=[k for k in (\"ECHO_API_KEY\",\"ECHO_SEARCH_KEY\",\"BOT_API_KEY\",\"ONEBOT_TOKEN\") if k in os.environ]; print(\"LEAK:\"+\",\".join(bad) if bad else \"CLEAN\")'"
                                                 )
                                             }),
                                         },
@@ -577,6 +641,25 @@ class ChatAgentBackendAndRoutingTests(unittest.TestCase):
                                             }),
                                         },
                                     },
+                                    {
+                                        "id": "tc_4",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "write_file",
+                                            "arguments": json.dumps({
+                                                "path": "inbox/hack.txt",
+                                                "content": "bad",
+                                            }),
+                                        },
+                                    },
+                                    {
+                                        "id": "tc_5",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "web_search",
+                                            "arguments": json.dumps({"query": "Python 3.12 特性", "limit": 3}),
+                                        },
+                                    },
                                 ],
                             }
                         }]
@@ -598,7 +681,10 @@ class ChatAgentBackendAndRoutingTests(unittest.TestCase):
         th.start()
 
         try:
-            with tempfile.TemporaryDirectory() as tmp:
+            with (
+                _sandbox_tempdir() as tmp,
+                patch.dict(os.environ, {"BOT_API_KEY": "sk-host-only-9999", "ONEBOT_TOKEN": "onebot-host-secret-9999"}),
+            ):
                 work = Path(tmp) / "work"
                 outbox = Path(tmp) / "outbox"
                 runner = SandboxRunner(work, outbox, timeout=180)
@@ -608,6 +694,7 @@ class ChatAgentBackendAndRoutingTests(unittest.TestCase):
                     model="claude-haiku-5-5",
                     search_provider="tavily",
                     search_api_key="tvly-secret-88888",
+                    search_client=_FakeSearcher(),
                 )
                 steps = []
                 res = runner.run(
@@ -624,13 +711,15 @@ class ChatAgentBackendAndRoutingTests(unittest.TestCase):
                 self.assertFalse((Path(tmp) / "escape.txt").exists())
                 self.assertGreaterEqual(len(steps), 2)
                 self.assertEqual(list(work.iterdir()), [])
+                self.assertEqual(search_queries, [("Python 3.12 特性", 3)])
                 # 首轮请求含 inline image_url 且不带 temperature / max_tokens
                 self.assertNotIn("temperature", captured_requests[0])
                 self.assertNotIn("max_tokens", captured_requests[0])
                 self.assertEqual(captured_requests[0]["messages"][1]["content"][1]["type"], "image_url")
-                # 越界写逃逸已被拒绝并回传给模型
+                # 越界写逃逸与写保留目录均已被拒绝并回传给模型，宿主机 search 返回已注入
                 tool_replies = [m["content"] for m in captured_requests[1]["messages"] if m.get("role") == "tool"]
-                self.assertTrue(any("写入失败" in t for t in tool_replies), tool_replies)
+                self.assertGreaterEqual(sum(1 for t in tool_replies if "写入失败" in t), 2, tool_replies)
+                self.assertTrue(any("宿主机搜索正常" in t for t in tool_replies), tool_replies)
         finally:
             server.shutdown()
             server.server_close()
@@ -656,7 +745,7 @@ class ChatAgentBackendAndRoutingTests(unittest.TestCase):
         th = threading.Thread(target=server.serve_forever, daemon=True)
         th.start()
         try:
-            with tempfile.TemporaryDirectory() as tmp:
+            with _sandbox_tempdir() as tmp:
                 runner = SandboxRunner(Path(tmp) / "work", Path(tmp) / "outbox", timeout=180)
                 backend = ChatAgentBackend(
                     api_base=f"http://127.0.0.1:{port}/v1",
@@ -669,6 +758,60 @@ class ChatAgentBackendAndRoutingTests(unittest.TestCase):
                 res = runner.run(TaskRequest(group_id="g1", umo="u1", prompt="测试取消"), backend, cancel_event=cancel)
                 self.assertLess(time.monotonic() - t0, 3.0)
                 self.assertEqual(res.status, "cancelled")
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_chat_agent_shell_timeout_kills_process_group_and_no_secrets(self):
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        class _ShellTimeoutHandler(BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                pass
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                _ = self.rfile.read(length)
+                cmd = f"{sys.executable} -c 'import subprocess,sys,time; subprocess.Popen([sys.executable,\"-c\",\"import time;time.sleep(30)\"]); time.sleep(30)'"
+                resp = {
+                    "choices": [{
+                        "message": {
+                            "content": "",
+                            "tool_calls": [{
+                                "id": "tc_sleep",
+                                "type": "function",
+                                "function": {"name": "run_shell", "arguments": json.dumps({"command": cmd, "timeout_sec": 1})},
+                            }],
+                        }
+                    }]
+                }
+                raw = json.dumps(resp).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+        server = HTTPServer(("127.0.0.1", 0), _ShellTimeoutHandler)
+        port = server.server_address[1]
+        th = threading.Thread(target=server.serve_forever, daemon=True)
+        th.start()
+        try:
+            with _sandbox_tempdir() as tmp:
+                runner = SandboxRunner(Path(tmp) / "work", Path(tmp) / "outbox", timeout=180)
+                runner.timeout = 2
+                backend = ChatAgentBackend(
+                    api_base=f"http://127.0.0.1:{port}/v1",
+                    api_key="sk-timeout-secret",
+                    model="claude-haiku-5-5",
+                )
+                t0 = time.monotonic()
+                with patch("os.killpg", wraps=os.killpg) as killpg_spy:
+                    res = runner.run(TaskRequest(group_id="g1", umo="u1", prompt="运行超时测试"), backend)
+                self.assertLess(time.monotonic() - t0, 6.0)
+                self.assertEqual(res.status, "timeout")
+                self.assertGreaterEqual(killpg_spy.call_count, 1)
+                self.assertEqual(killpg_spy.call_args_list[0][0][1], signal.SIGKILL)
         finally:
             server.shutdown()
             server.server_close()

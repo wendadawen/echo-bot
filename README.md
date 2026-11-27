@@ -25,6 +25,14 @@ cd echo-bot
 3. 如需在 GitHub Actions 构建时同步双推到国内个人镜像仓（如阿里云 ACR），在仓库 Settings → Variables/Secrets 配置 `MIRROR_IMAGE`、`MIRROR_USERNAME`、`MIRROR_PASSWORD`（可选 `MIRROR_REGISTRY`）即可自动开启双推。
 4. 宿主机 Docker daemon 可按云厂商文档在 `/etc/docker/daemon.json` 配置 `registry-mirrors` 加速基础镜像拉取。
 
+## 本地校验
+
+```bash
+python3 tools/validate_plugin.py
+python3 -m unittest discover -s tests -v
+python3 tools/simulate.py
+```
+
 ## 许可
 
 MIT，见 [LICENSE](LICENSE)。

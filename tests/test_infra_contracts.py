@@ -174,6 +174,61 @@ class InfraContractTests(unittest.TestCase):
         self.assertLess(len((pkg / "workers" / "manager.py").read_text(encoding="utf-8").splitlines()), 350)
         self.assertLess(len((pkg / "engine" / "agent.py").read_text(encoding="utf-8").splitlines()), 550)
 
+    def test_embedded_python_in_shell_scripts_syntax_and_behavior(self):
+        pattern = re.compile(r"<<'PY'\n(.*?)\nPY(?=\r?\n|$)", re.S)
+        up_blocks = pattern.findall((ROOT / "scripts" / "up.sh").read_text(encoding="utf-8"))
+        boot_blocks = pattern.findall((ROOT / "docker" / "bootstrap.sh").read_text(encoding="utf-8"))
+        self.assertEqual(len(up_blocks), 1)
+        self.assertEqual(len(boot_blocks), 3)
+        for src in (*up_blocks, *boot_blocks):
+            compile(src, "<embedded-py>", "exec")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / ".env"
+            env_file.write_text("# comment keep\nBOT_IMAGE=old-image\n", encoding="utf-8")
+            subprocess.run(
+                [sys.executable, "-c", up_blocks[0], str(env_file), "BOT_IMAGE", "echo-bot:cn"],
+                check=True,
+            )
+            subprocess.run(
+                [sys.executable, "-c", up_blocks[0], str(env_file), "DEPLOY_MODE", "cn"],
+                check=True,
+            )
+            content = env_file.read_text(encoding="utf-8")
+            self.assertIn("# comment keep\n", content)
+            self.assertIn("BOT_IMAGE=echo-bot:cn\n", content)
+            self.assertIn("DEPLOY_MODE=cn\n", content)
+            self.assertNotIn("old-image", content)
+            self.assertEqual(env_file.stat().st_mode & 0o777, 0o600)
+
+    def test_ci_and_release_workflows_have_test_gates(self):
+        img_wf = (ROOT / ".github" / "workflows" / "image.yml").read_text(encoding="utf-8")
+        self.assertIn("verify:", img_wf)
+        self.assertIn("needs: verify", img_wf)
+        for needle in ("validate_plugin.py", "unittest discover", "simulate.py"):
+            self.assertIn(needle, img_wf)
+
+        rel_wf = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+        for needle in ("validate_plugin.py", "unittest discover", "simulate.py", "smoke_import.py"):
+            self.assertIn(needle, rel_wf)
+
+    def test_wave4_sandbox_boundaries_and_facade_exports(self):
+        from astrbot_plugin_echo.workers import fs_guard, sandbox
+        from astrbot_plugin_echo.workers.backends import chat_agent
+
+        self.assertIs(sandbox.is_safe_export_name, fs_guard.is_safe_export_name)
+        self.assertIs(sandbox.atomic_write_text_no_follow, fs_guard.atomic_write_text_no_follow)
+        self.assertFalse(hasattr(chat_agent, "_AGENT_LOOP_SCRIPT"))
+        self.assertEqual(
+            chat_agent.ChatAgentBackend(api_base="https://api.example.com/v1", api_key="sk-secret").env_overrides(
+                Path("."), Path(".")
+            ),
+            {},
+        )
+        pkg = PLUGIN_ROOT / "astrbot_plugin_echo"
+        self.assertLess(len((pkg / "workers" / "sandbox.py").read_text(encoding="utf-8").splitlines()), 560)
+        self.assertLess(len((pkg / "workers" / "backends" / "chat_agent.py").read_text(encoding="utf-8").splitlines()), 420)
+
 
 if __name__ == "__main__":
     unittest.main()

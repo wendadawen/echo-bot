@@ -10,12 +10,35 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Optional, Sequence
 
 from ..sandbox import MAX_OUTPUT, atomic_write_text_no_follow
 
-SANDBOX_FLAG = "danger-full-access"
+SANDBOX_FLAG = "workspace-write"
+_VALID_SANDBOX_MODES = frozenset({"read-only", "workspace-write", "danger-full-access"})
+
+
+def supports_workspace_write_sandbox() -> bool:
+    """探测宿主机是否支持 Codex 原生工作区沙箱（macOS Seatbelt / Linux Landlock）。"""
+    if sys.platform == "darwin":
+        return True
+    if sys.platform.startswith("linux"):
+        try:
+            lsm = Path("/sys/kernel/security/lsm").read_text(encoding="utf-8", errors="ignore")
+            return "landlock" in lsm.lower()
+        except OSError:
+            return False
+    return False
+
+
+def resolve_sandbox_mode() -> str:
+    """选择 Codex --sandbox 策略：支持内核沙箱时自动启用 workspace-write，旧内核优雅回退。"""
+    override = str(os.environ.get("ECHO_CODEX_SANDBOX_MODE") or "").strip().lower()
+    if override in _VALID_SANDBOX_MODES:
+        return override
+    return "workspace-write" if supports_workspace_write_sandbox() else "danger-full-access"
 
 _TASK_PROMPT_TEMPLATE = (
     "你是后台执行助手，只负责查证、计算、读写隔离工作区或生成文件并交回真实结论，不直接对群友说话。"
@@ -69,6 +92,12 @@ class CodexBackend:
         else:
             lines.append("requires_openai_auth = false")
         lines.append('wire_api = "responses"')
+        lines.extend([
+            "",
+            "[shell_environment_policy]",
+            'inherit = "core"',
+            'exclude = ["*KEY*", "*TOKEN*", "*SECRET*"]',
+        ])
         return "\n".join(lines) + "\n"
 
     def prepare_home(self, home_dir: Path) -> None:
@@ -116,8 +145,8 @@ class CodexBackend:
         wrapped = self._wrap_prompt(prompt, inbox_files, timeout)
         args = [
             self.binary or "codex",
-            "exec", "--json", "--skip-git-repo-check",
-            "--sandbox", SANDBOX_FLAG,
+            "exec", "--json", "--skip-git-repo-check", "--ephemeral",
+            "--sandbox", resolve_sandbox_mode(),
         ]
         for fpath in list(inbox_files or ())[:2]:
             args.extend(["-i", str(fpath)])

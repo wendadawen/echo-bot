@@ -42,6 +42,7 @@ def select_backend(
         search_provider=str(getattr(search_provider, "provider", "") or ""),
         search_api_base=str(getattr(search_provider, "api_base", "") or ""),
         search_api_key=str(getattr(search_provider, "api_key", "") or ""),
+        search_client=search_provider if callable(getattr(search_provider, "search", None)) else None,
     )
 
 
