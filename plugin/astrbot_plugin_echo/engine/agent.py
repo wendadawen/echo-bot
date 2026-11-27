@@ -166,9 +166,10 @@ class EchoAgent:
     def _persist_batch_items(self, batch: Batch) -> None:
         if batch.persisted:
             return
-        for item in batch.items[-8:]:
+        unpersisted = [i for i in batch.items if not getattr(i, "persisted", False)]
+        for item in unpersisted[-8:]:
             self._repo.observe_person(batch.group_id, item.user_id, item.user_name, now=item.ts or None)
-        for item in batch.items:
+        for item in unpersisted:
             t = str(item.text or "").strip()
             if not t:
                 continue
@@ -415,8 +416,20 @@ class EchoAgent:
                 return {"replied": True, "actions": [SendText(gid, umo, "这个不干。")], "reason": "unsafe"}
             return {"replied": False, "actions": [], "reason": "unsafe_silent"}
 
-        # 2) 先取历史再落本批消息（防止 history 与 current turn 重复）
-        prev_history = self._repo.recent_messages(gid, limit=self.context.history_limit)
+        # 2) 先取历史并过滤已于入口落盘的本批消息（防止 history 与 current turn 重复），再补落未入库项
+        raw_history = self._repo.recent_messages(gid, limit=self.context.history_limit + len(batch.items))
+        batch_seqs = {
+            int(getattr(i, "db_seq", 0) or 0)
+            for i in batch.items
+            if int(getattr(i, "db_seq", 0) or 0) > 0
+        }
+        batch_mids = {str(i.msg_id) for i in batch.items if str(i.msg_id or "").strip()}
+        prev_history = [
+            r
+            for r in raw_history
+            if (not batch_seqs or int(r.get("seq") or 0) not in batch_seqs)
+            and (not r.get("msg_id") or str(r.get("msg_id")) not in batch_mids)
+        ][-self.context.history_limit:]
         self._persist_batch_items(batch)
 
         # 3) 重复文本消息 30 秒内防重（按点名与引用上下文隔离，静默/过滤/报错时回滚）

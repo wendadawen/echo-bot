@@ -85,8 +85,8 @@ class MemoryConsolidator:
         self._repo = repo
         self._llm = llm
         self._summary_interval = float(summary_interval)
-        self._summary_lock = threading.Lock()
         self._threads_lock = threading.Lock()
+        self._active_groups: set[str] = set()
         self._threads: set[threading.Thread] = set()
         self._last_attempt: dict[str, float] = {}
 
@@ -125,36 +125,43 @@ class MemoryConsolidator:
 
     def maybe_summarize(self, group_id: str, llm=None) -> None:
         active_llm = llm or self._llm
+        gid = str(group_id)
         now = time.time()
-        last = max(self._repo.last_episode_at(group_id), self._last_attempt.get(group_id, 0.0))
-        if last and now - last < self._summary_interval:
-            return
-        transcript, max_ts = self._collect_transcript(group_id)
+        last_ep = self._repo.last_episode_at(gid)
+        with self._threads_lock:
+            if gid in self._active_groups:
+                return
+            last = max(last_ep, self._last_attempt.get(gid, 0.0))
+            if last and now - last < self._summary_interval:
+                return
+            self._active_groups.add(gid)
+
+        transcript, max_ts = self._collect_transcript(gid)
         if not transcript:
+            with self._threads_lock:
+                self._active_groups.discard(gid)
             return
-        if not self._summary_lock.acquire(blocking=False):
-            return
-        self._last_attempt[group_id] = now
 
         def _work() -> None:
             th = threading.current_thread()
             try:
-                self.summarize_sync(group_id, transcript, episode_ts=max_ts or None, llm=active_llm)
+                self.summarize_sync(gid, transcript, episode_ts=max_ts or None, llm=active_llm)
             finally:
                 with self._threads_lock:
+                    self._active_groups.discard(gid)
                     self._threads.discard(th)
-                self._summary_lock.release()
 
         th = threading.Thread(target=_work, name="echo-summary", daemon=True)
         with self._threads_lock:
+            self._last_attempt[gid] = now
             self._threads = {t for t in self._threads if t.is_alive()}
             self._threads.add(th)
         try:
             th.start()
         except Exception:
             with self._threads_lock:
+                self._active_groups.discard(gid)
                 self._threads.discard(th)
-            self._summary_lock.release()
 
     def summarize_sync(
         self,

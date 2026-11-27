@@ -70,7 +70,7 @@ class Echo(Star):
 
         # 1) Unified SQLite + lossless migration + fail-closed emoji store
         self.repo = Repository(str(directory / "echo.sqlite3"))
-        self.emoji_store = EmojiStore(directory / "emojis")
+        self.emoji_store = EmojiStore(directory / "emojis", repo=self.repo)
 
         # 2) Pluggable LLM & optional Search provider
         self.llm = build_llm_client(self.config)
@@ -216,6 +216,10 @@ class Echo(Star):
         except Exception:
             pass
         try:
+            self.emoji_store.close()
+        except Exception:
+            pass
+        try:
             self.repo.close()
         except Exception:
             pass
@@ -284,9 +288,12 @@ class Echo(Star):
                 parsed.group_id, non_stickers, now=parsed.ts, sender_id=parsed.user_id
             )
 
-        # 未被 @ 的纯图片/表情只落历史与人类轮次轨迹，不吵群；若包含正文或被 @ 则进调度队列
+        # 未被 @ 的纯图片/表情只落人物活跃轨迹，不吵群；若包含正文或被 @ 则入口即时落库并进调度队列
         if not parsed.text and not parsed.mentioned:
             self.scheduler.observe_human(parsed.group_id, parsed.user_id, now=parsed.ts)
+            await asyncio.to_thread(
+                self.repo.observe_person, parsed.group_id, parsed.user_id, parsed.user_name, parsed.ts
+            )
             event.stop_event()
             return
         if parsed.bare_face and not parsed.mentioned and parsed.has_image:
@@ -306,6 +313,26 @@ class Echo(Star):
             )
             event.stop_event()
             return
+
+        if not parsed.persisted:
+            await asyncio.to_thread(
+                self.repo.observe_person, parsed.group_id, parsed.user_id, parsed.user_name, parsed.ts
+            )
+            clean_txt = str(parsed.text or "").strip()
+            if clean_txt:
+                seq = await asyncio.to_thread(
+                    self.repo.add_message,
+                    parsed.group_id,
+                    parsed.user_id,
+                    parsed.user_name,
+                    "user",
+                    clean_txt,
+                    parsed.ts,
+                    parsed.msg_id,
+                )
+                parsed = replace(parsed, persisted=True, db_seq=seq)
+            else:
+                parsed = replace(parsed, persisted=True)
 
         self.scheduler.enqueue(parsed)
         event.stop_event()

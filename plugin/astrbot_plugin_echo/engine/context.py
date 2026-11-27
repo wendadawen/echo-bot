@@ -316,18 +316,28 @@ class ContextAssembler:
             if p_sum:
                 bg_lines.append("关于{}：{}".format(format_speaker_message(user_name, "").strip(), p_sum))
 
-        # 若句中提到群内熟人名，自动补上对方画像
-        for cand_word in set(clean_speaker_name(body_text).split()):
-            if len(cand_word) < 2 or cand_word in ("大肥鱼", "回声"):
-                continue
-            resolved_uid = self._repo.resolve_person(gid, cand_word)
-            if resolved_uid and resolved_uid not in seen_uids:
-                seen_uids.add(resolved_uid)
-                p_sum = self._repo.person_summary(gid, resolved_uid)
-                if p_sum:
-                    bg_lines.append("提及成员「{}」档案：{}".format(cand_word, p_sum))
-                if len(seen_uids) >= 3:
-                    break
+        # 若句中提到群内熟人名（支持中文无空格子串与英文词边界），自动补上对方画像
+        find_fn = getattr(self._repo, "find_mentioned_persons", None)
+        if callable(find_fn):
+            rem = max(0, 3 - len(seen_uids))
+            if rem > 0:
+                for resolved_uid, matched_alias in find_fn(gid, body_text, exclude_uids=seen_uids, limit=rem):
+                    seen_uids.add(resolved_uid)
+                    p_sum = self._repo.person_summary(gid, resolved_uid)
+                    if p_sum:
+                        bg_lines.append("提及成员「{}」档案：{}".format(matched_alias, p_sum))
+        else:
+            for cand_word in set(clean_speaker_name(body_text).split()):
+                if len(cand_word) < 2 or cand_word in ("大肥鱼", "回声"):
+                    continue
+                resolved_uid = self._repo.resolve_person(gid, cand_word)
+                if resolved_uid and resolved_uid not in seen_uids:
+                    seen_uids.add(resolved_uid)
+                    p_sum = self._repo.person_summary(gid, resolved_uid)
+                    if p_sum:
+                        bg_lines.append("提及成员「{}」档案：{}".format(cand_word, p_sum))
+                    if len(seen_uids) >= 3:
+                        break
 
         sections = [self.persona, BEHAVIOR_RULES, "\n".join(signals)]
         if bg_lines:

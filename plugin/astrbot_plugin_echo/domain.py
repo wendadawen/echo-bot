@@ -338,6 +338,8 @@ class ChatEvent:
     bare_face: bool = False
     passthrough: bool = False
     is_poke: bool = False
+    persisted: bool = False
+    db_seq: int = 0
 
 
 @dataclass
@@ -598,7 +600,9 @@ class EmojiStorePort(Protocol):
 
     def has_entries(self, group_id: str) -> bool: ...
 
-    def cleanup(self, max_age_days: Optional[int] = None) -> None: ...
+    def cleanup(self, max_age_days: Optional[int] = None, now: Optional[float] = None) -> None: ...
+
+    def close(self) -> None: ...
 
 
 @runtime_checkable
@@ -670,6 +674,17 @@ class MemoryRepository(Protocol):
     def person_summary(self, group_id: str, user_id: str) -> str: ...
 
     def person_aliases(self, group_id: str, user_id: str) -> list[str]: ...
+
+    def person_facts(self, group_id: str, user_id: str, field: Optional[str] = None) -> list[dict[str, Any]]: ...
+
+    def find_mentioned_persons(
+        self,
+        group_id: str,
+        text: str,
+        *,
+        exclude_uids: Sequence[str] = (),
+        limit: int = 2,
+    ) -> list[tuple[str, str]]: ...
 
     def get_conv_state(
         self,

@@ -338,6 +338,32 @@ class ContextTests(unittest.TestCase):
         self.assertNotIn("滚动状态：", stale_sys)
         repo.close()
 
+    def test_wave2_chinese_substring_person_profile_injection(self):
+        repo = Repository(":memory:")
+        try:
+            repo.observe_person("g1", "10001", "阿明", now=100.0)
+            repo.upsert_person("g1", "10001", now=110.0, traits="量子计算博士", preferences="热美式")
+            ctx = ContextAssembler(repo)
+            batch = Batch(
+                "g1",
+                [
+                    ChatEvent(
+                        "g1",
+                        "10002",
+                        "小和",
+                        text="@大肥鱼 阿明今天去苏州实验室吗",
+                        msg_id="m_sub_1",
+                        ts=200.0,
+                        mentioned=True,
+                    )
+                ],
+            )
+            system, _, _, _ = ctx.build(batch, [], now=200.0)
+            self.assertIn("提及成员「阿明」档案", system)
+            self.assertIn("量子计算博士", system)
+        finally:
+            repo.close()
+
 
 class EchoAgentTests(unittest.TestCase):
     def test_tool_visibility_gates_and_task_dispatch(self):

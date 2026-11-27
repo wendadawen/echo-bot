@@ -1,8 +1,10 @@
 """store 层测试：统一 SQLite 仓库、FTS5/双字群记忆、表情包筛选与 v1 迁移。"""
 
+import shutil
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -176,6 +178,117 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual(stats["errors"], 1)
         self.assertEqual(stats["tokens"], 100)
 
+    def test_wave2_schema_version_trigram_pure_read_and_person_facts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # 1) user_version == 2 + FTS5 trigram + idempotent add_message + pure-read recall
+            db_path = root / "wave2.sqlite3"
+            repo = Repository(db_path)
+            try:
+                ver = int(repo._db.execute("PRAGMA user_version").fetchone()[0])
+                self.assertEqual(ver, 2)
+                if sqlite3.sqlite_version_info >= (3, 34, 0):
+                    self.assertTrue(repo._fts_trigram)
+
+                s1 = repo.add_message("g1", "10001", "阿明", "user", "你好大肥鱼", ts=100.0, msg_id="dup_mid")
+                s2 = repo.add_message("g1", "10001", "阿明", "user", "你好大肥鱼", ts=100.0, msg_id="dup_mid")
+                self.assertGreater(s1, 0)
+                self.assertEqual(s1, s2)
+                self.assertEqual(repo.stats("g1")["messages"], 1)
+
+                repo.add_memory("g1", "event", "小和正在苏州实验室调试量子芯片", now=1000.0)
+                repo.add_memory("g1", "relation", "大明和小和是同门师兄弟", now=1000.0)
+                if repo._fts_trigram:
+                    self.assertTrue(repo._fts_hits("g1", "苏州实验室", 5))
+                self.assertTrue(any("苏州" in h for h in repo.recall_memories("g1", "苏州", limit=5, now=1010.0)))
+                self.assertTrue(any("同门师兄弟" in h for h in repo.recall_memories("g1", "小和 同门", limit=5, now=1010.0)))
+
+                before = repo._db.execute(
+                    "SELECT weight, last_hit FROM memories WHERE group_id='g1' AND content LIKE '%苏州实验室%'"
+                ).fetchone()
+                for t_read in (2000.0, 2100.0, 2200.0):
+                    hits = repo.recall_memories("g1", "苏州实验室", limit=5, now=t_read)
+                    self.assertTrue(any("苏州实验室" in h for h in hits))
+                after = repo._db.execute(
+                    "SELECT weight, last_hit FROM memories WHERE group_id='g1' AND content LIKE '%苏州实验室%'"
+                ).fetchone()
+                self.assertEqual(tuple(before), tuple(after))
+
+                # 2) WAL 文件库并发读不阻塞写
+                errs = []
+                def _writer():
+                    try:
+                        for i in range(25):
+                            repo.add_message("g_conc", "200", "甲", "user", f"w{i}", ts=3000.0 + i, msg_id=f"w{i}")
+                    except Exception as exc:
+                        errs.append(exc)
+                def _reader():
+                    try:
+                        for _ in range(25):
+                            repo.recent_messages("g_conc", limit=5)
+                            repo.recall_memories("g1", "苏州实验室", limit=3, now=3100.0)
+                    except Exception as exc:
+                        errs.append(exc)
+                threads = [threading.Thread(target=_writer), threading.Thread(target=_reader), threading.Thread(target=_reader)]
+                for th in threads:
+                    th.start()
+                for th in threads:
+                    th.join(timeout=5.0)
+                self.assertEqual(errs, [])
+
+                # 3) 结构化 person_facts + 中英子串/词边界匹配
+                repo.observe_person("g1", "10001", "阿明", now=100.0)
+                repo.observe_person("g1", "10002", "al", now=100.0)
+                repo.upsert_person("g1", "10001", now=200.0, traits="早起；极客；写Python")
+                repo.upsert_person("g1", "10001", now=210.0, traits="早起喜欢看书")
+                facts = repo.person_facts("g1", "10001", field="traits")
+                fact_texts = [f["fact"] for f in facts]
+                self.assertIn("早起喜欢看书", fact_texts)
+                matched = [f for f in facts if f["fact"] == "早起喜欢看书"][0]
+                self.assertEqual(matched["hits"], 2)
+                self.assertIn("早起喜欢看书", repo.person_summary("g1", "10001"))
+
+                self.assertEqual(repo.find_mentioned_persons("g1", "阿明今天去实验室了吗"), [("10001", "阿明")])
+                self.assertEqual(repo.find_mentioned_persons("g1", "already done"), [])
+                self.assertEqual(repo.find_mentioned_persons("g1", "hey al look"), [("10002", "al")])
+            finally:
+                repo.close()
+
+            # 4) 二次打开不会重建已存在的 v2 FTS，且 legacy v1 含重复 msg_id 与旧 persons 可无损升到 v2
+            v1_db = root / "v1_upgrade.sqlite3"
+            with sqlite3.connect(v1_db) as c:
+                c.executescript(
+                    """
+                    PRAGMA user_version = 1;
+                    CREATE TABLE schema_meta (k TEXT PRIMARY KEY, v TEXT NOT NULL DEFAULT '');
+                    CREATE TABLE messages (
+                        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                        group_id TEXT NOT NULL, user_id TEXT NOT NULL, user_name TEXT NOT NULL,
+                        role TEXT NOT NULL, text TEXT NOT NULL, ts REAL NOT NULL,
+                        msg_id TEXT NOT NULL DEFAULT '', meta TEXT NOT NULL DEFAULT ''
+                    );
+                    INSERT INTO messages VALUES (1, 'g1', '10', '甲', 'user', '第一条', 100.0, 'dup', '');
+                    INSERT INTO messages VALUES (2, 'g1', '10', '甲', 'user', '重复条', 101.0, 'dup', '');
+                    CREATE TABLE episodes (id INTEGER PRIMARY KEY AUTOINCREMENT, group_id TEXT NOT NULL, text TEXT NOT NULL, created_at REAL NOT NULL, source TEXT NOT NULL DEFAULT '', external_id TEXT NOT NULL DEFAULT '', state TEXT NOT NULL DEFAULT 'ready');
+                    CREATE TABLE memories (id INTEGER PRIMARY KEY AUTOINCREMENT, group_id TEXT NOT NULL, category TEXT NOT NULL, content TEXT NOT NULL, weight REAL NOT NULL DEFAULT 1.0, last_hit REAL NOT NULL, state TEXT NOT NULL DEFAULT 'active', protected INTEGER NOT NULL DEFAULT 0);
+                    INSERT INTO memories VALUES (1, 'g1', 'event', '周末一起去苏州实验室', 1.0, 100.0, 'active', 0);
+                    CREATE TABLE person_aliases (group_id TEXT NOT NULL, user_id TEXT NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'nick', hits INTEGER NOT NULL DEFAULT 1, updated_at REAL NOT NULL, PRIMARY KEY (group_id, user_id, name));
+                    CREATE TABLE persons (group_id TEXT NOT NULL, user_id TEXT NOT NULL, traits TEXT NOT NULL DEFAULT '', preferences TEXT NOT NULL DEFAULT '', events TEXT NOT NULL DEFAULT '', relation TEXT NOT NULL DEFAULT '', intimacy REAL NOT NULL DEFAULT 0.5, msg_count INTEGER NOT NULL DEFAULT 0, first_seen REAL NOT NULL DEFAULT 0, last_seen REAL NOT NULL DEFAULT 0, updated_at REAL NOT NULL DEFAULT 0, PRIMARY KEY (group_id, user_id));
+                    INSERT INTO persons(group_id, user_id, traits, updated_at) VALUES ('g1', '10', '熬夜；话痨', 200.0);
+                    CREATE TABLE conv_state (group_id TEXT PRIMARY KEY, topics_json TEXT NOT NULL DEFAULT '[]', progress_json TEXT NOT NULL DEFAULT '[]', pending_json TEXT NOT NULL DEFAULT '[]', updated_at REAL NOT NULL);
+                    CREATE TABLE monitor_events (id INTEGER PRIMARY KEY AUTOINCREMENT, group_id TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL, ok INTEGER NOT NULL DEFAULT 1, latency REAL NOT NULL DEFAULT 0, tokens INTEGER NOT NULL DEFAULT 0, detail TEXT NOT NULL DEFAULT '', ts REAL NOT NULL);
+                    CREATE TABLE pending_deliveries (task_id TEXT PRIMARY KEY, group_id TEXT NOT NULL, umo TEXT NOT NULL DEFAULT '', prompt TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'failed', reason TEXT NOT NULL DEFAULT 'error', result TEXT NOT NULL DEFAULT '', partial TEXT NOT NULL DEFAULT '', files_json TEXT NOT NULL DEFAULT '[]', error TEXT NOT NULL DEFAULT '', pre_history_json TEXT NOT NULL DEFAULT '[]', created_at REAL NOT NULL);
+                    """
+                )
+            migrated = Repository(v1_db)
+            try:
+                self.assertEqual(int(migrated._db.execute("PRAGMA user_version").fetchone()[0]), 2)
+                self.assertEqual(migrated.stats("g1")["messages"], 1)
+                self.assertEqual([f["fact"] for f in migrated.person_facts("g1", "10", field="traits")], ["熬夜", "话痨"])
+                self.assertTrue(migrated.recall_memories("g1", "苏州实验室", limit=3, now=150.0))
+            finally:
+                migrated.close()
+
 
 class EmojiStoreTests(unittest.TestCase):
     def test_acceptable_and_analyze_gate(self):
@@ -241,7 +354,7 @@ class EmojiStoreTests(unittest.TestCase):
             self.assertEqual(store.collect("g1", TINY_PNG, llm), "")
             self.assertEqual(llm.describe_image.call_count, 1)
 
-            # 真表情被收录至 shared/ 并同步进入 _global 共享池，新群 g2 立即可查可用且含描述
+            # 真表情被收录至 shared/ 并同步进入共享池，新群 g2 立即可查可用且含描述
             b1 = TINY_GIF + b"1"
             b2 = TINY_GIF + b"2"
             self.assertEqual(store.collect("g1", b1, llm), "开心")
@@ -261,53 +374,163 @@ class EmojiStoreTests(unittest.TestCase):
             self.assertIn(str(Path(tmp) / "shared"), picked_g2.path)
             self.assertTrue(Path(picked_g2.path).is_file())
 
-            # 经典 QQ 小黄脸仅本群可用，不跨群进 _global；g1 同关键词命中，remove_face 可踢除失效 face_id
+            # 经典 QQ 小黄脸仅本群可用，不跨群共享；g1 同关键词命中，remove_face 可踢除失效 face_id
             self.assertEqual(store.pick("g1", "滑稽"), "face:178")
             self.assertNotEqual(store.pick("g2", "滑稽"), "face:178")
             self.assertIsInstance(store.pick("g1", "未知心情"), Path)
             self.assertTrue(store.remove_face("g1", "178"))
-            self.assertFalse(any(e.get("face_id") == "178" for e in store._index["g1"]))
+            with store._read() as conn:
+                self.assertIsNone(
+                    conn.execute("SELECT 1 FROM emoji_faces WHERE group_id='g1' AND face_id='178'").fetchone()
+                )
             self.assertNotEqual(store.pick("g1", "滑稽"), "face:178")
 
-            # 引用计数安全删除：从 g1 弹出条目时若 _global 仍引用，绝不误删 shared/ 下底层图片
+            # 引用计数安全删除：从 g1 删除群关联后 emoji_items 仍在，绝不误删 shared/ 下底层图片
             b1_path = Path(picked_g2.path)
-            store._index["g1"] = [e for e in store._index["g1"] if e.get("path") != str(b1_path)]
-            store._save()
-            store._unlink_if_unreferenced(str(b1_path))
+            rel_b1 = b1_path.relative_to(Path(tmp).resolve(strict=False)).as_posix()
+            with store._write() as conn:
+                conn.execute("DELETE FROM emoji_group_links WHERE group_id='g1'")
+            store._unlink_unreferenced([rel_b1])
             self.assertTrue(b1_path.is_file())
 
-            # 重载 _migrate_and_dedup 自动清洗历史坏 face_id、截断脏标签与 1179x2556 截屏图，并把旧群目录合法图迁移进 shared/
-            (Path(tmp) / "g1").mkdir(exist_ok=True)
-            legacy_good = Path(tmp) / "g1" / "legacy_ok.gif"
-            legacy_bytes = TINY_GIF + b"legacy_meme"
-            legacy_good.write_bytes(legacy_bytes)
-            dirty_file = Path(tmp) / "g1" / "dirty.png"
-            dirty_file.write_bytes(TINY_PNG)
-            long_shot = Path(tmp) / "g1" / "news_shot.png"
-            long_shot.write_bytes(_png_sized(1179, 2556))
-            raw_idx = _json.loads((Path(tmp) / "index.json").read_text(encoding="utf-8"))
-            raw_idx["g1"].extend([
-                {"face_id": "489", "tag": "QQ表情", "description": "QQ表情", "ts": time.time()},
-                {"path": str(dirty_file), "sha256": "deadbeef", "tag": "这是一张卡通猫的", "description": "猫", "ts": time.time()},
-                {"path": str(long_shot), "sha256": "news1179", "tag": "震惊", "description": "新闻报道正接受审查", "ts": time.time()},
-                {"path": str(legacy_good), "sha256": "", "tag": "呆萌", "description": "老群收藏小猫", "ts": time.time()},
-            ])
-            (Path(tmp) / "index.json").write_text(_json.dumps(raw_idx, ensure_ascii=False), encoding="utf-8")
-            reloaded = EmojiStore(tmp, limit=10, max_age_days=30)
-            self.assertFalse(dirty_file.exists())
-            self.assertFalse(long_shot.exists())
-            self.assertFalse(legacy_good.exists())  # 旧位置重复副本已迁移到 shared/ 后安全清理
-            self.assertIn("呆萌", reloaded.tags("g2"))
-            self.assertEqual([e for e in reloaded._index["g1"] if e.get("face_id") == "489"], [])
-
-            # 超期文件清理（全桶包括 _global 过期后彻底清空并删除共享文件）
-            for bucket in (reloaded._index.get("g1", []), reloaded._index.get(GLOBAL_POOL_KEY, [])):
-                for entry in bucket:
-                    entry["ts"] = time.time() - 40 * 86400
-            reloaded.cleanup(max_age_days=30)
-            self.assertFalse(reloaded.has_entries("g1"))
-            self.assertFalse(reloaded.has_entries("g2"))
+            # 超期文件清理（全池过期后彻底清空并删除共享文件）
+            store.cleanup(max_age_days=30, now=time.time() + 40 * 86400)
+            self.assertFalse(store.has_entries("g1"))
+            self.assertFalse(store.has_entries("g2"))
             self.assertFalse(b1_path.exists())
+            store.close()
+
+            # 旧版 index.json 无损迁移 + 自动清洗坏 face_id / 截屏图并迁移老路径进 shared/，重命名 *.migrated
+            legacy_dir = Path(tmp) / "legacy_mig"
+            (legacy_dir / "g1").mkdir(parents=True)
+            legacy_good = legacy_dir / "g1" / "legacy_ok.gif"
+            legacy_good.write_bytes(TINY_GIF + b"legacy_meme")
+            dirty_file = legacy_dir / "g1" / "dirty.png"
+            dirty_file.write_bytes(TINY_PNG)
+            long_shot = legacy_dir / "g1" / "news_shot.png"
+            long_shot.write_bytes(_png_sized(1179, 2556))
+            raw_idx = {
+                "g1": [
+                    {"face_id": "489", "tag": "QQ表情", "description": "QQ表情", "ts": time.time()},
+                    {"path": str(dirty_file), "sha256": "deadbeef", "tag": "这是一张卡通猫的", "description": "猫", "ts": time.time()},
+                    {"path": str(long_shot), "sha256": "news1179", "tag": "震惊", "description": "新闻报道正接受审查", "ts": time.time()},
+                    {"path": str(legacy_good), "sha256": "", "tag": "呆萌", "description": "老群收藏小猫", "ts": time.time()},
+                ]
+            }
+            (legacy_dir / "index.json").write_text(_json.dumps(raw_idx, ensure_ascii=False), encoding="utf-8")
+            reloaded = EmojiStore(legacy_dir, limit=10, max_age_days=30)
+            try:
+                self.assertFalse(dirty_file.exists())
+                self.assertFalse(long_shot.exists())
+                self.assertFalse(legacy_good.exists())
+                self.assertTrue((legacy_dir / "index.json.migrated").is_file())
+                self.assertIn("呆萌", reloaded.tags("g2"))
+                with reloaded._read() as conn:
+                    self.assertIsNone(
+                        conn.execute("SELECT 1 FROM emoji_faces WHERE group_id='g1' AND face_id='489'").fetchone()
+                    )
+            finally:
+                reloaded.close()
+
+    def test_wave2_sqlite_shared_relocatable_singleflight_and_weighted_pick(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # 1) 共享 Repository 模式：无 index.json / emoji_meta.sqlite3，且存储相对 shared/ 路径
+            repo = Repository(root / "echo.sqlite3")
+            shared_dir = root / "emojis"
+            store = EmojiStore(shared_dir, limit=10, max_age_days=30, repo=repo)
+            llm = MagicMock()
+            llm.describe_image.return_value = '{"kind":"sticker","usable":true,"tag":"偷笑","desc":"小猫偷笑"}'
+            b1 = _png_sized(120, 120) + b"a"
+            self.assertEqual(store.collect("g1", b1, llm), "偷笑")
+            self.assertFalse((shared_dir / "index.json").exists())
+            self.assertFalse((shared_dir / "emoji_meta.sqlite3").exists())
+            with repo.read_conn() as conn:
+                rel_row = conn.execute("SELECT rel_path FROM emoji_items").fetchone()
+            self.assertIsNotNone(rel_row)
+            self.assertTrue(str(rel_row["rel_path"]).startswith("shared/"))
+            store.close()
+            repo.close()
+
+            # 2) 目录整体迁移（relocation）：拷贝独立目录到新路径仍可用且解析在新目录内
+            orig_dir = root / "emojis_orig"
+            moved_dir = root / "emojis_moved"
+            s_orig = EmojiStore(orig_dir, limit=10)
+            llm2 = MagicMock()
+            llm2.describe_image.return_value = "点赞|熊猫头点赞"
+            b_move = _png_sized(140, 140) + b"move"
+            self.assertEqual(s_orig.collect("g1", b_move, llm2), "点赞")
+            s_orig.close()
+            shutil.copytree(orig_dir, moved_dir)
+            s_moved = EmojiStore(moved_dir, limit=10)
+            try:
+                picked = s_moved.pick_entry("g1", "点赞")
+                self.assertIsNotNone(picked)
+                self.assertTrue(Path(picked.path).is_file())
+                self.assertIn(str(moved_dir.resolve(strict=False)), str(Path(picked.path).resolve(strict=False)))
+            finally:
+                s_moved.close()
+
+            # 3) Singleflight 并发收录同一张图：VLM 仅调 1 次，且双群同时获得标签并入库
+            sf_dir = root / "emojis_sf"
+            s_sf = EmojiStore(sf_dir, limit=10)
+            call_count = 0
+            barrier = threading.Barrier(2)
+
+            class _SlowLLM:
+                def describe_image(self, image_bytes, prompt, timeout=None):
+                    nonlocal call_count
+                    call_count += 1
+                    time.sleep(0.15)
+                    return "摸鱼|小猫摸鱼"
+
+            b_sf = _png_sized(160, 160) + b"sf"
+            res_map = {}
+
+            def _worker(gid):
+                barrier.wait(timeout=3.0)
+                res_map[gid] = s_sf.collect(gid, b_sf, _SlowLLM())
+
+            t1 = threading.Thread(target=_worker, args=("g1",))
+            t2 = threading.Thread(target=_worker, args=("g2",))
+            t1.start()
+            t2.start()
+            t1.join(timeout=5.0)
+            t2.join(timeout=5.0)
+            self.assertEqual(call_count, 1)
+            self.assertEqual(res_map, {"g1": "摸鱼", "g2": "摸鱼"})
+            self.assertEqual(s_sf.stats("g1")["g1"], 1)
+            self.assertEqual(s_sf.stats("g2")["g2"], 1)
+            s_sf.close()
+
+            # 4) 加权挑选与使用计数记录：3 张图排除连发锁定，低频/非刚用图权重显著高于高频图并更新 use_count / last_used_at
+            w_dir = root / "emojis_weighted"
+            s_w = EmojiStore(w_dir, limit=10)
+            llm_w = MagicMock()
+            llm_w.describe_image.side_effect = ["开心|开心猫1", "开心|开心猫2", "开心|开心猫3"]
+            b_heavy = _png_sized(150, 150) + b"heavy"
+            b_fresh = _png_sized(150, 150) + b"fresh"
+            b_fresh2 = _png_sized(150, 150) + b"fresh2"
+            self.assertEqual(s_w.collect("g1", b_heavy, llm_w), "开心")
+            self.assertEqual(s_w.collect("g1", b_fresh, llm_w), "开心")
+            self.assertEqual(s_w.collect("g1", b_fresh2, llm_w), "开心")
+            import hashlib as _hashlib
+            h_heavy = _hashlib.sha256(b_heavy).hexdigest()
+            h_fresh = _hashlib.sha256(b_fresh).hexdigest()
+            with s_w._write() as conn:
+                conn.execute(
+                    "UPDATE emoji_items SET use_count = 80, last_used_at = ? WHERE sha256 = ?",
+                    (time.time(), h_heavy),
+                )
+            picked_paths = [Path(s_w.pick_entry("g1", "开心").path).name for _ in range(30)]
+            heavy_hits = sum(1 for p in picked_paths if h_heavy[:16] in p)
+            fresh_hits = 30 - heavy_hits
+            self.assertGreater(fresh_hits, heavy_hits * 2)
+            with s_w._read() as conn:
+                row_f = conn.execute("SELECT use_count, last_used_at FROM emoji_items WHERE sha256 = ?", (h_fresh,)).fetchone()
+            self.assertGreater(int(row_f["use_count"]), 0)
+            self.assertGreater(float(row_f["last_used_at"]), 0.0)
+            s_w.close()
 
 
 class LegacyMigrationTests(unittest.TestCase):

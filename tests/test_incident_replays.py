@@ -422,6 +422,37 @@ class IncidentReplayTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_11_ingress_logging_dedup_and_no_prompt_duplication(self):
+        async def scenario():
+            with tempfile.TemporaryDirectory() as tmp:
+                from astrbot_plugin_echo.domain import ModelTurn
+                spy = _SpyLLM([ModelTurn(text="收到啦")])
+                echo, _ = self._build_echo(Path(tmp), spy)
+                ev = _make_event(
+                    [_At(qq="8888"), _Plain("你好大肥鱼")],
+                    text="你好大肥鱼",
+                    raw_msg={"message_id": "m_ing_1", "message": []},
+                )
+                await _drive_event(echo, ev)
+
+                # 未到防抖期时，入口已将消息持久化进 SQLite
+                ingested = echo.repo.recent_messages("aiocqhttp:10086", limit=10)
+                self.assertEqual(len(ingested), 1)
+                self.assertEqual(ingested[0]["msg_id"], "m_ing_1")
+                self.assertIn("你好大肥鱼", ingested[0]["text"])
+
+                due = echo.scheduler.due(now=9e9)
+                self.assertEqual(len(due), 1)
+                await echo._process_batch(due[0])
+
+                # 处理完成后同一 msg_id 不重复落库，且 LLM 上下文中当前发言仅出现 1 次
+                after_rows = echo.repo.recent_messages("aiocqhttp:10086", limit=10)
+                self.assertEqual(sum(1 for r in after_rows if r.get("msg_id") == "m_ing_1"), 1)
+                non_sys = [str(m.content or "") for m in spy.chat_calls[0]["messages"] if m.role != "system"]
+                self.assertEqual(sum(1 for c in non_sys if "你好大肥鱼" in c), 1)
+
+        asyncio.run(scenario())
+
 
 if __name__ == "__main__":
     unittest.main()
