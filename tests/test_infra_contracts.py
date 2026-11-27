@@ -138,6 +138,42 @@ class InfraContractTests(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
+    def test_wave3_vertical_module_boundaries_and_facade_exports(self):
+        from astrbot_plugin_echo import domain, text_media
+        from astrbot_plugin_echo.adapters import astrbot, qq_protocol, sender
+        from astrbot_plugin_echo.engine import agent, tools
+        from astrbot_plugin_echo.store import (
+            cache_cleanup,
+            emoji_classifier,
+            emoji_store,
+            memory_store,
+            person_store,
+            repository,
+            schema,
+        )
+        from astrbot_plugin_echo.workers import manager, presenter
+
+        self.assertIs(domain.FACE_LABELS, text_media.FACE_LABELS)
+        self.assertIs(domain.detect_image_dimensions, text_media.detect_image_dimensions)
+        self.assertIs(repository.cleanup_runtime_caches, cache_cleanup.cleanup_runtime_caches)
+        self.assertEqual(repository.SCHEMA_VERSION, schema.SCHEMA_VERSION)
+        self.assertIs(repository.query_terms, memory_store.query_terms)
+        self.assertIs(repository._merge_field, person_store._merge_field)
+        self.assertIs(emoji_store.acceptable, emoji_classifier.acceptable)
+        self.assertIs(emoji_store.analyze_emoji, emoji_classifier.analyze_emoji)
+        self.assertIs(astrbot.AstrBotSender, sender.AstrBotSender)
+        self.assertIs(astrbot.MessageLimiter, sender.MessageLimiter)
+        self.assertIs(astrbot.is_public_http_url, qq_protocol.is_public_http_url)
+        self.assertIs(agent._format_emoji_meta, tools.format_emoji_meta)
+        self.assertIs(manager._split_code_blocks, presenter._split_code_blocks)
+
+        pkg = PLUGIN_ROOT / "astrbot_plugin_echo"
+        self.assertLess(len((pkg / "domain.py").read_text(encoding="utf-8").splitlines()), 550)
+        self.assertLess(len((pkg / "store" / "repository.py").read_text(encoding="utf-8").splitlines()), 450)
+        self.assertLess(len((pkg / "adapters" / "astrbot.py").read_text(encoding="utf-8").splitlines()), 550)
+        self.assertLess(len((pkg / "workers" / "manager.py").read_text(encoding="utf-8").splitlines()), 350)
+        self.assertLess(len((pkg / "engine" / "agent.py").read_text(encoding="utf-8").splitlines()), 550)
+
 
 if __name__ == "__main__":
     unittest.main()
