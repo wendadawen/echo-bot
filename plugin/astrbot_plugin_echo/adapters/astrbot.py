@@ -16,13 +16,14 @@ import hashlib
 import ipaddress
 import re
 import socket
+import struct
 import time
 import types
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 
 from ..domain import (
     ChatEvent,
@@ -147,16 +148,12 @@ def is_public_http_url(url: str) -> bool:
     for info in infos:
         try:
             ip_obj = ipaddress.ip_address(info[4][0])
+            mapped = getattr(ip_obj, "ipv4_mapped", None)
+            if mapped is not None:
+                ip_obj = mapped
         except ValueError:
             return False
-        if (
-            ip_obj.is_private
-            or ip_obj.is_loopback
-            or ip_obj.is_link_local
-            or ip_obj.is_multicast
-            or ip_obj.is_reserved
-            or ip_obj.is_unspecified
-        ):
+        if not ip_obj.is_global:
             return False
     return True
 
@@ -166,8 +163,13 @@ def looks_like_image(data: bytes) -> bool:
         return False
     if data.startswith(b"\x89PNG\r\n\x1a\n") or data.startswith(b"\xff\xd8\xff"):
         return True
-    if data.startswith((b"GIF87a", b"GIF89a")) or data.startswith(b"BM"):
+    if data.startswith((b"GIF87a", b"GIF89a")):
         return True
+    if data.startswith(b"BM"):
+        if len(data) < 26:
+            return False
+        dib_size = struct.unpack("<I", data[14:18])[0]
+        return dib_size in (12, 40, 52, 56, 108, 124)
     if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
         return True
     return False
@@ -282,7 +284,7 @@ class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
 def _download_public_bytes(url: str) -> bytes:
     if not is_public_http_url(url):
         return b""
-    opener = urllib.request.build_opener(_SafeRedirectHandler())
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _SafeRedirectHandler())
     request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://qq.com/"})
     with opener.open(request, timeout=15) as resp:
         data = resp.read(MAX_DOWNLOAD_BYTES + 1)
@@ -292,9 +294,12 @@ def _download_public_bytes(url: str) -> bytes:
 def _get_attr_or_key(node: Any, *names: str, default: Any = None) -> Any:
     for name in names:
         if isinstance(node, dict) and name in node:
-            return node[name]
+            val = node[name]
+            if val is not None and val != "" and val != []:
+                return val
+            continue
         val = getattr(node, name, None)
-        if val is not None:
+        if val is not None and val != "" and val != []:
             return val
     return default
 
@@ -386,24 +391,50 @@ class MessageLimiter:
     """滑动窗口发送限流：每群每分钟最多 per_minute 条，避免刷屏。"""
 
     def __init__(self, per_minute: int = 8):
-        self.per_minute = per_minute
+        self.per_minute = max(0, int(per_minute))
         self._sent: dict[str, list[float]] = {}
 
     def _trim(self, group_id: str, now: float) -> list[float]:
-        rows = [ts for ts in self._sent.get(str(group_id), []) if now - ts < 60.0]
-        self._sent[str(group_id)] = rows
+        gid = str(group_id)
+        old = self._sent.get(gid)
+        if not old:
+            return []
+        rows = [ts for ts in old if now - ts < 60.0]
+        if rows:
+            self._sent[gid] = rows
+        else:
+            self._sent.pop(gid, None)
         return rows
 
     def allow(self, group_id: str, count: int = 1, now: Optional[float] = None) -> bool:
-        cur = time.time() if now is None else now
+        cur = time.monotonic() if now is None else float(now)
         return len(self._trim(group_id, cur)) + count <= self.per_minute
 
     def record(self, group_id: str, count: int = 1, now: Optional[float] = None) -> int:
-        cur = time.time() if now is None else now
+        cur = time.monotonic() if now is None else float(now)
+        if self.per_minute <= 0:
+            self._sent.pop(str(group_id), None)
+            return 0
         rows = self._trim(group_id, cur)
         rows.extend([cur] * max(0, int(count)))
+        kept = rows[-self.per_minute:]
+        if kept:
+            self._sent[str(group_id)] = kept
+        else:
+            self._sent.pop(str(group_id), None)
+        return len(kept)
+
+    def try_acquire(self, group_id: str, count: int = 1, now: Optional[float] = None) -> bool:
+        """原子校验并预占发送额度，防止并发协程下的 check-then-act 穿透。"""
+        cur = time.monotonic() if now is None else float(now)
+        if self.per_minute <= 0 or count <= 0:
+            return False
+        rows = self._trim(group_id, cur)
+        if len(rows) + int(count) > self.per_minute:
+            return False
+        rows.extend([cur] * int(count))
         self._sent[str(group_id)] = rows[-self.per_minute:]
-        return len(rows)
+        return True
 
 
 class AstrBotInboundParser:
@@ -413,10 +444,42 @@ class AstrBotInboundParser:
         self,
         comp_types: dict[str, Any],
         downloader: Optional[Callable[[str], bytes]] = None,
+        allowed_local_roots: Sequence[str | Path] = (),
     ):
         self._comp = comp_types
         self._download = downloader or _download_public_bytes
         self._download_sem: Optional[asyncio.Semaphore] = None
+        self._allowed_roots: tuple[Path, ...] = tuple(
+            Path(r).resolve(strict=False) for r in (allowed_local_roots or ()) if str(r or "").strip()
+        )
+
+    def _is_safe_local_file(self, raw_path: str) -> Optional[Path]:
+        """fail-closed 本地图片路径校验：必须在显式白名单目录内且路径链条无任何符号链接。"""
+        if not raw_path or not self._allowed_roots:
+            return None
+        try:
+            p = Path(raw_path)
+            resolved = p.resolve(strict=True)
+        except OSError:
+            return None
+        if not resolved.is_file():
+            return None
+        for root in self._allowed_roots:
+            if root in resolved.parents:
+                cur = p
+                while True:
+                    if cur.is_symlink():
+                        return None
+                    try:
+                        if cur.resolve(strict=False) == root:
+                            return resolved
+                    except OSError:
+                        return None
+                    parent = cur.parent
+                    if parent == cur:
+                        break
+                    cur = parent
+        return None
 
     @staticmethod
     def _extract_raw_text(event: Any, parts: list[Any], plain_cls: Any) -> str:
@@ -488,7 +551,7 @@ class AstrBotInboundParser:
         if self._download_sem is None:
             self._download_sem = asyncio.Semaphore(4)
         async with self._download_sem:
-            for remote_url in (url, file_ref):
+            for remote_url in dict.fromkeys((url, file_ref)):
                 if not data and remote_url.startswith(("http://", "https://")):
                     try:
                         data = await asyncio.to_thread(self._download, remote_url)
@@ -511,10 +574,12 @@ class AstrBotInboundParser:
                 elif file_ref and not file_ref.startswith(("http://", "https://", "base64://")):
                     candidates.append(file_ref)
                 for lp in candidates:
+                    safe_local = self._is_safe_local_file(lp)
+                    if safe_local is None:
+                        continue
                     try:
-                        p = Path(lp)
-                        if not p.is_symlink() and p.is_file() and p.stat().st_size <= MAX_DOWNLOAD_BYTES:
-                            data = await asyncio.to_thread(p.read_bytes)
+                        if safe_local.stat().st_size <= MAX_DOWNLOAD_BYTES:
+                            data = await asyncio.to_thread(safe_local.read_bytes)
                             if data:
                                 break
                     except OSError:
@@ -614,24 +679,22 @@ class AstrBotInboundParser:
         if not mentioned and text.startswith(("/", "／")):
             mentioned = bool(getattr(event, "is_at_or_wake_command", lambda: False)())
 
-        # 合并转发解包
+        # 合并转发解包（支持夹带 @/正文的合并转发与多层回查）
         fwd_chunks = []
+        bot = getattr(event, "bot", None)
         for comp in parts:
             if looks_like_forward(comp):
                 rendered = unpack_forward(comp)
+                if not rendered:
+                    fid = getattr(comp, "id", None)
+                    if bot and fid and hasattr(bot, "call_action"):
+                        try:
+                            raw_fwd = await asyncio.wait_for(bot.call_action("get_forward_msg", id=fid), timeout=5.0)
+                            rendered = unpack_forward(raw_fwd)
+                        except Exception:
+                            rendered = ""
                 if rendered:
                     fwd_chunks.append(rendered)
-        if not fwd_chunks and len(parts) <= 1 and "forward" in type(parts[0]).__name__.lower() if parts else False:
-            bot = getattr(event, "bot", None)
-            fid = getattr(parts[0], "id", None)
-            if bot and fid and hasattr(bot, "call_action"):
-                try:
-                    raw_fwd = await asyncio.wait_for(bot.call_action("get_forward_msg", id=fid), timeout=5.0)
-                    rendered = unpack_forward(raw_fwd)
-                    if rendered:
-                        fwd_chunks.append(rendered)
-                except Exception:
-                    pass
         forward_text = " ".join(fwd_chunks).strip()
 
         # 含链接且未 @，或直通媒体卡片：交还后续插件放行
@@ -651,12 +714,13 @@ class AstrBotInboundParser:
         mface_tags: list[str] = []
         quote_extra_tags: list[str] = []
         img_jobs: list[tuple[Any, Optional[dict[str, Any]], bool]] = []
+        reply_parts: list[Any] = []
         raw_metas = raw_image_metas(raw_msg)
         face_texts = raw_face_texts(raw_msg)
         special_tags = raw_special_tags(raw_msg)
         img_idx = 0
-        bot = getattr(event, "bot", None)
 
+        # 优先收集当前消息自身的表情、图片与商城大表情（防止引用图抢占主消息图片配额）
         for part in parts:
             if isinstance(part, face_cls):
                 fid = str(getattr(part, "id", "") or "").strip()
@@ -674,7 +738,26 @@ class AstrBotInboundParser:
                 img_idx += 1
                 if len(img_jobs) < 2:
                     img_jobs.append((part, meta, True))
-            elif isinstance(part, reply_cls) and mentioned:
+            elif isinstance(part, reply_cls):
+                reply_parts.append(part)
+
+        if isinstance(raw_msg, dict) and isinstance(raw_msg.get("message"), list):
+            for seg in raw_msg["message"]:
+                if isinstance(seg, dict) and seg.get("type") == "mface":
+                    mdata = seg.get("data") or {}
+                    msum = str(mdata.get("summary") or "").strip().strip("[]")
+                    murl = str(mdata.get("url") or "").strip()
+                    if len(mface_tags) < 2:
+                        mface_tags.append("[商城表情:{}]".format(msum or "表情"))
+                    if murl and len(img_jobs) < 2:
+                        img_jobs.append((
+                            types.SimpleNamespace(url=murl, file="", path="", base64="", subType="1", summary=msum),
+                            {"sub_type": "1", "summary": msum or "表情"},
+                            True,
+                        ))
+
+        if mentioned:
+            for part in reply_parts:
                 found_chain_img = False
                 for qseg in getattr(part, "chain", None) or ():
                     if isinstance(qseg, img_cls):
@@ -723,23 +806,18 @@ class AstrBotInboundParser:
                                     ))
                             elif stype == "forward":
                                 fwd_q = unpack_forward(seg)
+                                if not fwd_q:
+                                    fwd_id = sdata.get("id")
+                                    if fwd_id and bot and hasattr(bot, "call_action"):
+                                        try:
+                                            raw_inner_fwd = await asyncio.wait_for(
+                                                bot.call_action("get_forward_msg", id=fwd_id), timeout=4.0
+                                            )
+                                            fwd_q = unpack_forward(raw_inner_fwd)
+                                        except Exception:
+                                            fwd_q = ""
                                 if fwd_q and fwd_q not in quote_extra_tags:
                                     quote_extra_tags.append(fwd_q)
-
-        if isinstance(raw_msg, dict) and isinstance(raw_msg.get("message"), list):
-            for seg in raw_msg["message"]:
-                if isinstance(seg, dict) and seg.get("type") == "mface":
-                    mdata = seg.get("data") or {}
-                    msum = str(mdata.get("summary") or "").strip().strip("[]")
-                    murl = str(mdata.get("url") or "").strip()
-                    if len(mface_tags) < 2:
-                        mface_tags.append("[商城表情:{}]".format(msum or "表情"))
-                    if murl and len(img_jobs) < 2:
-                        img_jobs.append((
-                            types.SimpleNamespace(url=murl, file="", path="", base64="", subType="1", summary=msum),
-                            {"sub_type": "1", "summary": msum or "表情"},
-                            True,
-                        ))
 
         media_refs: list[MediaRef] = []
         if img_jobs:
@@ -821,6 +899,9 @@ class AstrBotInboundParser:
         )
 
 
+_INVALID_FACE_ERROR_MARKERS = ("1200", "unsupported", "不支持", "invalid", "face")
+
+
 class AstrBotSender:
     """统一出口发送器：限流 + 智能引用 + 表情/文件目录牢笼 + QQ 消息贴表情。"""
 
@@ -848,6 +929,16 @@ class AstrBotSender:
         self._logger = logger
         self._on_invalid_face = on_invalid_face
 
+    @staticmethod
+    def _action_succeeded(res: Any) -> bool:
+        if isinstance(res, dict):
+            if str(res.get("status") or "").strip().lower() == "failed":
+                return False
+            retcode = res.get("retcode")
+            if retcode is not None and retcode != 0:
+                return False
+        return True
+
     async def send(self, action: OutboundAction) -> bool:
         if not action.umo:
             return False
@@ -865,7 +956,7 @@ class AstrBotSender:
 
     async def _send_text(self, action: SendText) -> bool:
         single = clean_display_text(action.text)
-        if not single or not self._limiter.allow(action.group_id):
+        if not single or not self._limiter.try_acquire(action.group_id):
             return False
         chain = []
         if action.reply_to_msg_id and "Reply" in self._comp:
@@ -881,11 +972,10 @@ class AstrBotSender:
                 await self._ctx.send_message(action.umo, self._Chain([self._comp["Plain"](single)]))
             else:
                 raise
-        self._limiter.record(action.group_id)
         return True
 
     async def _send_face(self, action: SendFace) -> bool:
-        if not action.face_id or not self._limiter.allow(action.group_id):
+        if not action.face_id or not self._limiter.try_acquire(action.group_id):
             return False
         fid = str(action.face_id).strip()
         try:
@@ -897,15 +987,16 @@ class AstrBotSender:
         try:
             await self._ctx.send_message(action.umo, self._Chain([face]))
         except Exception as exc:
+            err_low = str(exc or "").lower()
+            is_invalid = any(m in err_low for m in _INVALID_FACE_ERROR_MARKERS)
             if self._logger:
-                self._logger.warning("QQ表情发送失败（face_id=%s，将自动移除）：%s", fid, exc)
-            if callable(self._on_invalid_face):
+                self._logger.warning("QQ表情发送失败（face_id=%s，invalid=%s）：%s", fid, is_invalid, exc)
+            if is_invalid and callable(self._on_invalid_face):
                 try:
                     self._on_invalid_face(action.group_id, fid)
                 except Exception:
                     pass
             return False
-        self._limiter.record(action.group_id)
         return True
 
     def _get_bot(self, group_id: str) -> Any:
@@ -922,7 +1013,7 @@ class AstrBotSender:
         return int(raw) if raw.isdigit() else None
 
     async def _send_emoji(self, action: SendEmoji) -> bool:
-        if not action.path or not self._emoji_root or not self._limiter.allow(action.group_id):
+        if not action.path or not self._emoji_root or not self._limiter.try_acquire(action.group_id):
             return False
         try:
             root = self._emoji_root.resolve(strict=False)
@@ -940,7 +1031,7 @@ class AstrBotSender:
             try:
                 img_bytes = await asyncio.to_thread(target.read_bytes)
                 b64 = base64.b64encode(img_bytes).decode("ascii")
-                await asyncio.wait_for(
+                res = await asyncio.wait_for(
                     bot.call_action(
                         "send_group_msg",
                         group_id=raw_gid,
@@ -955,13 +1046,17 @@ class AstrBotSender:
                     ),
                     timeout=10.0,
                 )
-                self._limiter.record(action.group_id)
+                if not self._action_succeeded(res):
+                    raise RuntimeError("send_group_msg failed: {}".format(res))
                 return True
+            except asyncio.TimeoutError as exc:
+                if self._logger:
+                    self._logger.warning("sub_type=1 表情发送超时（避免重复双发）：%s", exc)
+                return False
             except Exception as exc:
                 if self._logger:
                     self._logger.warning("sub_type=1 表情发送失败，回退普通图片通道：%s", exc)
-        await self._ctx.send_message(action.umo, self._Chain([self._comp["Image"](file="file://" + str(target))]))
-        self._limiter.record(action.group_id)
+        await self._ctx.send_message(action.umo, self._Chain([self._comp["Image"](file=target.as_uri())]))
         return True
 
     async def _send_file(self, action: SendFile) -> bool:
@@ -969,26 +1064,29 @@ class AstrBotSender:
         display_name = action.name or (target.name if target else "")
         out_root = str(self._outbox_root) if self._outbox_root else ""
         try:
-            if not target or target.is_symlink() or not target.is_file():
+            if not target or not self._outbox_root or target.is_symlink() or not target.is_file():
                 return False
             resolved = target.resolve(strict=True)
-            if self._outbox_root:
-                root_resolved = self._outbox_root.resolve(strict=False)
-                if resolved == root_resolved or root_resolved not in resolved.parents:
-                    return False
+            root_resolved = self._outbox_root.resolve(strict=False)
+            if resolved == root_resolved or root_resolved not in resolved.parents:
+                return False
             await self._ctx.send_message(
                 action.umo,
                 self._Chain([self._comp["File"](name=display_name, file=str(resolved))]),
             )
             if self._repo is not None and action.group_id and display_name:
-                await asyncio.to_thread(
-                    self._repo.add_message,
-                    action.group_id,
-                    "bot",
-                    "大肥鱼",
-                    "bot",
-                    "[已发送群文件：{}]".format(display_name),
-                )
+                try:
+                    await asyncio.to_thread(
+                        self._repo.add_message,
+                        action.group_id,
+                        "bot",
+                        "大肥鱼",
+                        "bot",
+                        "[已发送群文件：{}]".format(display_name),
+                    )
+                except Exception as log_exc:
+                    if self._logger:
+                        self._logger.warning("群文件发送后落库失败（%s）：%s", display_name, log_exc)
             return True
         except Exception as exc:
             if self._logger:
@@ -1012,7 +1110,7 @@ class AstrBotSender:
         if not bot or not hasattr(bot, "call_action"):
             return False
         try:
-            await asyncio.wait_for(
+            res = await asyncio.wait_for(
                 bot.call_action(
                     "set_msg_emoji_like",
                     message_id=int(action.msg_id) if str(action.msg_id).isdigit() else action.msg_id,
@@ -1020,6 +1118,6 @@ class AstrBotSender:
                 ),
                 timeout=5.0,
             )
-            return True
+            return self._action_succeeded(res)
         except Exception:
             return False

@@ -5,7 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_ROOT = ROOT / "plugin"
@@ -42,7 +42,7 @@ from astrbot_plugin_echo.engine.safety import (  # noqa: E402
     sanitize_meta_reply,
     scrub_internal_leaks,
 )
-from astrbot_plugin_echo.engine.scheduler import Scheduler  # noqa: E402
+from astrbot_plugin_echo.engine.scheduler import IDLE_COOLDOWN, Scheduler, WINDOW_COOLDOWN  # noqa: E402
 from astrbot_plugin_echo.store.emoji_store import EmojiStore  # noqa: E402
 from astrbot_plugin_echo.store.repository import Repository  # noqa: E402
 
@@ -184,6 +184,64 @@ class SchedulerTests(unittest.TestCase):
         expired = Batch("g1", [ChatEvent("g1", "u2", "乙", "夸夸这个人物", ts=720.0, mentioned=True)])
         sch.merge_recent_images(expired, now=720.0)
         self.assertEqual(expired.images, [])
+
+    def test_wave1_debouncing_cooldowns_bystander_and_media_isolation(self):
+        # 1) quiet_delay / active_delay 生效，same_user (+2s) vs 换人 (+1s)，裸表情不 0ms 瞬发
+        sch = Scheduler(quiet_delay=2.5, active_delay=5.5, batch_cap=10.0, image_wait=4.0)
+        sch.enqueue(ChatEvent("g_q", "u1", "甲", "第一条", ts=100.0))
+        self.assertEqual(sch._pending["g_q"].deadline, 102.5)
+        sch.enqueue(ChatEvent("g_q", "u1", "甲", "同人第二条", ts=101.0))
+        self.assertEqual(sch._pending["g_q"].deadline, 103.0)
+        sch.enqueue(ChatEvent("g_q", "u2", "乙", "换人第三条", ts=102.5))
+        self.assertEqual(sch._pending["g_q"].deadline, 103.5)
+
+        sch.enqueue(ChatEvent("g_a", "u1", "甲", "暖群消息", ts=200.0))
+        sch.due(now=210.0)
+        sch.enqueue(ChatEvent("g_a", "u2", "乙", "活跃首条", ts=212.0))
+        self.assertEqual(sch._pending["g_a"].deadline, 217.5)
+
+        sch.enqueue(ChatEvent("g_f", "u1", "甲", "[QQ表情:微笑]", ts=300.0, bare_face=True))
+        self.assertEqual(sch._pending["g_f"].deadline, 302.0)
+
+        # 2) IDLE_COOLDOWN 与 WINDOW_COOLDOWN 分离：搭话伙伴短冷却，路人长冷却
+        sch.record_bot_reply("g_cd", user_id="u1", offered=False, from_mentioned=True, now=400.0)
+        with patch("astrbot_plugin_echo.engine.scheduler.random.random", return_value=0.0):
+            partner_batch = Batch("g_cd", [ChatEvent("g_cd", "u1", "甲", "那后面怎么安排比较好", ts=400.0 + WINDOW_COOLDOWN + 1.0)])
+            bystander_early = Batch("g_cd", [ChatEvent("g_cd", "u2", "乙", "今天天气真好适合出门", ts=400.0 + WINDOW_COOLDOWN + 1.0)])
+            bystander_later = Batch("g_cd", [ChatEvent("g_cd", "u2", "乙", "今天天气真好适合出门", ts=400.0 + IDLE_COOLDOWN + 1.0)])
+            self.assertTrue(sch.should_view(partner_batch, now=400.0 + WINDOW_COOLDOWN + 1.0))
+            self.assertFalse(sch.should_view(bystander_early, now=400.0 + WINDOW_COOLDOWN + 1.0))
+            self.assertTrue(sch.should_view(bystander_later, now=400.0 + IDLE_COOLDOWN + 1.0))
+
+        # 3) 群内未介入的新路人闲聊（非确认词）不劫持 OFFER_WINDOW 的 0.75 高概率
+        sch.record_bot_reply("g_off", user_id="u1", offered=True, from_mentioned=True, now=500.0)
+        casual = Batch("g_off", [ChatEvent("g_off", "u2", "乙", "哈哈", ts=505.0)])
+        confirm = Batch("g_off", [ChatEvent("g_off", "u2", "乙", "查吧", ts=505.0)])
+        self.assertLess(sch.chime_probability(casual, now=505.0), 0.75)
+        self.assertEqual(sch.chime_probability(confirm, now=505.0), 0.75)
+
+        # 4) 跨人未读图防盗抢：路人长句不劫持 u1 的未读图；30 秒内 @ 并带看图短问可达
+        sch.attach_images("g_img", [MediaRef(data=TINY_PNG, sha256="u1_shot")], now=600.0, sender_id="u1")
+        unrelated_other = Batch("g_img", [
+            ChatEvent("g_img", "u2", "乙", "请问明天下午三点半实验室例会是在二楼会议室吗", ts=605.0, mentioned=True)
+        ])
+        sch.merge_recent_images(unrelated_other, now=605.0)
+        self.assertEqual(unrelated_other.images, [])
+
+        vision_other = Batch("g_img", [ChatEvent("g_img", "u2", "乙", "这是谁", ts=605.0, mentioned=True)])
+        sch.merge_recent_images(vision_other, now=605.0)
+        self.assertEqual([m.sha256 for m in vision_other.images], ["u1_shot"])
+
+        # 5) due() 定期回收不活跃群过期媒体，但跳过当轮待出队群
+        sch.due(now=900.0)
+        sch.attach_images("g_idle", [MediaRef(data=TINY_PNG, sha256="idle_img")], now=1000.0, sender_id="u1")
+        sch.attach_images("g_busy", [MediaRef(data=TINY_PNG, sha256="busy_img")], now=1000.0, sender_id="u1")
+        sch.enqueue(ChatEvent("g_busy", "u1", "甲", "@大肥鱼 看图", ts=1001.0, mentioned=True))
+        sch._last_prune_at = 0.0
+        ready = sch.due(now=2000.0)
+        self.assertEqual([b.group_id for b in ready], ["g_busy"])
+        self.assertNotIn("g_idle", sch._media_window)
+        self.assertIn("g_busy", sch._media_window)
 
 
 class ContextTests(unittest.TestCase):
@@ -689,6 +747,98 @@ class EchoAgentTests(unittest.TestCase):
         self.assertFalse(r_retold["replied"])
         self.assertEqual(r_retold["actions"], [])
         repo.close()
+
+    def test_wave1_repeat_rollback_parallel_tools_wrapup_and_search_secrets(self):
+        class _SpySearch:
+            def __init__(self):
+                self.queries = []
+
+            def available(self):
+                return True
+
+            def search(self, query, limit=5):
+                self.queries.append(query)
+                return [SearchHit(title="天气预报", snippet="苏州今日晴朗 22℃", url="https://w.example.com")]
+
+            def extra_secrets(self):
+                return ("tvly-secret-leak-888",)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repository(":memory:")
+            sch = Scheduler(ambient_rate=1.0)
+            emoji_store = EmojiStore(Path(tmp) / "emojis")
+            emoji_store.collect_face("g1", "178", "开心")
+            search = _SpySearch()
+
+            # 1) stay_silent / filtered 回滚 _repeat_seen，且 _repeat_key 按 mentioned / quote_msg_id 隔离
+            llm_repeat = _SeqLLM([
+                ModelTurn(tool_calls=(ToolCall("s1", "stay_silent", {}),)),
+                ModelTurn(text="刚才我在听，怎么啦"),
+                ModelTurn(text="作为AI，我很高兴为您服务"),
+                ModelTurn(text="过滤回滚后重新回答"),
+                ModelTurn(text="换了个引用对象确实不同"),
+            ], ignore_summary=True)
+            agent_rep = EchoAgent(repo, llm_repeat, sch, emoji_store=emoji_store, search_provider=search)
+            r_silent = agent_rep.handle_batch(
+                Batch("g1", [ChatEvent("g1", "u1", "甲", "在吗", msg_id="m1", ts=100.0, mentioned=False, quote_msg_id="q1")])
+            )
+            self.assertEqual(r_silent["reason"], "silent")
+
+            r_after_silent = agent_rep.handle_batch(
+                Batch("g1", [ChatEvent("g1", "u1", "甲", "在吗", msg_id="m2", ts=102.0, mentioned=False, quote_msg_id="q1")])
+            )
+            self.assertEqual(r_after_silent["reason"], "reply")
+            self.assertEqual(r_after_silent["actions"][0].text, "刚才我在听，怎么啦")
+
+            r_filtered = agent_rep.handle_batch(
+                Batch("g1", [ChatEvent("g1", "u1", "甲", "问个问题", msg_id="m2b", ts=102.5, mentioned=True, quote_msg_id="q1")])
+            )
+            self.assertEqual(r_filtered["reason"], "filtered")
+
+            r_after_filtered = agent_rep.handle_batch(
+                Batch("g1", [ChatEvent("g1", "u1", "甲", "问个问题", msg_id="m2c", ts=103.0, mentioned=True, quote_msg_id="q1")])
+            )
+            self.assertEqual(r_after_filtered["reason"], "reply")
+            self.assertEqual(r_after_filtered["actions"][0].text, "过滤回滚后重新回答")
+
+            r_diff_quote = agent_rep.handle_batch(
+                Batch("g1", [ChatEvent("g1", "u1", "甲", "在吗", msg_id="m3", ts=104.0, mentioned=True, quote_msg_id="q2")])
+            )
+            self.assertEqual(r_diff_quote["reason"], "reply")
+
+            # 2) 并行返回的 [send_emoji, web_search] 不因 terminal 提前 return 而丢弃 web_search
+            llm_parallel = _SeqLLM([
+                ModelTurn(tool_calls=(
+                    ToolCall("p1", "send_emoji", {"mood": "开心", "reply_text": "给你查到晴天啦"}),
+                    ToolCall("p2", "web_search", {"query": "苏州天气"}),
+                )),
+            ], ignore_summary=True)
+            agent_par = EchoAgent(repo, llm_parallel, sch, emoji_store=emoji_store, search_provider=search)
+            r_par = agent_par.handle_batch(
+                Batch("g1", [ChatEvent("g1", "u1", "甲", "@大肥鱼 帮我查苏州天气顺便配个图", msg_id="m4", ts=200.0, mentioned=True)])
+            )
+            self.assertTrue(r_par["replied"])
+            self.assertEqual(search.queries, ["苏州天气"])
+
+            # 3) MAX_TOOL_ROUNDS 耗尽时发起无工具收尾调用，且 search_provider.extra_secrets() 被脱敏
+            llm_wrap = _SeqLLM([
+                ModelTurn(tool_calls=(ToolCall("w1", "web_search", {"query": "第1轮"}),)),
+                ModelTurn(tool_calls=(ToolCall("w2", "web_search", {"query": "第2轮"}),)),
+                ModelTurn(tool_calls=(ToolCall("w3", "web_search", {"query": "第3轮"}),)),
+                ModelTurn(tool_calls=(ToolCall("w4", "web_search", {"query": "第4轮"}),)),
+                ModelTurn(text="查到了苏州晴天，凭证 tvly-secret-leak-888 不用谢。"),
+            ], ignore_summary=True)
+            agent_wrap = EchoAgent(repo, llm_wrap, sch, emoji_store=emoji_store, search_provider=search)
+            r_wrap = agent_wrap.handle_batch(
+                Batch("g1", [ChatEvent("g1", "u1", "甲", "@大肥鱼 深入查一下", msg_id="m5", ts=300.0, mentioned=True)])
+            )
+            self.assertTrue(r_wrap["replied"])
+            self.assertEqual(len(llm_wrap.recorded_calls), 5)
+            self.assertEqual(llm_wrap.recorded_calls[4]["tool_names"], [])
+            reply_out = r_wrap["actions"][0].text
+            self.assertIn("查到了苏州晴天", reply_out)
+            self.assertNotIn("tvly-secret-leak-888", reply_out)
+            repo.close()
 
 
 if __name__ == "__main__":

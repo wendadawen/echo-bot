@@ -285,6 +285,60 @@ time.sleep(30)
             self.assertLess(time.monotonic() - t0, 5.0)
             self.assertEqual(res.status, "cancelled")
 
+    def test_wave1_unavailable_drain_stderr_and_cancel_after_exit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp) / "work"
+            outbox = Path(tmp) / "outbox"
+            runner = SandboxRunner(work, outbox, timeout=30)
+
+            # 1) 沙箱不可用时明确返回 status="error", error="sandbox_unavailable"
+            with patch.object(runner, "available", return_value=False):
+                res_unavail = runner.run(TaskRequest(group_id="g1", umo="u1", prompt="查一下"), _FakePythonBackend(""))
+            self.assertEqual(res_unavail.status, "error")
+            self.assertEqual(res_unavail.error, "sandbox_unavailable")
+
+            # 2) >70KB 单行 stdout 与 >70 行 stderr（含队列淘汰与字节统计）精确保留尾部
+            script_drain = """
+import sys
+sys.stdout.write(("X" * 70000) + "\\nANSWER:long_line_ok\\n")
+sys.stdout.flush()
+for i in range(75):
+    sys.stderr.write(f"ERR_{i:02d}:" + ("Y" * 80) + f"_END_{i:02d}\\n")
+sys.stderr.flush()
+sys.exit(1)
+"""
+            res_drain = runner.run(TaskRequest(group_id="g1", umo="u1", prompt="大输出"), _FakePythonBackend(script_drain))
+            self.assertEqual(res_drain.status, "error")
+            self.assertTrue(res_drain.error.startswith("exit 1:"))
+            self.assertIn("ERR_74:", res_drain.error)
+            self.assertIn("_END_73", res_drain.error)
+            self.assertNotIn("ERR_00:", res_drain.error)
+
+            # 3) 进程已正常 exit 0 之后收到 cancel_event，仍保留 status="ok" 与 outbox 产物
+            script_ok = """
+from pathlib import Path
+Path("outbox/ok.html").write_text("<h1>DONE</h1>", encoding="utf-8")
+print("ANSWER:finished_cleanly", flush=True)
+"""
+            cancel = threading.Event()
+            real_popen = __import__("subprocess").Popen
+
+            class _PostExitCancelPopen(real_popen):
+                def wait(self, timeout=None):
+                    rc = super().wait(timeout=timeout)
+                    cancel.set()
+                    return rc
+
+            with patch("subprocess.Popen", _PostExitCancelPopen):
+                res_race = runner.run(
+                    TaskRequest(group_id="g1", umo="u1", prompt="竞态测试"),
+                    _FakePythonBackend(script_ok),
+                    cancel_event=cancel,
+                )
+            self.assertEqual(res_race.status, "ok")
+            self.assertEqual(res_race.text, "finished_cleanly")
+            self.assertEqual(len(res_race.files), 1)
+
 
 class TaskManagerTests(unittest.TestCase):
     def test_single_flight_status_stop_and_reload_delivery(self):
@@ -326,8 +380,14 @@ print("ANSWER:完成", flush=True)
                 time.sleep(0.05)
             self.assertEqual(len(deliveries), 1)
             self.assertEqual(deliveries[0].reason, "cancelled")
+            self.assertEqual(mgr.poll_deliveries(), [])
+            self.assertEqual(len(repo.list_pending_deliveries()), 1)
+            mgr.release_delivery(deliveries[0].task_id)
+            deliveries = mgr.poll_deliveries()
+            self.assertEqual(len(deliveries), 1)
             rendered = mgr.present_delivery(deliveries[0], llm=_FakeLLM())
             self.assertIn("停掉", rendered["text"])
+            mgr.ack_delivery(deliveries[0].task_id)
             self.assertEqual(repo.list_pending_deliveries(), [])
             repo.close()
 
@@ -407,6 +467,28 @@ print("ANSWER:完成", flush=True)
             os.utime(keep_dir, (1.0, 1.0))
             cleanup_outbox(outbox, max_age=10, keep_paths={str(kept_f)})
             self.assertTrue(kept_f.exists())
+            repo.close()
+
+    def test_wave1_shutdown_cancels_joins_and_persists_delivery(self):
+        script = """
+import time
+print("PROGRESS:准备休眠", flush=True)
+time.sleep(10)
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repository(Path(tmp) / "echo.sqlite3")
+            runner = SandboxRunner(Path(tmp) / "work", Path(tmp) / "outbox", timeout=60)
+            mgr = TaskManager(runner, _FakePythonBackend(script), repo=repo)
+            sub = mgr.submit(TaskRequest(group_id="g_sd", umo="u1", prompt="长休眠任务"))
+            self.assertTrue(sub["accepted"])
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline and mgr.status("g_sd") is None:
+                time.sleep(0.02)
+            mgr.shutdown(timeout=3.0)
+            self.assertIsNone(mgr.status("g_sd"))
+            pending = repo.list_pending_deliveries()
+            self.assertEqual(len(pending), 1)
+            self.assertEqual(pending[0].reason, "cancelled")
             repo.close()
 
 

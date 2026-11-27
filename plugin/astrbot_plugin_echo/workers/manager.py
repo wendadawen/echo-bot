@@ -115,7 +115,9 @@ class TaskManager:
         self._extra_secrets_fn = extra_secrets_fn
         self._lock = threading.Lock()
         self._running: dict[str, _RunningJob] = {}
-        self._completed: collections.deque[PendingDelivery] = collections.deque()
+        self._threads: dict[str, threading.Thread] = {}
+        self._completed: collections.OrderedDict[str, PendingDelivery] = collections.OrderedDict()
+        self._inflight_deliveries: set[str] = set()
         self._delivered_ids: collections.OrderedDict[str, float] = collections.OrderedDict()
 
     @property
@@ -238,10 +240,20 @@ class TaskManager:
                     job.done = True
                     if self._running.get(gid) is job:
                         self._running.pop(gid, None)
-                    self._completed.append(delivery)
+                    self._completed[tid] = delivery
+                    self._threads.pop(tid, None)
 
         th = threading.Thread(target=_worker, name="echo-worker-" + tid, daemon=True)
-        th.start()
+        with self._lock:
+            self._threads[tid] = th
+        try:
+            th.start()
+        except Exception:
+            with self._lock:
+                self._threads.pop(tid, None)
+                if self._running.get(gid) is job:
+                    self._running.pop(gid, None)
+            raise
         return {
             "accepted": True,
             "reason": "task",
@@ -264,26 +276,64 @@ class TaskManager:
         out: list[PendingDelivery] = []
         seen_ids: set[str] = set()
         with self._lock:
-            while self._completed:
-                d = self._completed.popleft()
-                seen_ids.add(d.task_id)
-                if self._repo is not None:
-                    self._repo.delete_pending_delivery(d.task_id)
-                if not self._mark_delivered_locked(d.task_id):
-                    for item in d.files:
-                        cleanup_file_entry(item.get("path", ""), self.outbox_root)
+            for tid, d in list(self._completed.items()):
+                seen_ids.add(tid)
+                if tid in self._delivered_ids or tid in self._inflight_deliveries:
                     continue
+                self._inflight_deliveries.add(tid)
                 out.append(d)
             if self._repo is not None:
                 for d in self._repo.list_pending_deliveries():
-                    self._repo.delete_pending_delivery(d.task_id)
-                    if d.task_id in seen_ids or not self._mark_delivered_locked(d.task_id):
+                    tid = d.task_id
+                    if tid in seen_ids:
+                        continue
+                    seen_ids.add(tid)
+                    if tid in self._delivered_ids:
+                        try:
+                            self._repo.delete_pending_delivery(tid)
+                        except Exception:
+                            pass
                         for item in d.files:
                             cleanup_file_entry(item.get("path", ""), self.outbox_root)
                         continue
-                    seen_ids.add(d.task_id)
+                    if tid in self._inflight_deliveries:
+                        continue
+                    self._inflight_deliveries.add(tid)
                     out.append(d)
         return out
+
+    def ack_delivery(self, task_id: str) -> None:
+        tid = str(task_id or "")
+        with self._lock:
+            self._inflight_deliveries.discard(tid)
+            self._completed.pop(tid, None)
+            self._mark_delivered_locked(tid)
+        if self._repo is not None and tid:
+            try:
+                self._repo.delete_pending_delivery(tid)
+            except Exception:
+                pass
+
+    def release_delivery(self, task_id: str) -> None:
+        tid = str(task_id or "")
+        if not tid:
+            return
+        with self._lock:
+            self._inflight_deliveries.discard(tid)
+
+    def shutdown(self, timeout: float = 3.0) -> None:
+        with self._lock:
+            for job in self._running.values():
+                if not job.done:
+                    job.progress = "正在终止…"
+                    job.cancel_event.set()
+            threads = list(self._threads.values())
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        for th in threads:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            th.join(timeout=remaining)
 
     def _filter_valid_files(self, files: tuple[dict[str, Any], ...]) -> tuple[dict[str, Any], ...]:
         if not files:

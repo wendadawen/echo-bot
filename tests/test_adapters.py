@@ -41,6 +41,7 @@ from astrbot_plugin_echo.domain import (  # noqa: E402
     SendEmoji,
     SendFile,
     SendText,
+    ToolCall,
     ToolSpec,
 )
 from astrbot_plugin_echo.store.repository import Repository  # noqa: E402
@@ -225,9 +226,6 @@ class LLMClientTests(unittest.TestCase):
                 raise urllib.error.HTTPError(
                     req.full_url, 422, "Unprocessable", {}, io.BytesIO(b"multimodal image_url unsupported")
                 )
-            if len(calls) == 3:
-                # describe_image 调用
-                return _fake_urlopen_response({"choices": [{"message": {"content": "一只蓝猫"}}]})
             return _fake_urlopen_response({
                 "choices": [{"message": {"content": '{"tool":"react_message","args":{"emoji_id":"124"}}'}}]
             })
@@ -242,6 +240,8 @@ class LLMClientTests(unittest.TestCase):
         with patch("urllib.request.urlopen", side_effect=fake_urlopen):
             turn = client.chat(msgs, tools=tools)
 
+        self.assertEqual(len(calls), 3)
+        self.assertIn("[附带了图片，当前模型暂不支持直接看图]", calls[2]["messages"][-1]["content"])
         self.assertFalse(client._tools_supported)
         self.assertFalse(client._inline_vision_supported)
         self.assertEqual(len(turn.tool_calls), 1)
@@ -255,11 +255,67 @@ class LLMClientTests(unittest.TestCase):
                 "finish_reason": "stop",
             }]
         }
-        turn = OpenAICompatClient._parse_response(data)
-        self.assertEqual(turn.text, "直接思考得出答案：42")
+        with self.assertRaises(RuntimeError):
+            OpenAICompatClient._parse_response(data)
 
         mock_turn = MockLLMClient().chat((LLMMessage(role="user", content="在吗"),))
         self.assertIn("在呢", mock_turn.text)
+
+    def test_wave1_thinking_strip_vision_non_poisoning_and_tool_flattening(self):
+        # 1) 思考链清洗边界：中间块 / 孤立闭合 / 未闭合 / 多段头 / 纯思考归零
+        self.assertEqual(strip_thinking("前缀<think>内部思考</think>正文"), "前缀正文")
+        self.assertEqual(strip_thinking("残留思考</think>真实结论"), "真实结论")
+        self.assertEqual(strip_thinking("正文<thinking>截断未闭合"), "正文")
+        self.assertEqual(strip_thinking("<think>只有思考</think>"), "")
+        self.assertEqual(
+            strip_thinking("Thinking Process:\n\n1. 分析第一步\n\n2. 分析第二步\n\n最终回复"),
+            "最终回复",
+        )
+
+        # 2) Anthropic / 推理块类型过滤
+        turn = OpenAICompatClient._parse_response({
+            "choices": [{
+                "message": {
+                    "content": [
+                        {"type": "thinking", "text": "内部推理"},
+                        {"type": "redacted_thinking", "text": "加密思考"},
+                        {"type": "refusal", "text": "refusal"},
+                        {"type": "text", "text": "最终答复"},
+                    ]
+                }
+            }]
+        })
+        self.assertEqual(turn.text, "最终答复")
+
+        # 3) 无图请求的 "invalid content" 400 不误伤 _inline_vision_supported；冷却到期自动恢复
+        client = OpenAICompatClient("sk-12345678", "https://example.com/v1", "test-model")
+        def fake_400(req, timeout=90):
+            raise urllib.error.HTTPError(
+                req.full_url, 400, "Bad Request", {}, io.BytesIO(b"invalid content format")
+            )
+        with patch("urllib.request.urlopen", side_effect=fake_400):
+            with self.assertRaises(RuntimeError):
+                client.chat((LLMMessage(role="user", content="纯文本"),))
+        self.assertIsNone(client._inline_vision_supported)
+
+        client._tools_supported = False
+        self.assertFalse(client._tools_supported)
+        client._tools_disabled_until = time.monotonic() - 1.0
+        self.assertIsNone(client._tools_supported)
+
+        # 4) use_native_tools=False 时将历史 assistant(tool_calls) 与 role=tool 扁平化
+        encoded = client._encode_messages(
+            (
+                LLMMessage(role="user", content="查天气"),
+                LLMMessage(role="assistant", content="", tool_calls=(ToolCall("tc1", "web_search", {"query": "北京"}),)),
+                LLMMessage(role="tool", name="web_search", tool_call_id="tc1", content="晴天 20度"),
+            ),
+            allow_images=False,
+            use_native_tools=False,
+        )
+        self.assertFalse(any("tool_calls" in m for m in encoded))
+        self.assertFalse(any(m.get("role") == "tool" for m in encoded))
+        self.assertTrue(any("晴天 20度" in str(m.get("content", "")) for m in encoded))
 
 
 class SearchProviderTests(unittest.TestCase):
@@ -413,6 +469,52 @@ class SearchProviderTests(unittest.TestCase):
         standalone = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(standalone)
         self.assertTrue(standalone.HttpSearchProvider(provider="free").available())
+
+    def test_wave1_auto_provider_hostname_captcha_and_error_cooldown(self):
+        with patch.dict(os.environ, {}, clear=True):
+            sp_auto = HttpSearchProvider.from_config({
+                "search_provider": "auto",
+                "search_api_key": "tvly-secret-123456",
+            })
+        self.assertTrue(sp_auto.available())
+        self.assertIn("tvly-secret-123456", sp_auto.extra_secrets())
+
+        sp_ex = HttpSearchProvider(
+            provider="auto", api_base="https://example.com/search", api_key="k12345678"
+        )
+        self.assertEqual(sp_ex._resolve_endpoint(), ("generic", "https://example.com/search"))
+
+        # 有效结果页中正巧包含 captcha 字样时不应触发错误冷却
+        bing_with_word = (
+            '<html><body><ol id="b_results">'
+            '<li class="b_algo"><h2><a href="https://docs.example.com">How captcha works</a></h2>'
+            '<div class="b_caption"><p>A captcha tutorial for web apps.</p></div></li>'
+            '</ol></body></html>'
+        )
+        sp_bing = HttpSearchProvider(provider="bing")
+        with patch("urllib.request.urlopen") as m_open:
+            resp = MagicMock()
+            resp.read.return_value = bing_with_word.encode("utf-8")
+            resp.__enter__.return_value = resp
+            resp.__exit__.return_value = False
+            m_open.return_value = resp
+            hits = sp_bing.search("captcha tutorial")
+        self.assertEqual(len(hits), 1)
+        self.assertFalse(sp_bing.in_cooldown("bing_cn"))
+
+        # 主搜 500 错误应进入短冷却而不是继续死磕
+        sp_500 = HttpSearchProvider(provider="tavily", api_key="tvly-123456")
+        def fake_500(req, timeout=12):
+            if "tavily.com" in req.full_url:
+                raise urllib.error.HTTPError(req.full_url, 500, "Server Error", {}, io.BytesIO(b"boom"))
+            resp = MagicMock()
+            resp.read.return_value = b""
+            resp.__enter__.return_value = resp
+            resp.__exit__.return_value = False
+            return resp
+        with patch("urllib.request.urlopen", side_effect=fake_500):
+            sp_500.search("test")
+        self.assertTrue(sp_500.in_primary_cooldown())
 
 
 class InboundAndSenderTests(unittest.TestCase):
@@ -697,6 +799,81 @@ class InboundAndSenderTests(unittest.TestCase):
             )
             self.assertEqual(ctx.send_message.call_count, send_before + 1)
             repo.close()
+
+    def test_wave1_ssrf_lfi_forward_quota_and_limiter(self):
+        # 1) CGNAT (100.64.0.1) 与 IPv4-mapped loopback (::ffff:127.0.0.1) 均被 SSRF 拦截
+        with patch("socket.getaddrinfo", return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("100.64.0.1", 0))]):
+            self.assertFalse(is_public_http_url("https://cgnat.example/img.png"))
+        with patch("socket.getaddrinfo", return_value=[(socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("::ffff:127.0.0.1", 0, 0, 0))]):
+            self.assertFalse(is_public_http_url("https://mapped.example/img.png"))
+
+        # 2) 本地文件路径 fail-closed：无白名单 / 越界 / symlink 均拒，白名单内普通文件可读
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            allowed = root / "allowed"
+            outside = root / "outside"
+            allowed.mkdir()
+            outside.mkdir()
+            ok_img = allowed / "ok.png"
+            ok_img.write_bytes(TINY_PNG)
+            bad_img = outside / "secret.png"
+            bad_img.write_bytes(TINY_PNG)
+            sym_img = allowed / "sym.png"
+            sym_img.symlink_to(bad_img)
+
+            p_closed = AstrBotInboundParser(COMP_TYPES)
+            self.assertIsNone(p_closed._is_safe_local_file(str(ok_img)))
+
+            p_jailed = AstrBotInboundParser(COMP_TYPES, allowed_local_roots=(allowed,))
+            self.assertIsNotNone(p_jailed._is_safe_local_file(str(ok_img)))
+            self.assertIsNone(p_jailed._is_safe_local_file(str(bad_img)))
+            self.assertIsNone(p_jailed._is_safe_local_file(str(sym_img)))
+
+        # 3) @bot + 空内容合并转发会回查 get_forward_msg 且空 card 自动回落 nickname
+        class _EmptyForward(_Forward):
+            def __init__(self, fid="fwd_1"):
+                super().__init__(content=())
+                self.id = fid
+
+        ev_fwd = self._make_event(parts=[_At(qq="8888"), _EmptyForward("fwd_99")], text="")
+        ev_fwd.bot = MagicMock()
+        ev_fwd.bot.call_action = AsyncMock(return_value={
+            "messages": [{"sender": {"card": "", "nickname": "阿花"}, "content": "群聊转发原文"}]
+        })
+        parser = AstrBotInboundParser(COMP_TYPES, downloader=lambda url: b"")
+        parsed_fwd = asyncio.run(parser.parse(ev_fwd))
+        ev_fwd.bot.call_action.assert_awaited_once_with("get_forward_msg", id="fwd_99")
+        self.assertIn("阿花", parsed_fwd.text)
+        self.assertIn("群聊转发原文", parsed_fwd.text)
+
+        # 4) 主消息自带图片优先占用 2 张配额，不被 Reply 引用的图片挤掉
+        own1 = TINY_PNG + b"own1"
+        own2 = TINY_PNG + b"own2"
+        q1 = TINY_PNG + b"quote1"
+        data_map = {
+            "https://example.com/own1.png": own1,
+            "https://example.com/own2.png": own2,
+            "https://example.com/q1.png": q1,
+        }
+        p_img = AstrBotInboundParser(COMP_TYPES, downloader=lambda url: data_map.get(url, b""))
+        ev_prio = self._make_event(
+            parts=[
+                _Reply(id="10", sender_id="2", sender_nickname="路人", chain=[_Image(url="https://example.com/q1.png")]),
+                _At(qq="8888"),
+                _Image(url="https://example.com/own1.png"),
+                _Image(url="https://example.com/own2.png"),
+            ]
+        )
+        parsed_prio = asyncio.run(p_img.parse(ev_prio))
+        self.assertEqual([m.data for m in parsed_prio.images], [own1, own2])
+
+        # 5) MessageLimiter.try_acquire 原子配额扣减与 per_minute<=0 拦截
+        lim = MessageLimiter(per_minute=2)
+        self.assertTrue(lim.try_acquire("g1", now=100.0))
+        self.assertTrue(lim.try_acquire("g1", now=100.5))
+        self.assertFalse(lim.try_acquire("g1", now=101.0))
+        self.assertTrue(lim.try_acquire("g1", now=161.0))
+        self.assertFalse(MessageLimiter(per_minute=0).try_acquire("g1", now=100.0))
 
 
 if __name__ == "__main__":

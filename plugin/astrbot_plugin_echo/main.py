@@ -97,9 +97,13 @@ class Echo(Star):
 
         def _extra_secrets() -> tuple[str, ...]:
             out = list(self.llm.extra_secrets() or ())
-            skey = str(getattr(self.search_provider, "api_key", "") or "").strip()
-            if len(skey) >= 8:
-                out.append(skey)
+            extra_fn = getattr(self.search_provider, "extra_secrets", None)
+            if callable(extra_fn):
+                out.extend(extra_fn() or ())
+            else:
+                skey = str(getattr(self.search_provider, "api_key", "") or "").strip()
+                if len(skey) >= 8:
+                    out.append(skey)
             return tuple(out)
 
         self.task_manager = (
@@ -143,7 +147,10 @@ class Echo(Star):
             "Image": Image,
             "File": File,
         }
-        self.inbound = AstrBotInboundParser(self._comp_types)
+        self.inbound = AstrBotInboundParser(
+            self._comp_types,
+            allowed_local_roots=(self._astrbot_data_root,) if self._astrbot_data_root else (),
+        )
         self.limiter = MessageLimiter(per_minute=8)
         self._bots: dict[str, object] = {}
         self.sender = AstrBotSender(
@@ -199,6 +206,11 @@ class Echo(Star):
             tasks.append(t)
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        if self.task_manager is not None:
+            try:
+                await asyncio.to_thread(self.task_manager.shutdown, 3.0)
+            except Exception:
+                pass
         try:
             await asyncio.to_thread(self.agent.wait_background, 2.0)
         except Exception:
@@ -336,30 +348,54 @@ class Echo(Star):
                 except Exception as exc:
                     logger.error("消息发送失败：%s", exc)
 
+    async def _deliver_one_task(self, delivery) -> None:
+        if self.task_manager is None:
+            return
+        gid = str(getattr(delivery, "group_id", "") or "")
+        tid = str(getattr(delivery, "task_id", "") or "")
+        acked = False
+        files: list[dict] = []
+        try:
+            async with self._group_locks[gid]:
+                row = await asyncio.to_thread(self.task_manager.present_delivery, delivery, self.llm)
+                gid = str(row.get("group_id", "") or gid)
+                umo = str(row.get("umo", "") or "")
+                files = list(row.get("files") or ())
+                if not row.get("ok") and row.get("error"):
+                    logger.warning("后台子任务失败（group=%s）：%s", gid, row.get("error"))
+                if not umo:
+                    await asyncio.to_thread(self.task_manager.ack_delivery, tid)
+                    acked = True
+                    return
+                if row.get("text"):
+                    sent = await self.sender.send(SendText(gid, umo, row["text"]))
+                    if sent is not False:
+                        self.scheduler.record_bot_reply(
+                            gid, user_id="", offered=False, from_mentioned=True
+                        )
+                for f in files:
+                    await self.sender.send(SendFile(gid, umo, f.get("path", ""), f.get("name", "")))
+                await asyncio.to_thread(self.task_manager.ack_delivery, tid)
+                acked = True
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("后台结果发送失败：%s", exc)
+        finally:
+            if acked:
+                for f in files:
+                    cleanup_file_entry(f.get("path", ""), self._outbox_root)
+            else:
+                try:
+                    self.task_manager.release_delivery(tid)
+                except Exception:
+                    pass
+
     async def _deliver_completed_tasks(self) -> None:
         if self.task_manager is None:
             return
         for delivery in await asyncio.to_thread(self.task_manager.poll_deliveries):
-            row = await asyncio.to_thread(self.task_manager.present_delivery, delivery, self.llm)
-            gid = row.get("group_id", "")
-            umo = row.get("umo", "")
-            files = list(row.get("files") or ())
-            if not row.get("ok") and row.get("error"):
-                logger.warning("后台子任务失败（group=%s）：%s", gid, row.get("error"))
-            try:
-                if not umo:
-                    continue
-                if row.get("text"):
-                    await self.sender.send(SendText(gid, umo, row["text"]))
-                for f in files:
-                    await self.sender.send(SendFile(gid, umo, f.get("path", ""), f.get("name", "")))
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logger.error("后台结果发送失败：%s", exc)
-            finally:
-                for f in files:
-                    cleanup_file_entry(f.get("path", ""), self._outbox_root)
+            self._spawn_bg(self._deliver_one_task(delivery))
 
     async def _chat_loop(self) -> None:
         while True:

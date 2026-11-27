@@ -408,6 +408,9 @@ class IncidentReplayTests(unittest.TestCase):
                     partial="查到了第1批线索",
                 ))
                 await echo._deliver_completed_tasks()
+                if echo._bg_tasks:
+                    await asyncio.gather(*list(echo._bg_tasks))
+                self.assertEqual(echo.repo.list_pending_deliveries(), [])
                 self.assertGreaterEqual(ctx.send_message.call_count, 3)
                 self.assertFalse(html_path.exists())
                 # partial 进消息且无超时幻觉

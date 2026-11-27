@@ -31,6 +31,7 @@ else:
             self.url = str(url)
 
 PRIMARY_QUOTA_COOLDOWN = 1800.0
+PRIMARY_ERROR_COOLDOWN = 60.0
 FALLBACK_COOLDOWN = 600.0
 QUOTA_HTTP_CODES = frozenset({402, 429, 432})
 _QUOTA_BODY_KEYWORDS = ("quota", "limit", "credit", "usage", "rate", "exceeded", "insufficient")
@@ -59,7 +60,7 @@ def _has_captcha(page_html: str) -> bool:
     return any(marker in low for marker in _CAPTCHA_MARKERS)
 
 
-def _http_get_html(url: str, timeout: int) -> tuple[str, bool]:
+def _http_get_html(url: str, timeout: int) -> tuple[str, int]:
     req = urllib.request.Request(
         url,
         headers={
@@ -71,13 +72,11 @@ def _http_get_html(url: str, timeout: int) -> tuple[str, bool]:
     try:
         with urllib.request.urlopen(req, timeout=max(3, int(timeout or 10))) as resp:
             body = resp.read(300_000).decode("utf-8", errors="ignore")
+        return body, 0
     except urllib.error.HTTPError as exc:
-        return "", exc.code in (402, 403, 429, 432)
+        return "", int(exc.code)
     except Exception:
-        return "", False
-    if _has_captcha(body):
-        return "", True
-    return body, False
+        return "", -1
 
 
 def _parse_bing_algo_blocks(page_html: str, limit: int = 5) -> list[SearchHit]:
@@ -138,10 +137,15 @@ def _fetch_bing(query: str, host: str, limit: int = 5, timeout: int = 10) -> tup
     top_n = max(1, min(8, int(limit or 5)))
     suffix = "&setlang=zh-CN" if host == "cn.bing.com" else ""
     url = "https://{}/search?q={}{}".format(host, urllib.parse.quote(q), suffix)
-    page, blocked = _http_get_html(url, timeout=timeout)
-    if blocked or not page:
-        return [], blocked
-    return _parse_bing_algo_blocks(page, limit=top_n), False
+    page, status = _http_get_html(url, timeout=timeout)
+    if status in (402, 403, 429, 432):
+        return [], True
+    if not page:
+        return [], False
+    hits = _parse_bing_algo_blocks(page, limit=top_n)
+    if hits:
+        return hits, False
+    return [], _has_captcha(page)
 
 
 def _fetch_so360(query: str, limit: int = 5, timeout: int = 10) -> tuple[list[SearchHit], bool]:
@@ -150,10 +154,15 @@ def _fetch_so360(query: str, limit: int = 5, timeout: int = 10) -> tuple[list[Se
         return [], False
     top_n = max(1, min(8, int(limit or 5)))
     url = "https://www.so.com/s?q={}".format(urllib.parse.quote(q))
-    page, blocked = _http_get_html(url, timeout=timeout)
-    if blocked or not page:
-        return [], blocked
-    return _parse_so360_blocks(page, limit=top_n), False
+    page, status = _http_get_html(url, timeout=timeout)
+    if status in (402, 403, 429, 432):
+        return [], True
+    if not page:
+        return [], False
+    hits = _parse_so360_blocks(page, limit=top_n)
+    if hits:
+        return hits, False
+    return [], _has_captcha(page)
 
 
 def search_bing_cn(query: str, limit: int = 5, timeout: int = 10) -> list[SearchHit]:
@@ -193,12 +202,15 @@ class HttpSearchProvider:
         key = str(cfg.get("search_api_key") or os.environ.get("BOT_SEARCH_API_KEY", "")).strip()
         return cls(provider=provider, api_base=base, api_key=key)
 
+    def extra_secrets(self) -> tuple[str, ...]:
+        return (self.api_key,) if len(self.api_key) >= 8 else ()
+
     def available(self) -> bool:
         if self.provider in ("free", "bing", "so360"):
             return True
         if self.api_base:
             return self.api_base.startswith(("http://", "https://"))
-        if self.api_key and self.provider in ("tavily", "exa"):
+        if self.api_key and self.provider in ("auto", "tavily", "exa"):
             return True
         return False
 
@@ -214,7 +226,7 @@ class HttpSearchProvider:
             return False
         if self.api_base:
             return self.api_base.startswith(("http://", "https://"))
-        return bool(self.api_key and self.provider in ("tavily", "exa"))
+        return bool(self.api_key and self.provider in ("auto", "tavily", "exa"))
 
     def _fallback_order(self) -> tuple[str, ...]:
         if self.provider == "so360":
@@ -226,10 +238,11 @@ class HttpSearchProvider:
             return "bing", "https://cn.bing.com/search"
         if self.provider == "so360":
             return "so360", "https://www.so.com/s"
-        if self.provider == "exa" or ("exa" in self.api_base):
+        host = (urllib.parse.urlsplit(self.api_base).hostname or "").lower()
+        if self.provider == "exa" or host == "exa.ai" or host.endswith(".exa.ai"):
             url = self.api_base or "https://api.exa.ai/search"
             return "exa", url if url.endswith("/search") else url + "/search"
-        if self.provider == "tavily" or ("tavily" in self.api_base) or (self.api_key and not self.api_base):
+        if self.provider == "tavily" or host == "tavily.com" or host.endswith(".tavily.com") or (self.api_key and not self.api_base):
             url = self.api_base or "https://api.tavily.com/search"
             return "tavily", url if url.endswith("/search") else url + "/search"
         return "generic", self.api_base
@@ -296,8 +309,10 @@ class HttpSearchProvider:
             except urllib.error.HTTPError as exc:
                 if self._is_quota_error(exc):
                     self._cooldown_until["primary"] = time.monotonic() + PRIMARY_QUOTA_COOLDOWN
+                else:
+                    self._cooldown_until["primary"] = time.monotonic() + PRIMARY_ERROR_COOLDOWN
             except Exception:
-                pass
+                self._cooldown_until["primary"] = time.monotonic() + PRIMARY_ERROR_COOLDOWN
 
         for channel in self._fallback_order():
             if self.in_cooldown(channel):

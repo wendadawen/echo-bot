@@ -12,6 +12,8 @@ import base64
 import json
 import os
 import re
+import threading
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -22,25 +24,63 @@ from ..domain import LLMMessage, ModelTurn, ToolCall, ToolSpec, detect_image_for
 DEFAULT_API_BASE = "https://api.openai.com/v1"
 DEFAULT_MODEL_TIMEOUT = 90
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+MAX_ERROR_BODY_BYTES = 4096
+CAPABILITY_COOLDOWN = 600.0
 
-_THINK_TAG_RE = re.compile(r"^\s*(?:<(?:think|thinking|analysis)>.*?</(?:think|thinking|analysis)>\s*)+", re.I | re.S)
-_THINK_HEADER_RE = re.compile(
-    r"^\s*(?:#{1,6}\s*)?(?:\*\*)?(?:thinking\s+process|thought\s+process|思考过程|思维链)(?:\*\*)?\s*[:：].*?\n\s*\n+",
-    re.I | re.S,
+_THINK_PAIR_RE = re.compile(r"<(?:think|thinking|analysis)>.*?</(?:think|thinking|analysis)>\s*", re.I | re.S)
+_ORPHAN_THINK_END_RE = re.compile(r"^.*?</(?:think|thinking|analysis)>\s*", re.I | re.S)
+_UNCLOSED_THINK_START_RE = re.compile(r"<(?:think|thinking|analysis)>.*\Z", re.I | re.S)
+_THINK_PREFIX_RE = re.compile(
+    r"^\s*(?:#{1,6}\s*)?(?:\*\*)?(?:thinking\s+process|thought\s+process|思考过程|思维链)(?:\*\*)?\s*[:：]",
+    re.I,
+)
+_VISION_ERROR_KEYWORDS = (
+    "image_url",
+    "vision",
+    "multimodal",
+    "does not support image",
+    "image input",
+    "invalid image",
+    "cannot read image",
+    "unsupported image",
 )
 
 
 def strip_thinking(text: Any) -> str:
-    """剥离推理模型（DeepSeek/Gemini/Qwen3）意外混入正文的思考块，不破坏正常文本。"""
+    """剥离推理模型（DeepSeek/Gemini/Qwen3）混入正文的思考块，纯思考内容返回空串绝不外泄。"""
     s = str(text or "").strip()
     if not s:
         return ""
-    stripped = _THINK_TAG_RE.sub("", s).strip()
-    if stripped:
-        s = stripped
-    header_stripped = _THINK_HEADER_RE.sub("", s).strip()
-    if header_stripped:
-        s = header_stripped
+    s = _THINK_PAIR_RE.sub("", s).strip()
+    if not s:
+        return ""
+    if re.search(r"</(?:think|thinking|analysis)>", s, re.I):
+        s = _ORPHAN_THINK_END_RE.sub("", s).strip()
+        if not s:
+            return ""
+    if re.search(r"<(?:think|thinking|analysis)>", s, re.I):
+        s = _UNCLOSED_THINK_START_RE.sub("", s).strip()
+        if not s:
+            return ""
+    if _THINK_PREFIX_RE.match(s):
+        if "\n\n" in s:
+            parts = re.split(r"\n\s*\n+", s)
+            kept: list[str] = []
+            in_thought = True
+            for idx, seg in enumerate(parts):
+                st = seg.strip()
+                if idx == 0:
+                    continue
+                if in_thought and (
+                    re.match(r"^(?:[-*•]|\d+\.)", st)
+                    or re.match(r"^(?:thinking|thought|analysis|step\s*\d+|思考|分析)", st, re.I)
+                ):
+                    continue
+                in_thought = False
+                kept.append(st)
+            s = "\n\n".join(kept).strip()
+        else:
+            s = ""
     return s
 
 
@@ -62,19 +102,18 @@ def _extract_message_text(message: dict[str, Any]) -> str:
         parts = []
         for block in content:
             if isinstance(block, dict):
-                txt = block.get("text")
-                if txt:
-                    parts.append(str(txt))
+                btype = str(block.get("type") or "").strip().lower()
+                if btype in ("thinking", "reasoning", "redacted_thinking", "refusal"):
+                    continue
+                if btype in ("", "text", "output_text"):
+                    txt = block.get("text")
+                    if txt:
+                        parts.append(str(txt))
             elif isinstance(block, str) and block:
                 parts.append(block)
         content = "".join(parts)
     if isinstance(content, str) and content.strip():
         return strip_thinking(content)
-    # 仅在既无 content 也无 tool_calls 时才回落 reasoning_content，防止吞掉真实结论。
-    if not message.get("tool_calls"):
-        reasoning = message.get("reasoning_content")
-        if isinstance(reasoning, str) and reasoning.strip():
-            return strip_thinking(reasoning)
     return ""
 
 
@@ -184,8 +223,66 @@ class OpenAICompatClient:
         self.url = clean_base if clean_base.endswith("/chat/completions") else clean_base + "/chat/completions"
         self.model = str(model or "gpt-4o-mini").strip()
         self.timeout = int(timeout or DEFAULT_MODEL_TIMEOUT)
-        self._tools_supported: Optional[bool] = None
-        self._inline_vision_supported: Optional[bool] = None
+        self._cap_lock = threading.Lock()
+        self._tools_state: Optional[bool] = None
+        self._tools_disabled_until: Optional[float] = None
+        self._vision_state: Optional[bool] = None
+        self._vision_disabled_until: Optional[float] = None
+
+    @property
+    def _tools_supported(self) -> Optional[bool]:
+        with self._cap_lock:
+            if self._tools_disabled_until is not None:
+                if time.monotonic() < self._tools_disabled_until:
+                    return False
+                self._tools_disabled_until = None
+                self._tools_state = None
+            return self._tools_state
+
+    @_tools_supported.setter
+    def _tools_supported(self, value: Optional[bool]) -> None:
+        with self._cap_lock:
+            self._tools_state = value
+            if value is False:
+                self._tools_disabled_until = time.monotonic() + CAPABILITY_COOLDOWN
+            else:
+                self._tools_disabled_until = None
+
+    @property
+    def _inline_vision_supported(self) -> Optional[bool]:
+        with self._cap_lock:
+            if self._vision_disabled_until is not None:
+                if time.monotonic() < self._vision_disabled_until:
+                    return False
+                self._vision_disabled_until = None
+                self._vision_state = None
+            return self._vision_state
+
+    @_inline_vision_supported.setter
+    def _inline_vision_supported(self, value: Optional[bool]) -> None:
+        with self._cap_lock:
+            self._vision_state = value
+            if value is False:
+                self._vision_disabled_until = time.monotonic() + CAPABILITY_COOLDOWN
+            else:
+                self._vision_disabled_until = None
+
+    def _safe_http_error_body(self, exc: urllib.error.HTTPError) -> str:
+        raw_body = ""
+        try:
+            raw_bytes = exc.read(MAX_ERROR_BODY_BYTES)
+        except TypeError:
+            try:
+                raw_bytes = exc.read()
+            except Exception:
+                raw_bytes = b""
+        except Exception:
+            raw_bytes = b""
+        if raw_bytes:
+            raw_body = bytes(raw_bytes[:MAX_ERROR_BODY_BYTES]).decode("utf-8", errors="ignore").strip()
+        if raw_body and len(self.api_key) >= 8:
+            raw_body = raw_body.replace(self.api_key, "***")
+        return raw_body
 
     def extra_secrets(self) -> tuple[str, ...]:
         return (self.api_key,) if len(self.api_key) >= 8 else ()
@@ -210,6 +307,7 @@ class OpenAICompatClient:
         self,
         messages: Sequence[LLMMessage],
         allow_images: bool = True,
+        use_native_tools: bool = True,
         extra_system: str = "",
     ) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
@@ -222,8 +320,8 @@ class OpenAICompatClient:
                     injected_extra = True
                 out.append({"role": "system", "content": content})
             elif m.role == "assistant":
-                entry: dict[str, Any] = {"role": "assistant", "content": m.content or ""}
-                if m.tool_calls:
+                if m.tool_calls and use_native_tools:
+                    entry: dict[str, Any] = {"role": "assistant", "content": m.content or ""}
                     entry["tool_calls"] = [
                         {
                             "id": tc.id,
@@ -235,13 +333,28 @@ class OpenAICompatClient:
                         }
                         for tc in m.tool_calls
                     ]
-                out.append(entry)
+                    out.append(entry)
+                elif m.tool_calls:
+                    calls_desc = "；".join(
+                        "{}({})".format(tc.name, json.dumps(tc.arguments, ensure_ascii=False))
+                        for tc in m.tool_calls
+                    )
+                    txt = (str(m.content or "").strip() + "\n[调用工具: {}]".format(calls_desc)).strip()
+                    out.append({"role": "assistant", "content": txt})
+                else:
+                    out.append({"role": "assistant", "content": str(m.content or "")})
             elif m.role == "tool":
-                out.append({
-                    "role": "tool",
-                    "tool_call_id": m.tool_call_id,
-                    "content": str(m.content or ""),
-                })
+                if use_native_tools:
+                    out.append({
+                        "role": "tool",
+                        "tool_call_id": m.tool_call_id,
+                        "content": str(m.content or ""),
+                    })
+                else:
+                    out.append({
+                        "role": "user",
+                        "content": "[工具 {} 返回]\n{}".format(m.name or "tool", str(m.content or "")),
+                    })
             else:
                 if allow_images and m.images:
                     blocks: list[dict[str, Any]] = [{"type": "text", "text": str(m.content or "（附图片）")}]
@@ -253,17 +366,7 @@ class OpenAICompatClient:
                 else:
                     txt = str(m.content or "")
                     if m.images and not allow_images:
-                        notes = []
-                        for idx, img in enumerate(m.images[:2], 1):
-                            if img.data:
-                                try:
-                                    desc = self.describe_image(img.data, "简要客观描述图片内容")
-                                except Exception:
-                                    desc = ""
-                                if desc:
-                                    notes.append("[图片{}: {}]".format(idx, desc[:140]))
-                        if notes:
-                            txt = (txt + "\n" + "\n".join(notes)).strip()
+                        txt = (txt + "\n[附带了图片，当前模型暂不支持直接看图]").strip()
                     out.append({"role": "user", "content": txt})
         if extra_system and not injected_extra:
             out.insert(0, {"role": "system", "content": extra_system})
@@ -328,11 +431,18 @@ class OpenAICompatClient:
         messages: Sequence[LLMMessage],
         tools: Sequence[ToolSpec] = (),
         timeout: Optional[int] = None,
+        _retry_depth: int = 0,
     ) -> ModelTurn:
         use_native_tools = bool(tools) and (self._tools_supported is not False)
         allow_images = self._inline_vision_supported is not False
+        had_images = bool(allow_images and any(bool(m.images) for m in messages))
         extra_sys = _render_tools_fallback_prompt(tools) if (tools and not use_native_tools) else ""
-        encoded_msgs = self._encode_messages(messages, allow_images=allow_images, extra_system=extra_sys)
+        encoded_msgs = self._encode_messages(
+            messages,
+            allow_images=allow_images,
+            use_native_tools=use_native_tools,
+            extra_system=extra_sys,
+        )
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": encoded_msgs,
@@ -346,28 +456,26 @@ class OpenAICompatClient:
             turn = self._parse_response(data)
             if use_native_tools:
                 self._tools_supported = True
+            if had_images:
+                self._inline_vision_supported = True
             if not use_native_tools and tools and not turn.tool_calls and turn.text:
                 parsed = _parse_json_fallback_turn(turn.text, {t.name for t in tools})
                 if parsed is not None:
                     return parsed
             return turn
         except urllib.error.HTTPError as exc:
-            raw_body = ""
-            try:
-                raw_body = exc.read().decode("utf-8", errors="ignore").strip()
-            except Exception:
-                pass
+            raw_body = self._safe_http_error_body(exc)
             body = raw_body.lower()
-            if exc.code in (400, 422):
+            if exc.code in (400, 422) and _retry_depth < 2:
                 retried = False
                 if use_native_tools and any(k in body for k in ("tool", "function", "tool_choice")):
                     self._tools_supported = False
                     retried = True
-                if allow_images and any(k in body for k in ("image", "vision", "multimodal", "content")):
+                if had_images and any(k in body for k in _VISION_ERROR_KEYWORDS):
                     self._inline_vision_supported = False
                     retried = True
                 if retried:
-                    return self.chat(messages, tools=tools, timeout=timeout)
+                    return self.chat(messages, tools=tools, timeout=timeout, _retry_depth=_retry_depth + 1)
             raise RuntimeError("HTTP {}: {}".format(exc.code, raw_body[:240] or exc.reason)) from exc
 
     def describe_image(self, image_bytes: bytes, prompt: str, timeout: Optional[int] = None) -> str:
@@ -383,11 +491,16 @@ class OpenAICompatClient:
                 ],
             }],
         }
-        data = self._post(payload, timeout=timeout)
+        try:
+            data = self._post(payload, timeout=timeout)
+        except urllib.error.HTTPError as exc:
+            raw_body = self._safe_http_error_body(exc)
+            raise RuntimeError("HTTP {}: {}".format(exc.code, raw_body[:240] or exc.reason)) from exc
         choices = data.get("choices") or []
         if not choices:
             raise RuntimeError("模型未返回候选结果")
-        return _extract_message_text(choices[0].get("message") or {})
+        choice = choices[0] or {}
+        return _extract_message_text(choice.get("message") or {})
 
 
 def resolve_model_config(config: Optional[dict[str, Any]] = None) -> tuple[str, str, str]:

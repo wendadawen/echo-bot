@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import re
+import threading
 import time
 from typing import Any, Callable, Optional
 
@@ -48,7 +49,8 @@ _OFFER_HINTS = (
     "你要的话", "要不要", "需要的话", "发我", "告诉我",
     "帮你查", "帮你排", "想吃什么", "哪个", "哪种", "什么方向",
 )
-_EXPLICIT_EMOJI_HINTS = ("表情包", "斗图", "发个表情", "发表情", "再来一张", "换一张", "发张表情")
+_EXPLICIT_EMOJI_HINTS = ("表情包", "斗图", "发个表情", "发表情", "再来一张", "换一张", "发张表情", "配个图", "配张图")
+_TERMINAL_TOOLS = frozenset({"stay_silent", "react_message", "send_emoji", "run_task"})
 _VAGUE_TASK_PROMPTS = frozenset({
     "查一下", "去查一下", "查一查", "帮我查", "帮我查一下",
     "搜一下", "去搜一下", "搜一搜", "看看", "去看看", "查查看", "查",
@@ -60,9 +62,15 @@ def _is_open_offer(text: str) -> bool:
     return bool(s) and (s.endswith(("?", "？")) or any(h in s for h in _OFFER_HINTS))
 
 
-def _repeat_key(group_id: str, user_id: str, text: str) -> tuple[str, str, str]:
+def _repeat_key(
+    group_id: str,
+    user_id: str,
+    text: str,
+    mentioned: bool = False,
+    quote_msg_id: str = "",
+) -> tuple[str, str, str, bool, str]:
     clean = re.sub(r"[\s，,。.！!？?～~、…]+", "", str(text or ""))
-    return (str(group_id), str(user_id), clean)
+    return (str(group_id), str(user_id), clean, bool(mentioned), str(quote_msg_id or ""))
 
 
 _OVERLOAD_ERROR_KEYWORDS = (
@@ -131,13 +139,29 @@ class EchoAgent:
             **({"persona": persona} if persona else {}),
         )
         self.memory = MemoryConsolidator(repo, llm)
-        self._repeat_seen: dict[tuple[str, str, str], float] = {}
+        self._state_lock = threading.Lock()
+        self._repeat_seen: dict[tuple[str, str, str, bool, str], float] = {}
         self._last_bot_reply: dict[str, tuple[tuple[Any, ...], float]] = {}
         self._last_emoji_at: dict[str, float] = {}
 
     def _secrets(self) -> tuple[str, ...]:
         out = list(self._llm.extra_secrets() or ())
-        return tuple(s for s in out if len(str(s)) >= 8)
+        if self._search is not None:
+            extra_fn = getattr(self._search, "extra_secrets", None)
+            if callable(extra_fn):
+                out.extend(extra_fn() or ())
+            else:
+                skey = getattr(self._search, "api_key", "")
+                if skey:
+                    out.append(str(skey))
+        return tuple(dict.fromkeys(str(s) for s in out if len(str(s)) >= 8))
+
+    def _release_repeat_keys(self, keys: list[tuple[str, str, str, bool, str]]) -> None:
+        if not keys:
+            return
+        with self._state_lock:
+            for k in keys:
+                self._repeat_seen.pop(k, None)
 
     def _persist_batch_items(self, batch: Batch) -> None:
         if batch.persisted:
@@ -305,7 +329,7 @@ class EchoAgent:
             return [SendText(gid, umo, "这方面我这边暂时没接画图/语音接口，做不到呢。")]
         if self._tasks is None or not self._tasks.available():
             return []
-        non_sticker_imgs = tuple(m.data for m in batch.images if m.data)[:2]
+        non_sticker_imgs = tuple(m.data for m in batch.images if m.data and not m.is_sticker)[:2]
         req = TaskRequest(
             group_id=gid,
             umo=umo,
@@ -395,22 +419,29 @@ class EchoAgent:
         prev_history = self._repo.recent_messages(gid, limit=self.context.history_limit)
         self._persist_batch_items(batch)
 
-        # 3) 重复文本消息 30 秒内防重（仅对显式无图相同短句防刷）
+        # 3) 重复文本消息 30 秒内防重（按点名与引用上下文隔离，静默/过滤/报错时回滚）
         now = time.time()
-        repeat_keys: list[str] = []
+        repeat_keys: list[tuple[str, str, str, bool, str]] = []
         if not batch.has_image:
             repeat_keys = [
-                _repeat_key(gid, i.user_id, i.text)
+                _repeat_key(
+                    gid,
+                    i.user_id,
+                    i.text,
+                    mentioned=bool(i.mentioned or batch.mentioned),
+                    quote_msg_id=i.quote_msg_id,
+                )
                 for i in batch.items
                 if str(i.text or "").strip()
             ]
-            if repeat_keys and all(now - self._repeat_seen.get(k, 0.0) < REPEAT_WINDOW for k in repeat_keys):
-                return {"replied": False, "actions": [], "reason": "repeat"}
-            for k in repeat_keys:
-                self._repeat_seen[k] = now
-            if len(self._repeat_seen) > 500:
-                cutoff = now - REPEAT_WINDOW
-                self._repeat_seen = {k: v for k, v in self._repeat_seen.items() if v >= cutoff}
+            with self._state_lock:
+                if repeat_keys and all(now - self._repeat_seen.get(k, 0.0) < REPEAT_WINDOW for k in repeat_keys):
+                    return {"replied": False, "actions": [], "reason": "repeat"}
+                for k in repeat_keys:
+                    self._repeat_seen[k] = now
+                if len(self._repeat_seen) > 500:
+                    cutoff = now - REPEAT_WINDOW
+                    self._repeat_seen = {k: v for k, v in self._repeat_seen.items() if v >= cutoff}
 
         # 4) 仅在正式进入模型决策时非破坏性绑定近期群图（绝不让被跳过的批消费未看图）
         self._scheduler.merge_recent_images(batch, now=now)
@@ -479,8 +510,7 @@ class EchoAgent:
             except Exception as exc:
                 elapsed = time.monotonic() - started
                 self._repo.record_event(gid, "model_error", ok=False, latency=elapsed, detail=str(exc))
-                for k in repeat_keys:
-                    self._repeat_seen.pop(k, None)
+                self._release_repeat_keys(repeat_keys)
                 if batch.mentioned and not batch.retold:
                     quote_mid = self._resolve_quote_mid(gid, anchor)
                     notice = _format_model_error_notice(exc)
@@ -501,12 +531,15 @@ class EchoAgent:
                 LLMMessage(role="assistant", content=turn.text or "", tool_calls=turn.tool_calls)
             )
             should_stop_loop = False
-            for tc in turn.tool_calls:
+            non_terminal_tcs = [tc for tc in turn.tool_calls if tc.name not in _TERMINAL_TOOLS]
+            terminal_tcs = [tc for tc in turn.tool_calls if tc.name in _TERMINAL_TOOLS]
+            for tc in (*non_terminal_tcs, *terminal_tcs):
                 args = tc.arguments if isinstance(tc.arguments, dict) else {}
                 name = tc.name
 
                 if name == "stay_silent":
                     if allow_silent:
+                        self._release_repeat_keys(repeat_keys)
                         elapsed = time.monotonic() - started
                         self._repo.record_event(gid, "silent", ok=True, latency=elapsed, tokens=total_tokens)
                         return {"replied": False, "actions": [], "reason": "silent"}
@@ -546,9 +579,21 @@ class EchoAgent:
                         break
                     picked = self._pick_emoji(gid, mood)
                     if picked is None:
+                        if batch.mentioned and not batch.retold:
+                            llm_messages.append(LLMMessage(
+                                role="tool",
+                                tool_call_id=tc.id,
+                                name=name,
+                                content="本群表情库暂未匹配到合适表情，请直接用简洁文字回复群友。",
+                            ))
+                            continue
+                        self._release_repeat_keys(repeat_keys)
                         elapsed = time.monotonic() - started
                         self._repo.record_event(gid, "silent", ok=True, latency=elapsed)
                         return {"replied": False, "actions": [], "reason": "silent"}
+                    now_emoji = time.time()
+                    with self._state_lock:
+                        self._last_emoji_at[gid] = now_emoji
                     elapsed = time.monotonic() - started
                     self._repo.record_event(gid, "send_face", ok=True, latency=elapsed, tokens=total_tokens, detail=mood)
                     _record_tool("send_emoji")
@@ -561,8 +606,9 @@ class EchoAgent:
                         gid,
                         user_id=anchor.user_id if anchor else "",
                         from_mentioned=bool(batch.mentioned and not batch.retold),
-                        now=time.time(),
+                        now=now_emoji,
                     )
+                    self._maybe_summarize(gid)
                     if picked.kind == "face":
                         terminal_actions = [SendFace(gid, umo, picked.face_id)]
                     else:
@@ -673,40 +719,71 @@ class EchoAgent:
         if terminal_actions is not None:
             return {"replied": True, "actions": terminal_actions, "reason": terminal_reason}
 
+        # MAX_TOOL_ROUNDS 耗尽且已查过工具但尚未收尾正文时，补充一轮无工具收尾调用
+        if not reply_text and not attach_mood and tools_used:
+            try:
+                wrap_turn = self._llm.chat(llm_messages, tools=())
+                total_tokens += int(wrap_turn.usage_tokens or 0)
+                reply_text = str(wrap_turn.text or "").strip()
+            except Exception as exc:
+                elapsed = time.monotonic() - started
+                self._repo.record_event(gid, "model_error", ok=False, latency=elapsed, detail=str(exc))
+                self._release_repeat_keys(repeat_keys)
+                if batch.mentioned and not batch.retold:
+                    quote_mid = self._resolve_quote_mid(gid, anchor)
+                    notice = _format_model_error_notice(exc)
+                    return {
+                        "replied": True,
+                        "actions": [SendText(gid, umo, notice, reply_to_msg_id=quote_mid)],
+                        "reason": "model_error",
+                        "error": str(exc),
+                        "text": notice,
+                    }
+                return {"replied": False, "actions": [], "reason": "model_error", "error": str(exc), "text": ""}
+
         elapsed = time.monotonic() - started
         if not reply_text:
+            self._release_repeat_keys(repeat_keys)
             self._repo.record_event(gid, "silent", ok=True, latency=elapsed, tokens=total_tokens)
             return {"replied": False, "actions": [], "reason": "silent"}
 
         if is_boilerplate(reply_text):
+            self._release_repeat_keys(repeat_keys)
             self._repo.record_event(gid, "filtered", ok=False, latency=elapsed)
             return {"replied": False, "actions": [], "reason": "filtered"}
 
         cleaned = clean_display_text(scrub_internal_leaks(reply_text, extra_secrets=self._secrets()))
         if not cleaned:
+            self._release_repeat_keys(repeat_keys)
             self._repo.record_event(gid, "filtered", ok=False, latency=elapsed)
             return {"replied": False, "actions": [], "reason": "filtered"}
 
         # 防 30 秒内同句复读
+        now_done = time.time()
         rkey = (_repeat_key(gid, "bot", cleaned), _repeat_key(gid, anchor.user_id if anchor else "", raw_text))
-        last_bot = self._last_bot_reply.get(gid)
-        if last_bot and last_bot[0] == rkey and time.time() - last_bot[1] < REPEAT_WINDOW:
-            return {"replied": False, "actions": [], "reason": "repeat_reply"}
-        self._last_bot_reply[gid] = (rkey, time.time())
-        if len(self._last_bot_reply) > 200:
-            self._last_bot_reply.clear()
+        with self._state_lock:
+            last_bot = self._last_bot_reply.get(gid)
+            if last_bot and last_bot[0] == rkey and now_done - last_bot[1] < REPEAT_WINDOW:
+                return {"replied": False, "actions": [], "reason": "repeat_reply"}
+            self._last_bot_reply[gid] = (rkey, now_done)
+            if len(self._last_bot_reply) > 200:
+                cutoff_bot = now_done - REPEAT_WINDOW
+                self._last_bot_reply = {
+                    k: v for k, v in self._last_bot_reply.items() if v[1] >= cutoff_bot
+                }
+            last_emoji_ts = self._last_emoji_at.get(gid, 0.0)
 
         # 智能 QQ 引用判断（处理模型思考期间是否有人插话）
         quote_mid = self._resolve_quote_mid(gid, anchor)
 
-        now_done = time.time()
         extra_actions: list[OutboundAction] = []
         explicit_emoji_req = any(h in (batch.body_text or "") for h in _EXPLICIT_EMOJI_HINTS)
-        emoji_cooldown_ok = explicit_emoji_req or (now_done - self._last_emoji_at.get(gid, 0.0) >= ATTACH_EMOJI_COOLDOWN)
+        emoji_cooldown_ok = explicit_emoji_req or (now_done - last_emoji_ts >= ATTACH_EMOJI_COOLDOWN)
         if attach_mood and has_emoji and self._emoji is not None and emoji_cooldown_ok:
             picked = self._pick_emoji(gid, attach_mood)
             if picked is not None:
-                self._last_emoji_at[gid] = now_done
+                with self._state_lock:
+                    self._last_emoji_at[gid] = now_done
                 _record_tool("send_emoji")
                 emoji_meta = self._format_emoji_meta(picked)
                 self._repo.record_event(gid, "send_face", ok=True, latency=0.0, detail="attach:" + attach_mood)

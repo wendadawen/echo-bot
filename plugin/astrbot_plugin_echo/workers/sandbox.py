@@ -425,8 +425,10 @@ class SandboxRunner:
         extra_secrets: Sequence[str] = (),
     ) -> TaskResult:
         prompt = str(req.prompt or "").strip()
-        if not prompt or not self.available(backend):
+        if not prompt:
             return TaskResult(status="empty", timeout=self.timeout)
+        if not self.available(backend):
+            return TaskResult(status="error", timeout=self.timeout, error="sandbox_unavailable")
         try:
             workdir_base = self._prepare_roots()
         except OSError as exc:
@@ -541,10 +543,25 @@ class SandboxRunner:
                 stderr_lines: collections.deque[str] = collections.deque(maxlen=64)
                 stderr_bytes = 0
 
+                def _iter_lines(stream: Any, max_chars: int = 65536):
+                    readline = getattr(stream, "readline", None)
+                    if callable(readline):
+                        while True:
+                            try:
+                                line = readline(max_chars)
+                            except TypeError:
+                                line = readline()
+                            if not line:
+                                break
+                            yield line
+                        return
+                    for line in stream:
+                        yield line
+
                 def _drain() -> None:
                     nonlocal total_bytes
                     try:
-                        for line in proc_stdout:
+                        for line in _iter_lines(proc_stdout):
                             line_len = len(line.encode("utf-8", errors="ignore"))
                             step = backend.parse_line(line)
                             if step and on_progress is not None:
@@ -563,15 +580,23 @@ class SandboxRunner:
 
                 def _drain_stderr() -> None:
                     nonlocal stderr_bytes
+                    if proc_stderr is None:
+                        return
                     try:
-                        for line in proc_stderr:
-                            line_len = len(line.encode("utf-8", errors="ignore"))
+                        for line in _iter_lines(proc_stderr):
+                            chunk = line[-400:] if len(line) > 400 else line
+                            chunk_len = len(chunk.encode("utf-8", errors="ignore"))
                             with data_lock:
-                                stderr_lines.append(line[-400:] if len(line) > 400 else line)
-                                stderr_bytes += line_len
+                                if stderr_lines.maxlen is not None and len(stderr_lines) >= stderr_lines.maxlen:
+                                    evicted = stderr_lines.popleft()
+                                    stderr_bytes -= len(evicted.encode("utf-8", errors="ignore"))
+                                stderr_lines.append(chunk)
+                                stderr_bytes += chunk_len
                                 while stderr_bytes > MAX_STDERR_BYTES and len(stderr_lines) > 1:
                                     dropped = stderr_lines.popleft()
                                     stderr_bytes -= len(dropped.encode("utf-8", errors="ignore"))
+                                if stderr_bytes < 0:
+                                    stderr_bytes = 0
                     except Exception:
                         pass
 
@@ -637,10 +662,14 @@ class SandboxRunner:
                     if watcher is not None:
                         watcher.join(timeout=0.5)
 
-            cancelled = bool(cancel_triggered[0] or (cancel_event is not None and cancel_event.is_set()))
+            rc = getattr(proc, "returncode", None)
+            cancelled = bool(
+                cancel_triggered[0]
+                or (cancel_event is not None and cancel_event.is_set() and rc != 0)
+            )
         finally:
-            rc = getattr(proc, "returncode", 0)
-            if not timed_out and not cancelled and rc in (0, None):
+            rc = getattr(proc, "returncode", None)
+            if not timed_out and not cancelled and rc == 0:
                 collected = self._collect_outbox(
                     outbox_dir, task_id, expected_task_dir=task_dir, extra_secrets=extra_secrets
                 )
@@ -664,8 +693,8 @@ class SandboxRunner:
                 error="timeout",
             )
         answer = backend.parse_output(stdout, limit=MAX_OUTPUT)
-        rc = getattr(proc, "returncode", 0)
-        if rc not in (0, None):
+        rc = getattr(proc, "returncode", None)
+        if rc != 0:
             err_msg = "exit {}".format(rc) + (": " + stderr_tail if stderr_tail else "")
             return TaskResult(
                 status="error",

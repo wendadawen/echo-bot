@@ -40,8 +40,15 @@ class InfraContractTests(unittest.TestCase):
             "LINK_RESOLVER_URL",
             "LINK_RESOLVER_SHA256",
             "QQ_DEB_SHA256",
+            "BOT_SEARCH_PROVIDER",
+            "BOT_SEARCH_API_BASE",
+            "BOT_SEARCH_API_KEY",
         ):
             self.assertIn(key, text)
+
+        env_ex = (ROOT / ".env.example").read_text(encoding="utf-8")
+        for needle in ("24 字节", "BOT_API_KEY", "BOT_SEARCH_PROVIDER", "MEM_LIMIT", "PIDS_LIMIT"):
+            self.assertIn(needle, env_ex)
 
     def test_entrypoint_and_supervisord_proxy_contracts(self):
         entry = (ROOT / "docker" / "entrypoint.sh").read_text(encoding="utf-8")
@@ -53,7 +60,8 @@ class InfraContractTests(unittest.TestCase):
 
         sup = (ROOT / "docker" / "supervisord.conf").read_text(encoding="utf-8")
         self.assertIn(
-            "env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy",
+            "env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy"
+            " -u BOT_API_KEY -u BOT_API_BASE -u BOT_SEARCH_API_KEY -u BOT_SEARCH_API_BASE",
             sup,
         )
 
