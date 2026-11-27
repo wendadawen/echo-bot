@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import re
 import time
@@ -23,6 +24,7 @@ from .qq_protocol import (
     _download_public_bytes,
     _get_attr_or_key,
     detect_mentions,
+    extract_replied_media_jobs,
     is_public_http_url,
     is_question,
     is_retold,
@@ -157,50 +159,131 @@ class AstrBotInboundParser:
                 return "回复 {}".format(sname), sname, qid
         return "", "", ""
 
-    async def _download_part_bytes(self, part: Any) -> bytes:
+    @staticmethod
+    def _decode_b64_image(src: str, *, require_prefix: bool = False) -> bytes:
+        s = str(src or "").strip()
+        if not s or len(s) >= 3 * 1024 * 1024:
+            return b""
+        if s.startswith("base64://"):
+            s = s[9:]
+        elif require_prefix:
+            return b""
+        try:
+            decoded = base64.b64decode(s, validate=False)
+        except Exception:
+            return b""
+        return decoded if looks_like_image(decoded) else b""
 
+    async def _read_safe_local_image(self, raw_ref: str) -> bytes:
+        lp = urllib.parse.unquote(urllib.parse.urlsplit(raw_ref).path) if raw_ref.startswith("file://") else raw_ref
+        safe_local = self._is_safe_local_file(lp)
+        if safe_local is None:
+            return b""
+        try:
+            if safe_local.stat().st_size <= MAX_DOWNLOAD_BYTES:
+                raw = await asyncio.to_thread(safe_local.read_bytes)
+                return raw if looks_like_image(raw) else b""
+        except OSError:
+            pass
+        return b""
+
+    async def _download_http_image(self, remote_url: str) -> bytes:
+        if not remote_url.startswith(("http://", "https://")):
+            return b""
+        try:
+            raw = await asyncio.to_thread(self._download, remote_url)
+            return raw if looks_like_image(raw) else b""
+        except Exception:
+            return b""
+
+    async def _download_part_bytes(self, part: Any, bot: Any = None) -> bytes:
         url = str(getattr(part, "url", "") or "").strip()
         file_ref = str(getattr(part, "file", "") or "").strip()
         path_ref = str(getattr(part, "path", "") or "").strip()
         b64_ref = str(getattr(part, "base64", "") or "").strip()
-        data = b""
         if self._download_sem is None:
             self._download_sem = asyncio.Semaphore(4)
         async with self._download_sem:
             for remote_url in dict.fromkeys((url, file_ref)):
-                if not data and remote_url.startswith(("http://", "https://")):
+                data = await self._download_http_image(remote_url)
+                if data:
+                    return data
+            for b64_src in (b64_ref, file_ref):
+                data = self._decode_b64_image(b64_src, require_prefix=True)
+                if data:
+                    return data
+            local_cands = [path_ref] if path_ref else []
+            if file_ref and not file_ref.startswith(("http://", "https://", "base64://")):
+                local_cands.append(file_ref)
+            for lp in local_cands:
+                data = await self._read_safe_local_image(lp)
+                if data:
+                    return data
+            if bot is not None and hasattr(bot, "call_action"):
+                file_key = (
+                    file_ref
+                    if (file_ref and not file_ref.startswith(("http://", "https://", "base64://", "file://")))
+                    else str(getattr(part, "file_unique", "") or "").strip()
+                )
+                if file_key:
                     try:
-                        data = await asyncio.to_thread(self._download, remote_url)
+                        res = await asyncio.wait_for(bot.call_action("get_image", file=file_key), timeout=4.0)
                     except Exception:
-                        data = b""
-            if not data:
-                for b64_src in (b64_ref, file_ref):
-                    if b64_src.startswith("base64://") and len(b64_src) < 3 * 1024 * 1024:
-                        try:
-                            data = base64.b64decode(b64_src[9:], validate=False)
-                        except Exception:
-                            data = b""
-                        break
-            if not data:
-                candidates = []
-                if path_ref:
-                    candidates.append(path_ref)
-                if file_ref.startswith("file://"):
-                    candidates.append(urllib.parse.unquote(urllib.parse.urlsplit(file_ref).path))
-                elif file_ref and not file_ref.startswith(("http://", "https://", "base64://")):
-                    candidates.append(file_ref)
-                for lp in candidates:
-                    safe_local = self._is_safe_local_file(lp)
-                    if safe_local is None:
-                        continue
-                    try:
-                        if safe_local.stat().st_size <= MAX_DOWNLOAD_BYTES:
-                            data = await asyncio.to_thread(safe_local.read_bytes)
+                        res = None
+                    info = res.get("data") if isinstance(res, dict) and isinstance(res.get("data"), dict) else res
+                    if isinstance(info, dict):
+                        data = await self._download_http_image(str(info.get("url") or "").strip())
+                        if data:
+                            return data
+                        data = self._decode_b64_image(str(info.get("base64") or ""), require_prefix=False)
+                        if data:
+                            return data
+                        info_file = str(info.get("file") or "").strip()
+                        if info_file:
+                            data = await self._read_safe_local_image(info_file)
                             if data:
-                                break
-                    except OSError:
-                        data = b""
-        return data if looks_like_image(data) else b""
+                                return data
+        return b""
+
+    async def _fetch_replied_media(
+        self, bot: Any, reply_id: str,
+    ) -> tuple[list[tuple[Any, Optional[dict[str, Any]], bool]], list[str]]:
+        try:
+            qid_arg: Any = int(reply_id) if reply_id.isdigit() else reply_id
+            raw_replied = await asyncio.wait_for(bot.call_action("get_msg", message_id=qid_arg), timeout=4.0)
+        except Exception:
+            return [], []
+        jobs, tags, fwd_ids = extract_replied_media_jobs(raw_replied)
+        for fid in fwd_ids:
+            try:
+                raw_fwd = await asyncio.wait_for(bot.call_action("get_forward_msg", id=fid), timeout=4.0)
+                fq = unpack_forward(raw_fwd)
+                if fq and fq not in tags:
+                    tags.append(fq)
+            except Exception:
+                pass
+        return jobs, tags
+
+    async def _collect_media_refs(
+        self,
+        jobs: list[tuple[Any, Optional[dict[str, Any]], bool]],
+        bot: Any,
+        out: list[MediaRef],
+    ) -> None:
+        if not jobs or len(out) >= 2:
+            return
+        pending = jobs[:2 - len(out)]
+        raw_bytes_list = await asyncio.gather(
+            *(self._download_part_bytes(p, bot=bot) for p, _, _ in pending),
+            return_exceptions=True,
+        )
+        for (part_obj, meta, allow_emoji), raw_data in zip(pending, raw_bytes_list):
+            if isinstance(raw_data, (bytes, bytearray)) and raw_data:
+                b = bytes(raw_data)
+                digest = hashlib.sha256(b).hexdigest()
+                sticker = bool(allow_emoji and is_sticker_image(part_obj, b, raw_meta=meta))
+                summary = str((meta or {}).get("summary") or getattr(part_obj, "summary", "") or "")
+                out.append(MediaRef(data=b, sha256=digest, is_sticker=sticker, summary=summary))
 
     async def parse(self, event: Any, last_bot_reply_at: float = 0.0) -> Optional[ChatEvent]:
         raw_gid = event.get_group_id()
@@ -238,28 +321,12 @@ class AstrBotInboundParser:
                     target_id = val
             if not self_id or target_id != self_id or sender == self_id:
                 return ChatEvent(
-                    group_id=group_id,
-                    user_id=sender,
-                    user_name=user_name,
-                    text="",
-                    raw_text="",
-                    msg_id="",
-                    ts=time.time(),
-                    umo=umo,
-                    passthrough=True,
+                    group_id=group_id, user_id=sender, user_name=user_name, text="",
+                    raw_text="", msg_id="", ts=time.time(), umo=umo, passthrough=True,
                 )
             return ChatEvent(
-                group_id=group_id,
-                user_id=sender,
-                user_name=user_name,
-                text="（戳了戳你）",
-                raw_text="",
-                msg_id="",
-                ts=time.time(),
-                umo=umo,
-                mentioned=True,
-                is_poke=True,
-                passthrough=False,
+                group_id=group_id, user_id=sender, user_name=user_name, text="（戳了戳你）",
+                raw_text="", msg_id="", ts=time.time(), umo=umo, mentioned=True, is_poke=True, passthrough=False,
             )
 
         msg_id = str(
@@ -372,6 +439,7 @@ class AstrBotInboundParser:
                             True,
                         ))
 
+        chain_reply_ids: list[str] = []
         if mentioned:
             for part in reply_parts:
                 found_chain_img = False
@@ -382,72 +450,31 @@ class AstrBotInboundParser:
                             # 引用图片供看图，绝不收入表情库
                             img_jobs.append((qseg, None, False))
                 reply_id = str(getattr(part, "id", "") or "").strip()
-                if not found_chain_img and len(img_jobs) < 2 and reply_id and bot and hasattr(bot, "call_action"):
-                    try:
-                        qid_arg: Any = int(reply_id) if reply_id.isdigit() else reply_id
-                        raw_replied = await asyncio.wait_for(bot.call_action("get_msg", message_id=qid_arg), timeout=4.0)
-                    except Exception:
-                        raw_replied = None
-                    raw_segs: Any = None
-                    if isinstance(raw_replied, dict):
-                        raw_segs = raw_replied.get("message")
-                        if not isinstance(raw_segs, list) and isinstance(raw_replied.get("data"), dict):
-                            raw_segs = raw_replied["data"].get("message")
-                    if isinstance(raw_segs, list):
-                        for seg in raw_segs:
-                            if not isinstance(seg, dict):
-                                continue
-                            stype = str(seg.get("type") or "").strip().lower()
-                            sdata = seg.get("data") if isinstance(seg.get("data"), dict) else {}
-                            if stype == "mface":
-                                msum = str(sdata.get("summary") or "").strip().strip("[]")
-                                murl = str(sdata.get("url") or "").strip()
-                                mtag = "[商城表情:{}]".format(msum or "表情")
-                                if mtag not in quote_extra_tags:
-                                    quote_extra_tags.append(mtag)
-                                if murl and len(img_jobs) < 2:
-                                    img_jobs.append((
-                                        types.SimpleNamespace(url=murl, file="", path="", base64="", subType="1", summary=msum),
-                                        {"sub_type": "1", "summary": msum or "表情"},
-                                        False,
-                                    ))
-                            elif stype == "image":
-                                iurl = str(sdata.get("url") or "").strip()
-                                ifile = str(sdata.get("file") or "").strip()
-                                if (iurl or ifile) and len(img_jobs) < 2:
-                                    img_jobs.append((
-                                        types.SimpleNamespace(url=iurl, file=ifile, path="", base64=""),
-                                        sdata,
-                                        False,
-                                    ))
-                            elif stype == "forward":
-                                fwd_q = unpack_forward(seg)
-                                if not fwd_q:
-                                    fwd_id = sdata.get("id")
-                                    if fwd_id and bot and hasattr(bot, "call_action"):
-                                        try:
-                                            raw_inner_fwd = await asyncio.wait_for(
-                                                bot.call_action("get_forward_msg", id=fwd_id), timeout=4.0
-                                            )
-                                            fwd_q = unpack_forward(raw_inner_fwd)
-                                        except Exception:
-                                            fwd_q = ""
-                                if fwd_q and fwd_q not in quote_extra_tags:
-                                    quote_extra_tags.append(fwd_q)
+                if found_chain_img:
+                    if reply_id and reply_id not in chain_reply_ids:
+                        chain_reply_ids.append(reply_id)
+                elif len(img_jobs) < 2 and reply_id and bot and hasattr(bot, "call_action"):
+                    rjobs, rtags = await self._fetch_replied_media(bot, reply_id)
+                    for rtag in rtags:
+                        if rtag not in quote_extra_tags:
+                            quote_extra_tags.append(rtag)
+                    for rjob in rjobs:
+                        if len(img_jobs) < 2:
+                            img_jobs.append(rjob)
 
         media_refs: list[MediaRef] = []
-        if img_jobs:
-            raw_bytes_list = await asyncio.gather(
-                *(self._download_part_bytes(p) for p, _, _ in img_jobs),
-                return_exceptions=True,
-            )
-            for (part_obj, meta, allow_emoji), raw_data in zip(img_jobs, raw_bytes_list):
-                if isinstance(raw_data, (bytes, bytearray)) and raw_data:
-                    b = bytes(raw_data)
-                    digest = hashlib.sha256(b).hexdigest()
-                    sticker = bool(allow_emoji and is_sticker_image(part_obj, b, raw_meta=meta))
-                    summary = str((meta or {}).get("summary") or getattr(part_obj, "summary", "") or "")
-                    media_refs.append(MediaRef(data=b, sha256=digest, is_sticker=sticker, summary=summary))
+        await self._collect_media_refs(img_jobs, bot, media_refs)
+
+        if mentioned and chain_reply_ids and not media_refs and bot and hasattr(bot, "call_action"):
+            for rid in chain_reply_ids:
+                if len(media_refs) >= 2:
+                    break
+                rjobs, rtags = await self._fetch_replied_media(bot, rid)
+                for rtag in rtags:
+                    if rtag not in quote_extra_tags:
+                        quote_extra_tags.append(rtag)
+                if rjobs:
+                    await self._collect_media_refs(rjobs, bot, media_refs)
 
         has_image = bool(media_refs) or any(isinstance(p, img_cls) for p in parts) or bool(mface_tags)
         has_sticker = any(m.is_sticker for m in media_refs)

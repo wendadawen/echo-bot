@@ -20,9 +20,18 @@ WINDOW_COOLDOWN = 15.0
 IDLE_COOLDOWN = 25.0
 POKE_COOLDOWN = 35.0
 
+_STICKER_EXPLICIT_NOUNS = ("表情", "表情包", "梗图", "动图", "贴纸", "配字", "什么梗")
+_STICKER_REF_HINTS = _STICKER_EXPLICIT_NOUNS + ("评价", "评一下", "评评", "点评")
+
 _IMAGE_REF_HINTS = (
     "图", "截图", "照片", "画面", "上图", "这张", "那张", "人物",
-    "识图", "看图", "刚才那", "上面那",
+    "识图", "看图", "刚才那", "上面那", "表情", "表情包", "梗图", "动图",
+    "贴纸", "配图", "图里", "图上", "画的", "拍的", "长啥样", "什么梗",
+)
+
+_VISUAL_FOLLOWUP_WORDS = (
+    "看", "这", "那", "啥", "谁", "什么", "评", "笑", "意思",
+    "可爱", "离谱", "抽象", "像", "好不好", "怎么样", "咋样", "表情", "图",
 )
 
 _FOLLOWUP_CONFIRMS = frozenset({
@@ -59,6 +68,7 @@ class Scheduler:
         self.image_wait = float(image_wait)
         self._pending: dict[str, Batch] = {}
         self._media_window: dict[str, list[_MediaSlot]] = {}
+        self._sticker_window: dict[str, list[_MediaSlot]] = {}
         self._last_input: dict[str, float] = {}
         self._last_reply_at: dict[str, float] = {}
         self._last_reply_user: dict[str, str] = {}
@@ -128,39 +138,36 @@ class Scheduler:
         with self._lock:
             return self._last_reply_at.get(str(group_id), 0.0)
 
-    def attach_images(
-        self,
-        group_id: str,
+    @staticmethod
+    def _upsert_window_locked(
+        window: dict[str, list[_MediaSlot]],
+        gid: str,
         media_list: Sequence[MediaRef],
-        now: Optional[float] = None,
-        sender_id: str = "",
+        cur: float,
+        sender_id: str,
+        cap: int,
     ) -> None:
-        """把近期群图存入非破坏性短时窗口；重复发同一张图时移至队尾并重置其未读状态。"""
         if not media_list:
             return
-        cur = time.time() if now is None else float(now)
-        gid = str(group_id)
-        with self._lock:
-            buf = [s for s in self._media_window.get(gid, []) if cur - s.ts <= IMAGE_TTL]
-            for m in media_list:
-                slot = _MediaSlot(media=m, ts=cur, sender_id=str(sender_id or ""), viewed_at=0.0)
-                if m.sha256:
-                    buf = [s for s in buf if s.media.sha256 != m.sha256]
-                buf.append(slot)
-            self._media_window[gid] = buf[-4:]
+        buf = [s for s in window.get(gid, []) if cur - s.ts <= IMAGE_TTL]
+        for m in media_list:
+            slot = _MediaSlot(media=m, ts=cur, sender_id=str(sender_id or ""), viewed_at=0.0)
+            if m.sha256:
+                buf = [s for s in buf if s.media.sha256 != m.sha256]
+            buf.append(slot)
+        window[gid] = buf[-cap:]
 
-    def prune_stale_media(self, now: Optional[float] = None) -> int:
-        """定期清理所有不活跃群里已过期的原始图片 bytes，防止永久内存泄漏。"""
-        cur = time.time() if now is None else float(now)
-        with self._lock:
-            return self._prune_stale_media_locked(cur)
-
-    def _prune_stale_media_locked(self, cur: float, skip_gids: Optional[set[str]] = None) -> int:
+    @staticmethod
+    def _prune_window_locked(
+        window: dict[str, list[_MediaSlot]],
+        cur: float,
+        skip_gids: Optional[set[str]] = None,
+    ) -> int:
         removed = 0
-        for gid in list(self._media_window.keys()):
+        for gid in list(window.keys()):
             if skip_gids and gid in skip_gids:
                 continue
-            old_buf = self._media_window[gid]
+            old_buf = window[gid]
             kept = [
                 s
                 for s in old_buf
@@ -169,58 +176,154 @@ class Scheduler:
             ]
             removed += len(old_buf) - len(kept)
             if kept:
-                self._media_window[gid] = kept
+                window[gid] = kept
             else:
-                self._media_window.pop(gid, None)
+                window.pop(gid, None)
         return removed
 
+    @staticmethod
+    def _mark_window_viewed_locked(
+        window: dict[str, list[_MediaSlot]],
+        gid: str,
+        digests: set[str],
+        refs: set[int],
+        cur: float,
+    ) -> None:
+        buf = window.get(gid)
+        if not buf:
+            return
+        for slot in buf:
+            if (slot.media.sha256 and slot.media.sha256 in digests) or id(slot.media) in refs:
+                if slot.viewed_at == 0.0:
+                    slot.viewed_at = cur
+
+    def attach_images(
+        self,
+        group_id: str,
+        media_list: Sequence[MediaRef],
+        now: Optional[float] = None,
+        sender_id: str = "",
+    ) -> None:
+        """把近期群图与表情包分别存入独立非破坏性短时窗口；互不挤占并重置未读状态。"""
+        if not media_list:
+            return
+        cur = time.time() if now is None else float(now)
+        gid = str(group_id)
+        photos = [m for m in media_list if not m.is_sticker]
+        stickers = [m for m in media_list if m.is_sticker]
+        with self._lock:
+            self._upsert_window_locked(self._media_window, gid, photos, cur, sender_id, 4)
+            self._upsert_window_locked(self._sticker_window, gid, stickers, cur, sender_id, 3)
+
+    def prune_stale_media(self, now: Optional[float] = None) -> int:
+        """定期清理所有不活跃群里已过期的原始图片 bytes，防止永久内存泄漏。"""
+        cur = time.time() if now is None else float(now)
+        with self._lock:
+            return self._prune_stale_media_locked(cur)
+
+    def _prune_stale_media_locked(self, cur: float, skip_gids: Optional[set[str]] = None) -> int:
+        return (
+            self._prune_window_locked(self._media_window, cur, skip_gids=skip_gids)
+            + self._prune_window_locked(self._sticker_window, cur, skip_gids=skip_gids)
+        )
+
     def merge_recent_images(self, batch: Batch, now: Optional[float] = None) -> None:
-        """非破坏性地把近期未看/同话题群图附着到当前批；绝不在投喂前弹出或标记已看。"""
+        """非破坏性地把近期未看/同话题群图或表情包附着到当前批；绝不在投喂前弹出或标记已看。"""
         cur = time.time() if now is None else float(now)
         gid = str(batch.group_id)
         with self._lock:
-            buf = [s for s in self._media_window.get(gid, []) if cur - s.ts <= IMAGE_TTL]
-            if buf:
-                self._media_window[gid] = buf
+            photos = [s for s in self._media_window.get(gid, []) if cur - s.ts <= IMAGE_TTL]
+            if photos:
+                self._media_window[gid] = photos
             else:
                 self._media_window.pop(gid, None)
 
+            stickers = [s for s in self._sticker_window.get(gid, []) if cur - s.ts <= IMAGE_TTL]
+            if stickers:
+                self._sticker_window[gid] = stickers
+            else:
+                self._sticker_window.pop(gid, None)
+
             if batch.images:
-                known = {s.media.sha256 for s in buf if s.media.sha256}
+                known = {s.media.sha256 for s in (*photos, *stickers) if s.media.sha256}
                 anchor_uid = batch.anchor.user_id if batch.anchor else ""
                 missing = [m for m in batch.images if not (m.sha256 and m.sha256 in known)]
                 if missing:
                     self.attach_images(gid, missing, now=cur, sender_id=anchor_uid)
                 return
 
-            if not buf:
+            if not photos and not stickers:
                 return
 
-            unread = [s for s in buf if s.viewed_at == 0.0]
             body = (batch.body_text or "").strip()
-            has_ref_hint = bool(body and any(h in body for h in _IMAGE_REF_HINTS))
-            if unread:
-                batch_uids = {str(i.user_id or "") for i in batch.items if i.user_id}
-                clean_body = re.sub(r"^(?:@\S+\s*)+", "", body).strip()
-                matched_unread = [
+            quote = (batch.quote_text or "").strip()
+            ref_scope = (body + " " + quote).strip()
+            clean_body = re.sub(r"^(?:@\S+\s*)+", "", body).strip()
+            batch_uids = {str(i.user_id or "") for i in batch.items if i.user_id}
+            is_bare_at = clean_body == "（只 @ 了你一下，没说话）"
+
+            has_explicit_sticker = bool(ref_scope and any(h in ref_scope for h in _STICKER_EXPLICIT_NOUNS))
+            has_sticker_hint = bool(ref_scope and any(h in ref_scope for h in _STICKER_REF_HINTS))
+            has_image_hint = bool(ref_scope and any(h in ref_scope for h in _IMAGE_REF_HINTS))
+            has_visual_cue = bool(is_bare_at or any(k in clean_body for k in _VISUAL_FOLLOWUP_WORDS))
+
+            unread_photos = [s for s in photos if s.viewed_at == 0.0]
+            matched_photos = [
+                s
+                for s in unread_photos
+                if (not s.sender_id)
+                or (s.sender_id in batch_uids)
+                or has_image_hint
+                or (
+                    batch.mentioned
+                    and cur - s.ts <= 30.0
+                    and (len(clean_body) <= 20 or has_visual_cue)
+                )
+            ]
+
+            unread_stickers = [s for s in stickers if s.viewed_at == 0.0]
+            matched_stickers: list[_MediaSlot] = []
+            if unread_stickers and (batch.mentioned or has_sticker_hint):
+                matched_stickers = [
                     s
-                    for s in unread
-                    if (not s.sender_id)
-                    or (s.sender_id in batch_uids)
-                    or has_ref_hint
+                    for s in unread_stickers
+                    if has_sticker_hint
+                    or (has_image_hint and (not s.sender_id or s.sender_id in batch_uids or cur - s.ts <= 60.0))
                     or (
-                        batch.mentioned
-                        and cur - s.ts <= 30.0
-                        and (len(clean_body) <= 20 or any(k in clean_body for k in ("看", "这", "那", "啥", "谁", "什么")))
+                        s.sender_id
+                        and s.sender_id in batch_uids
+                        and cur - s.ts <= 45.0
+                        and (is_bare_at or (len(clean_body) <= 24 and has_visual_cue))
                     )
                 ]
-                if matched_unread:
-                    batch.images = [s.media for s in matched_unread[-2:]]
-                    return
 
-            viewed = [s for s in buf if s.viewed_at > 0.0 and cur - s.viewed_at <= VIEWED_IMAGE_TTL]
-            if viewed and has_ref_hint:
-                batch.images = [s.media for s in viewed[-2:]]
+            if has_explicit_sticker and matched_stickers:
+                batch.images = [s.media for s in matched_stickers[-2:]]
+                return
+            if matched_photos and matched_stickers:
+                if (
+                    (has_sticker_hint or matched_stickers[-1].sender_id in batch_uids)
+                    and matched_stickers[-1].ts >= matched_photos[-1].ts
+                ):
+                    batch.images = [matched_stickers[-1].media]
+                else:
+                    batch.images = [s.media for s in matched_photos[-2:]]
+                return
+            if matched_photos:
+                batch.images = [s.media for s in matched_photos[-2:]]
+                return
+            if matched_stickers:
+                batch.images = [s.media for s in matched_stickers[-2:]]
+                return
+
+            viewed_photos = [s for s in photos if s.viewed_at > 0.0 and cur - s.viewed_at <= VIEWED_IMAGE_TTL]
+            viewed_stickers = [s for s in stickers if s.viewed_at > 0.0 and cur - s.viewed_at <= VIEWED_IMAGE_TTL]
+            if has_explicit_sticker and viewed_stickers:
+                batch.images = [s.media for s in viewed_stickers[-2:]]
+            elif has_image_hint and viewed_photos:
+                batch.images = [s.media for s in viewed_photos[-2:]]
+            elif (has_image_hint or has_sticker_hint) and viewed_stickers:
+                batch.images = [s.media for s in viewed_stickers[-2:]]
 
     def mark_images_viewed(
         self,
@@ -228,7 +331,7 @@ class Scheduler:
         media_list: Sequence[MediaRef],
         now: Optional[float] = None,
     ) -> None:
-        """仅在主引擎真正完成 LLM 调用后才标记图片已看；跳过批与报错批绝不消费图片。"""
+        """仅在主引擎真正完成 LLM 调用后才标记图片或表情包已看；跳过批与报错批绝不消费图片。"""
         if not media_list:
             return
         cur = time.time() if now is None else float(now)
@@ -236,13 +339,8 @@ class Scheduler:
         digests = {m.sha256 for m in media_list if m.sha256}
         refs = set(id(m) for m in media_list)
         with self._lock:
-            buf = self._media_window.get(gid)
-            if not buf:
-                return
-            for slot in buf:
-                if (slot.media.sha256 and slot.media.sha256 in digests) or id(slot.media) in refs:
-                    if slot.viewed_at == 0.0:
-                        slot.viewed_at = cur
+            self._mark_window_viewed_locked(self._media_window, gid, digests, refs, cur)
+            self._mark_window_viewed_locked(self._sticker_window, gid, digests, refs, cur)
 
     def enqueue(self, event: ChatEvent) -> None:
         gid = str(event.group_id)

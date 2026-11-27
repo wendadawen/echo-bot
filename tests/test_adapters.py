@@ -875,6 +875,76 @@ class InboundAndSenderTests(unittest.TestCase):
         self.assertTrue(lim.try_acquire("g1", now=161.0))
         self.assertFalse(MessageLimiter(per_minute=0).try_acquire("g1", now=100.0))
 
+    def test_base64_and_get_image_and_expired_reply_chain_fallbacks(self):
+        import base64
+
+        b64_payload = "base64://" + base64.b64encode(TINY_PNG).decode("ascii")
+        parser_b64 = AstrBotInboundParser(COMP_TYPES, downloader=lambda url: b"")
+        ev_b64 = self._make_event(
+            parts=[_Image(url="", file="", path="", base64=b64_payload)],
+            raw_msg={"message_id": 3001, "message": []},
+        )
+        parsed_b64 = asyncio.run(parser_b64.parse(ev_b64))
+        self.assertEqual(len(parsed_b64.images), 1)
+        self.assertEqual(parsed_b64.images[0].data, TINY_PNG)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            safe_dir = root / "allowed"
+            safe_dir.mkdir()
+            safe_img = safe_dir / "ok.png"
+            safe_img.write_bytes(TINY_PNG)
+            outside_img = root / "outside.png"
+            outside_img.write_bytes(TINY_PNG)
+
+            parser_fb = AstrBotInboundParser(
+                COMP_TYPES,
+                downloader=lambda url: TINY_PNG if "recovered.example.com" in url else b"",
+                allowed_local_roots=(safe_dir,),
+            )
+            bot_url = MagicMock()
+            bot_url.call_action = AsyncMock(return_value={"data": {"url": "https://recovered.example.com/1.png"}})
+            ev_url_fb = self._make_event(
+                parts=[_Image(url="https://broken.example.com/expired.png", file="expired.png"), _At(qq="8888"), _Plain("看图")],
+                raw_msg={"message_id": 3002, "message": []},
+                text="看图",
+            )
+            ev_url_fb.bot = bot_url
+            parsed_url_fb = asyncio.run(parser_fb.parse(ev_url_fb))
+            bot_url.call_action.assert_awaited_once_with("get_image", file="expired.png")
+            self.assertEqual(len(parsed_url_fb.images), 1)
+
+            bot_jail = MagicMock()
+            bot_jail.call_action = AsyncMock(side_effect=[
+                {"data": {"file": str(outside_img)}},
+                {"data": {"file": str(safe_img)}},
+            ])
+            ev_out = self._make_event(parts=[_Image(url="", file="k1")], raw_msg={"message_id": 3003, "message": []})
+            ev_out.bot = bot_jail
+            self.assertEqual(asyncio.run(parser_fb.parse(ev_out)).images, ())
+            ev_in = self._make_event(parts=[_Image(url="", file="k2")], raw_msg={"message_id": 3004, "message": []})
+            ev_in.bot = bot_jail
+            self.assertEqual(len(asyncio.run(parser_fb.parse(ev_in)).images), 1)
+
+            bot_q = MagicMock()
+            bot_q.call_action = AsyncMock(return_value={
+                "data": {"message": [{"type": "image", "data": {"url": "https://recovered.example.com/q.png", "file": "q.png"}}]}
+            })
+            ev_qstub = self._make_event(
+                parts=[
+                    _Reply(id="888", sender_id="2002", sender_nickname="小和", text="", chain=[_Image(url="https://broken.example.com/old.png")]),
+                    _At(qq="8888"),
+                    _Plain("看引用图"),
+                ],
+                raw_msg={"message_id": 3005, "message": []},
+                text="看引用图",
+            )
+            ev_qstub.bot = bot_q
+            parsed_qstub = asyncio.run(parser_fb.parse(ev_qstub))
+            bot_q.call_action.assert_awaited_once_with("get_msg", message_id=888)
+            self.assertEqual(len(parsed_qstub.images), 1)
+            self.assertFalse(parsed_qstub.images[0].is_sticker)
+
 
 if __name__ == "__main__":
     unittest.main()

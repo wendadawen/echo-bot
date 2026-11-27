@@ -474,11 +474,10 @@ class EchoAgent:
         self._persist_batch_items(batch)
 
         now = time.time()
+        self._scheduler.merge_recent_images(batch, now=now)
         repeat_keys, repeat_early = self._check_repeat_guard(batch, now)
         if repeat_early is not None:
             return repeat_early
-
-        self._scheduler.merge_recent_images(batch, now=now)
 
         running_task = self._tasks.running_for_group(gid) if self._tasks is not None else None
         caps = {

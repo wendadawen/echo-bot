@@ -281,11 +281,10 @@ class Echo(Star):
         if parsed.has_sticker:
             self._spawn_bg(self._collect_stickers(parsed.group_id, parsed.images))
 
-        # 保留新近非表情截图供后续追问使用（表情包不混入识图上下文）
-        non_stickers = [m for m in parsed.images if not m.is_sticker]
-        if non_stickers:
+        # 保留新近群图与表情包至各自短时窗口供后续追问/评价使用（彼此隔离、互不挤占）
+        if parsed.images:
             self.scheduler.attach_images(
-                parsed.group_id, non_stickers, now=parsed.ts, sender_id=parsed.user_id
+                parsed.group_id, parsed.images, now=parsed.ts, sender_id=parsed.user_id
             )
 
         # 未被 @ 的纯图片/表情只落人物活跃轨迹，不吵群；若包含正文或被 @ 则入口即时落库并进调度队列

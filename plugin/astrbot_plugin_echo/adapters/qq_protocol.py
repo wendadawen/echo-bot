@@ -6,6 +6,7 @@ import ipaddress
 import re
 import socket
 import struct
+import types
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -354,3 +355,55 @@ def unpack_forward(comp: Any, _depth: int = 0) -> str:
     if len(joined) > MAX_FORWARD_CHARS:
         joined = joined[:MAX_FORWARD_CHARS] + "…"
     return joined if _depth > 0 else ("（转发的聊天）" + joined)
+
+
+def extract_replied_media_jobs(
+    raw_replied: Any,
+) -> tuple[list[tuple[Any, Optional[dict[str, Any]], bool]], list[str], list[str]]:
+    """从 OneBot `get_msg` 响应中提取引用消息里的图片/商城表情下载任务、文案标签与嵌套转发 ID。"""
+    img_jobs: list[tuple[Any, Optional[dict[str, Any]], bool]] = []
+    extra_tags: list[str] = []
+    forward_ids: list[str] = []
+    if not isinstance(raw_replied, dict):
+        return img_jobs, extra_tags, forward_ids
+    raw_segs = raw_replied.get("message")
+    if not isinstance(raw_segs, list) and isinstance(raw_replied.get("data"), dict):
+        raw_segs = raw_replied["data"].get("message")
+    if not isinstance(raw_segs, list):
+        return img_jobs, extra_tags, forward_ids
+
+    for seg in raw_segs:
+        if not isinstance(seg, dict):
+            continue
+        stype = str(seg.get("type") or "").strip().lower()
+        sdata = seg.get("data") if isinstance(seg.get("data"), dict) else {}
+        if stype == "mface":
+            msum = str(sdata.get("summary") or "").strip().strip("[]")
+            murl = str(sdata.get("url") or "").strip()
+            mtag = "[商城表情:{}]".format(msum or "表情")
+            if mtag not in extra_tags:
+                extra_tags.append(mtag)
+            if murl and len(img_jobs) < 2:
+                img_jobs.append((
+                    types.SimpleNamespace(url=murl, file="", path="", base64="", subType="1", summary=msum),
+                    {"sub_type": "1", "summary": msum or "表情"},
+                    False,
+                ))
+        elif stype == "image":
+            iurl = str(sdata.get("url") or "").strip()
+            ifile = str(sdata.get("file") or "").strip()
+            funiq = str(sdata.get("file_unique") or "").strip()
+            if (iurl or ifile or funiq) and len(img_jobs) < 2:
+                img_jobs.append((
+                    types.SimpleNamespace(url=iurl, file=ifile, file_unique=funiq, path="", base64=""),
+                    sdata,
+                    False,
+                ))
+        elif stype == "forward":
+            fwd_q = unpack_forward(seg)
+            if fwd_q:
+                if fwd_q not in extra_tags:
+                    extra_tags.append(fwd_q)
+            elif sdata.get("id"):
+                forward_ids.append(str(sdata["id"]))
+    return img_jobs, extra_tags, forward_ids

@@ -524,6 +524,65 @@ class IncidentReplayTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_13_sticker_followup_evaluation_and_bare_at_after_sticker(self):
+        async def scenario():
+            with tempfile.TemporaryDirectory() as tmp:
+                from astrbot_plugin_echo.domain import ModelTurn
+                spy = _SpyLLM(
+                    [ModelTurn(text="哈哈这只小猫表情太魔性了"), ModelTurn(text="收到啦"), ModelTurn(text="又拿这个表情来怼我")],
+                    vision_label="震惊呕吐|一只小猫露出惊恐表情",
+                )
+                echo, ctx = self._build_echo(Path(tmp), spy)
+
+                # Replay A (19:00 线上事故): 先发未 @ 表情包(sub_type=1)，5 秒后 @ 评价这个表情
+                ev_st = _make_event(
+                    [_Image(url="https://cdn.example.com/sticker_yue.png", file="sticker_yue.png")],
+                    uid="2320",
+                    name="和",
+                    raw_msg={"message_id": "401", "message": [{"type": "image", "data": {"file": "sticker_yue.png", "sub_type": "1", "summary": "[动画表情]"}}]},
+                )
+                await _drive_event(echo, ev_st)
+                if echo._bg_tasks:
+                    await asyncio.gather(*list(echo._bg_tasks), return_exceptions=True)
+
+                ev_eval = _make_event(
+                    [_At(qq="8888"), _Plain("评价这个表情")],
+                    uid="2320",
+                    name="和",
+                    text="评价这个表情",
+                    raw_msg={"message_id": "402", "message": []},
+                )
+                await _drive_event(echo, ev_eval)
+                await echo._process_batch(echo.scheduler.due(now=9e9)[0])
+                self.assertEqual(len(spy.chat_calls[0]["messages"][-1].images), 1)
+                bot_rows = [r for r in echo.repo.recent_messages("aiocqhttp:10086", limit=10) if r["role"] == "bot"]
+                self.assertTrue(any("seen_image" in str(r.get("meta") or "") for r in bot_rows), bot_rows)
+
+                # Replay B (20:46 线上事故): 裸@ -> 发图/表情 -> 几秒后再裸@ 仍能看图不误吞
+                ev_b1 = _make_event([_At(qq="8888")], uid="2573", name="炸芋花", raw_msg={"message_id": "403", "message": []})
+                await _drive_event(echo, ev_b1)
+                await echo._process_batch(echo.scheduler.due(now=9e9)[0])
+
+                echo.inbound._download = lambda url: TINY_PNG + b"yue2" if "sticker_yue2" in url else (TINY_GIF if "sticker" in url else TINY_PNG)
+                ev_st2 = _make_event(
+                    [_Image(url="https://cdn.example.com/sticker_yue2.png", file="sticker_yue2.png")],
+                    uid="2573",
+                    name="炸芋花",
+                    raw_msg={"message_id": "404", "message": [{"type": "image", "data": {"file": "sticker_yue2.png", "sub_type": "1", "summary": "[动画表情]"}}]},
+                )
+                await _drive_event(echo, ev_st2)
+                if echo._bg_tasks:
+                    await asyncio.gather(*list(echo._bg_tasks), return_exceptions=True)
+
+                ev_b2 = _make_event([_At(qq="8888")], uid="2573", name="炸芋花", raw_msg={"message_id": "405", "message": []})
+                await _drive_event(echo, ev_b2)
+                sent_before = ctx.send_message.call_count
+                await echo._process_batch(echo.scheduler.due(now=9e9)[0])
+                self.assertGreater(ctx.send_message.call_count, sent_before)
+                self.assertEqual(len(spy.chat_calls[-1]["messages"][-1].images), 1)
+
+        asyncio.run(scenario())
+
 
 if __name__ == "__main__":
     unittest.main()

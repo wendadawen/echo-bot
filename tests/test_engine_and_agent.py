@@ -3,6 +3,7 @@
 import json
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -242,6 +243,36 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual([b.group_id for b in ready], ["g_busy"])
         self.assertNotIn("g_idle", sch._media_window)
         self.assertIn("g_busy", sch._media_window)
+
+    def test_sticker_window_isolation_evaluation_and_bare_at_followup(self):
+        sch = Scheduler()
+        shot = MediaRef(data=TINY_PNG, sha256="shot_keep", is_sticker=False)
+        st1 = MediaRef(data=TINY_PNG + b"1", sha256="st_1", is_sticker=True)
+        st2 = MediaRef(data=TINY_PNG + b"2", sha256="st_2", is_sticker=True)
+        st3 = MediaRef(data=TINY_PNG + b"3", sha256="st_3", is_sticker=True)
+
+        # 表情包存入 _sticker_window，绝不挤出 _media_window 中的普通截图
+        sch.attach_images("g_st", [shot], now=100.0, sender_id="u1")
+        sch.attach_images("g_st", [st1, st2, st3], now=102.0, sender_id="u1")
+        self.assertEqual([s.media.sha256 for s in sch._media_window["g_st"]], ["shot_keep"])
+        self.assertEqual([s.media.sha256 for s in sch._sticker_window["g_st"]], ["st_1", "st_2", "st_3"])
+
+        # @大肥鱼 评价这个表情 -> 命中最新表情包
+        eval_b = Batch("g_st", [ChatEvent("g_st", "u2", "乙", "@大肥鱼 评价这个表情", ts=106.0, mentioned=True)])
+        sch.merge_recent_images(eval_b, now=106.0)
+        self.assertEqual([m.sha256 for m in eval_b.images], ["st_1", "st_2", "st_3"][-2:])
+
+        # 无关技术问答（即使刚发过表情包）绝不误贴表情包
+        tech_b = Batch("g_st", [ChatEvent("g_st", "u2", "乙", "@大肥鱼 Python 怎么写 asyncio 并发", ts=108.0, mentioned=True)])
+        sch.merge_recent_images(tech_b, now=108.0)
+        self.assertEqual(tech_b.images, [])
+
+        # 同人刚发过表情包，45 秒内裸 @ 追问会自动附着表情包
+        sch2 = Scheduler()
+        sch2.attach_images("g_bare", [st1], now=200.0, sender_id="u1")
+        bare_b = Batch("g_bare", [ChatEvent("g_bare", "u1", "甲", "（只 @ 了你一下，没说话）", ts=205.0, mentioned=True)])
+        sch2.merge_recent_images(bare_b, now=205.0)
+        self.assertEqual([m.sha256 for m in bare_b.images], ["st_1"])
 
 
 class ContextTests(unittest.TestCase):
@@ -864,6 +895,25 @@ class EchoAgentTests(unittest.TestCase):
             reply_out = r_wrap["actions"][0].text
             self.assertIn("查到了苏州晴天", reply_out)
             self.assertNotIn("tvly-secret-leak-888", reply_out)
+
+            # 4) 裸 @ -> 表情包 -> 10s 内再裸 @：先 merge_recent_images 再判 repeat，绝不误吞
+            t_bare = time.time()
+            st_media = MediaRef(data=TINY_PNG + b"st", sha256="st_repeat_guard", is_sticker=True)
+            llm_bare = _SeqLLM([
+                ModelTurn(text="咋光@我不说话"),
+                ModelTurn(text="这只猫猫挺搞笑的"),
+            ], ignore_summary=True)
+            agent_bare = EchoAgent(repo, llm_bare, sch)
+            r_b1 = agent_bare.handle_batch(
+                Batch("g_bare_ag", [ChatEvent("g_bare_ag", "u1", "甲", "（只 @ 了你一下，没说话）", msg_id="b1", ts=t_bare, mentioned=True)])
+            )
+            self.assertEqual(r_b1["reason"], "reply")
+            sch.attach_images("g_bare_ag", [st_media], now=t_bare + 2.0, sender_id="u1")
+            r_b2 = agent_bare.handle_batch(
+                Batch("g_bare_ag", [ChatEvent("g_bare_ag", "u1", "甲", "（只 @ 了你一下，没说话）", msg_id="b2", ts=t_bare + 5.0, mentioned=True)])
+            )
+            self.assertEqual(r_b2["reason"], "reply")
+            self.assertEqual(len(llm_bare.recorded_calls[1]["messages"][-1].images), 1)
             repo.close()
 
 

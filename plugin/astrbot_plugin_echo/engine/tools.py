@@ -217,7 +217,10 @@ class AgentToolkit:
             return [SendText(gid, umo, "这方面我这边暂时没接画图/语音接口，做不到呢。")]
         if self._tasks is None or not self._tasks.available():
             return []
-        non_sticker_imgs = tuple(m.data for m in batch.images if m.data and not m.is_sticker)[:2]
+        non_sticker_imgs = (
+            tuple(m.data for m in batch.images if m.data and not m.is_sticker)[:2]
+            or tuple(m.data for m in batch.images if m.data)[:2]
+        )
         req = TaskRequest(
             group_id=gid,
             umo=umo,
