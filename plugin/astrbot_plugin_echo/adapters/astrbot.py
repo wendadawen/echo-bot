@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import ipaddress
 import re
@@ -24,7 +25,6 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from ..domain import (
-    FACE_LABELS,
     ChatEvent,
     FaceRef,
     MediaRef,
@@ -37,6 +37,7 @@ from ..domain import (
     clean_display_text,
     detect_image_dimensions,
     format_speaker_message,
+    resolve_face_label,
 )
 from ..workers.sandbox import cleanup_file_entry
 
@@ -182,6 +183,48 @@ def raw_image_metas(raw_msg: Any) -> list[dict[str, Any]]:
     ]
 
 
+def raw_face_texts(raw_msg: Any) -> dict[str, str]:
+    out: dict[str, str] = {}
+    if not isinstance(raw_msg, dict) or not isinstance(raw_msg.get("message"), list):
+        return out
+    for seg in raw_msg["message"]:
+        if not isinstance(seg, dict) or seg.get("type") != "face":
+            continue
+        data = seg.get("data") or {}
+        fid = str(data.get("id") or "").strip()
+        if not fid or fid in out:
+            continue
+        raw_obj = data.get("raw") if isinstance(data.get("raw"), dict) else {}
+        ft = str(raw_obj.get("faceText") or data.get("faceText") or "").strip()
+        if ft:
+            out[fid] = ft
+    return out
+
+
+_RPS_NAMES = {"1": "布", "2": "剪刀", "3": "石头"}
+
+
+def raw_special_tags(raw_msg: Any) -> list[str]:
+    out: list[str] = []
+    if not isinstance(raw_msg, dict) or not isinstance(raw_msg.get("message"), list):
+        return out
+    for seg in raw_msg["message"]:
+        if not isinstance(seg, dict):
+            continue
+        stype = str(seg.get("type") or "").strip().lower()
+        data = seg.get("data") if isinstance(seg.get("data"), dict) else {}
+        if stype == "dice":
+            res = str(data.get("result") or "").strip()
+            out.append("[骰子:{}点]".format(res) if res else "[骰子]")
+        elif stype == "rps":
+            res = str(data.get("result") or "").strip()
+            label = _RPS_NAMES.get(res, res)
+            out.append("[猜拳:{}]".format(label) if label else "[猜拳]")
+        if len(out) >= 3:
+            break
+    return out
+
+
 def match_raw_image_meta(part: Any, raw_metas: list[dict[str, Any]], index: int) -> Optional[dict[str, Any]]:
     if not raw_metas:
         return None
@@ -295,10 +338,15 @@ def unpack_forward(comp: Any, _depth: int = 0) -> str:
                 return (" " + nested + " ") if nested else ""
             if p_type == "image":
                 return "[图片]"
+            if p_type == "mface":
+                msum = str(pdata.get("summary") or "").strip().strip("[]")
+                return "[商城表情:{}]".format(msum or "表情")
             if p_type == "face":
                 fid = str(pdata.get("id") or "").strip()
-                fn = FACE_LABELS.get(fid, "")
-                return "[QQ表情:{}]".format(fn or fid or "表情")
+                raw_obj = pdata.get("raw") if isinstance(pdata.get("raw"), dict) else {}
+                ft = str(raw_obj.get("faceText") or pdata.get("faceText") or pdata.get("name") or "").strip()
+                fn = resolve_face_label(fid, ft)
+                return "[QQ表情:{}]".format(fn or (("ID" + fid) if fid else "表情"))
             t = _get_attr_or_key(pdata, "text", "content", default="")
             if isinstance(t, (list, tuple, dict)):
                 return seg_text(t)
@@ -337,9 +385,8 @@ def unpack_forward(comp: Any, _depth: int = 0) -> str:
 class MessageLimiter:
     """滑动窗口发送限流：每群每分钟最多 per_minute 条，避免刷屏。"""
 
-    def __init__(self, per_minute: int = 8, per_burst: int = 3):
+    def __init__(self, per_minute: int = 8):
         self.per_minute = per_minute
-        self.per_burst = per_burst
         self._sent: dict[str, list[float]] = {}
 
     def _trim(self, group_id: str, now: float) -> list[float]:
@@ -390,7 +437,7 @@ class AstrBotInboundParser:
 
     @staticmethod
     def _has_passthrough_component(parts: list[Any]) -> bool:
-        pass_types = {"json", "share", "poke", "record", "video", "music", "location"}
+        pass_types = {"json", "share", "record", "video", "music", "location"}
         for part in parts:
             cls_name = type(part).__name__.lower()
             comp_type = str(getattr(part, "type", "") or "").lower()
@@ -416,8 +463,8 @@ class AstrBotInboundParser:
                         segs.append("[图片]")
                     elif isinstance(seg, face_cls):
                         fid = str(getattr(seg, "id", "") or "").strip()
-                        fn = str(getattr(seg, "name", "") or FACE_LABELS.get(fid) or "").strip()
-                        segs.append("[QQ表情:{}]".format(fn or fid or "表情"))
+                        fn = resolve_face_label(fid, getattr(seg, "name", ""))
+                        segs.append("[QQ表情:{}]".format(fn or (("ID" + fid) if fid else "表情")))
                     else:
                         txt = getattr(seg, "text", None)
                         if txt:
@@ -432,7 +479,6 @@ class AstrBotInboundParser:
         return "", "", ""
 
     async def _download_part_bytes(self, part: Any) -> bytes:
-        import base64
 
         url = str(getattr(part, "url", "") or "").strip()
         file_ref = str(getattr(part, "file", "") or "").strip()
@@ -487,6 +533,54 @@ class AstrBotInboundParser:
         parts = list(event.get_messages() or ())
         msg_obj = getattr(event, "message_obj", None)
         raw_msg = getattr(msg_obj, "raw_message", None)
+
+        # 戳一戳事件：仅响应针对大肥鱼的戳一戳，群友互戳或自身回声一律放行忽略
+        poke_part = None
+        for part in parts:
+            cls_name = type(part).__name__.lower()
+            comp_type = str(getattr(part, "type", "") or "").lower()
+            if cls_name in ("poke", "_poke") or comp_type == "poke" or comp_type.endswith(".poke"):
+                poke_part = part
+                break
+        is_raw_poke = isinstance(raw_msg, dict) and str(raw_msg.get("sub_type") or "").lower() == "poke"
+        if poke_part is not None or is_raw_poke:
+            target_id = ""
+            if poke_part is not None:
+                for attr in ("id", "qq"):
+                    val = str(getattr(poke_part, attr, "") or "").strip()
+                    if val and val != "0":
+                        target_id = val
+                        break
+            if not target_id and isinstance(raw_msg, dict):
+                val = str(raw_msg.get("target_id") or "").strip()
+                if val and val != "0":
+                    target_id = val
+            if not self_id or target_id != self_id or sender == self_id:
+                return ChatEvent(
+                    group_id=group_id,
+                    user_id=sender,
+                    user_name=user_name,
+                    text="",
+                    raw_text="",
+                    msg_id="",
+                    ts=time.time(),
+                    umo=umo,
+                    passthrough=True,
+                )
+            return ChatEvent(
+                group_id=group_id,
+                user_id=sender,
+                user_name=user_name,
+                text="（戳了戳你）",
+                raw_text="",
+                msg_id="",
+                ts=time.time(),
+                umo=umo,
+                mentioned=True,
+                is_poke=True,
+                passthrough=False,
+            )
+
         msg_id = str(
             (raw_msg.get("message_id") if isinstance(raw_msg, dict) else None)
             or getattr(msg_obj, "message_id", "")
@@ -555,14 +649,21 @@ class AstrBotInboundParser:
         faces: list[FaceRef] = []
         face_tags: list[str] = []
         mface_tags: list[str] = []
+        quote_extra_tags: list[str] = []
         img_jobs: list[tuple[Any, Optional[dict[str, Any]], bool]] = []
         raw_metas = raw_image_metas(raw_msg)
+        face_texts = raw_face_texts(raw_msg)
+        special_tags = raw_special_tags(raw_msg)
         img_idx = 0
+        bot = getattr(event, "bot", None)
 
         for part in parts:
             if isinstance(part, face_cls):
                 fid = str(getattr(part, "id", "") or "").strip()
-                fname = str(getattr(part, "name", "") or FACE_LABELS.get(fid) or "").strip()
+                fname = (
+                    resolve_face_label(fid, face_texts.get(fid, ""))
+                    or resolve_face_label(fid, getattr(part, "name", ""))
+                )
                 if fid:
                     faces.append(FaceRef(face_id=fid, label=fname))
                 tag_lbl = fname or (("ID" + fid) if fid else "")
@@ -574,10 +675,56 @@ class AstrBotInboundParser:
                 if len(img_jobs) < 2:
                     img_jobs.append((part, meta, True))
             elif isinstance(part, reply_cls) and mentioned:
+                found_chain_img = False
                 for qseg in getattr(part, "chain", None) or ():
-                    if isinstance(qseg, img_cls) and len(img_jobs) < 2:
-                        # 引用图片供看图，绝不收入表情库
-                        img_jobs.append((qseg, None, False))
+                    if isinstance(qseg, img_cls):
+                        found_chain_img = True
+                        if len(img_jobs) < 2:
+                            # 引用图片供看图，绝不收入表情库
+                            img_jobs.append((qseg, None, False))
+                reply_id = str(getattr(part, "id", "") or "").strip()
+                if not found_chain_img and len(img_jobs) < 2 and reply_id and bot and hasattr(bot, "call_action"):
+                    try:
+                        qid_arg: Any = int(reply_id) if reply_id.isdigit() else reply_id
+                        raw_replied = await asyncio.wait_for(bot.call_action("get_msg", message_id=qid_arg), timeout=4.0)
+                    except Exception:
+                        raw_replied = None
+                    raw_segs: Any = None
+                    if isinstance(raw_replied, dict):
+                        raw_segs = raw_replied.get("message")
+                        if not isinstance(raw_segs, list) and isinstance(raw_replied.get("data"), dict):
+                            raw_segs = raw_replied["data"].get("message")
+                    if isinstance(raw_segs, list):
+                        for seg in raw_segs:
+                            if not isinstance(seg, dict):
+                                continue
+                            stype = str(seg.get("type") or "").strip().lower()
+                            sdata = seg.get("data") if isinstance(seg.get("data"), dict) else {}
+                            if stype == "mface":
+                                msum = str(sdata.get("summary") or "").strip().strip("[]")
+                                murl = str(sdata.get("url") or "").strip()
+                                mtag = "[商城表情:{}]".format(msum or "表情")
+                                if mtag not in quote_extra_tags:
+                                    quote_extra_tags.append(mtag)
+                                if murl and len(img_jobs) < 2:
+                                    img_jobs.append((
+                                        types.SimpleNamespace(url=murl, file="", path="", base64="", subType="1", summary=msum),
+                                        {"sub_type": "1", "summary": msum or "表情"},
+                                        False,
+                                    ))
+                            elif stype == "image":
+                                iurl = str(sdata.get("url") or "").strip()
+                                ifile = str(sdata.get("file") or "").strip()
+                                if (iurl or ifile) and len(img_jobs) < 2:
+                                    img_jobs.append((
+                                        types.SimpleNamespace(url=iurl, file=ifile, path="", base64=""),
+                                        sdata,
+                                        False,
+                                    ))
+                            elif stype == "forward":
+                                fwd_q = unpack_forward(seg)
+                                if fwd_q and fwd_q not in quote_extra_tags:
+                                    quote_extra_tags.append(fwd_q)
 
         if isinstance(raw_msg, dict) and isinstance(raw_msg.get("message"), list):
             for seg in raw_msg["message"]:
@@ -610,7 +757,7 @@ class AstrBotInboundParser:
 
         has_image = bool(media_refs) or any(isinstance(p, img_cls) for p in parts) or bool(mface_tags)
         has_sticker = any(m.is_sticker for m in media_refs)
-        media_prefix = " ".join(face_tags + mface_tags).strip()
+        media_prefix = " ".join(face_tags + mface_tags + special_tags).strip()
         bare_face = False
 
         if not text and not forward_text:
@@ -619,10 +766,10 @@ class AstrBotInboundParser:
                     marker = " ".join(mface_tags + (["[图片]"] if (media_refs or any(isinstance(p, img_cls) for p in parts)) else [])).strip()
                     text = marker
                     bare_face = True  # 只落库与附带表情/图片，不触发发言
-                elif face_tags and time.time() - last_bot_reply_at <= 120.0:
-                    text = " ".join(face_tags).strip()
+                elif (face_tags or special_tags) and time.time() - last_bot_reply_at <= 120.0:
+                    text = " ".join(face_tags + special_tags).strip()
                     bare_face = True
-                elif faces:
+                elif faces or special_tags:
                     bare_face = True
             elif media_prefix:
                 text = (media_prefix + (" [图片]" if any(isinstance(p, img_cls) for p in parts) else "")).strip()
@@ -638,6 +785,13 @@ class AstrBotInboundParser:
 
         final_text = (text + (" " + forward_text if forward_text else "")).strip()
         quote_text, quote_sender, quote_msg_id = self._extract_quote(parts)
+        if quote_extra_tags:
+            extra_q = " ".join(t for t in quote_extra_tags if t and t not in quote_text).strip()
+            if extra_q:
+                if not quote_text or (quote_sender and quote_text == "回复 {}".format(quote_sender)):
+                    quote_text = format_speaker_message(quote_sender, extra_q) if quote_sender else extra_q
+                else:
+                    quote_text = "{} {}".format(quote_text, extra_q).strip()
 
         return ChatEvent(
             group_id=group_id,
@@ -647,7 +801,6 @@ class AstrBotInboundParser:
             raw_text=raw_text,
             msg_id=msg_id,
             ts=time.time(),
-            scene="group",
             umo=umo,
             at_self=at_self,
             at_others=at_others,
@@ -755,6 +908,19 @@ class AstrBotSender:
         self._limiter.record(action.group_id)
         return True
 
+    def _get_bot(self, group_id: str) -> Any:
+        if not callable(self._bot_provider):
+            return None
+        try:
+            return self._bot_provider(group_id)
+        except TypeError:
+            return self._bot_provider()
+
+    @staticmethod
+    def _extract_raw_group_id(group_id: str) -> Optional[int]:
+        raw = str(group_id or "").rsplit(":", 1)[-1].strip()
+        return int(raw) if raw.isdigit() else None
+
     async def _send_emoji(self, action: SendEmoji) -> bool:
         if not action.path or not self._emoji_root or not self._limiter.allow(action.group_id):
             return False
@@ -768,6 +934,32 @@ class AstrBotSender:
             return False
         if target == root or root not in target.parents or not target.is_file():
             return False
+        bot = self._get_bot(action.group_id)
+        raw_gid = self._extract_raw_group_id(action.group_id)
+        if bot is not None and hasattr(bot, "call_action") and raw_gid is not None:
+            try:
+                img_bytes = await asyncio.to_thread(target.read_bytes)
+                b64 = base64.b64encode(img_bytes).decode("ascii")
+                await asyncio.wait_for(
+                    bot.call_action(
+                        "send_group_msg",
+                        group_id=raw_gid,
+                        message=[{
+                            "type": "image",
+                            "data": {
+                                "file": "base64://" + b64,
+                                "sub_type": 1,
+                                "summary": action.summary or "[动画表情]",
+                            },
+                        }],
+                    ),
+                    timeout=10.0,
+                )
+                self._limiter.record(action.group_id)
+                return True
+            except Exception as exc:
+                if self._logger:
+                    self._logger.warning("sub_type=1 表情发送失败，回退普通图片通道：%s", exc)
         await self._ctx.send_message(action.umo, self._Chain([self._comp["Image"](file="file://" + str(target))]))
         self._limiter.record(action.group_id)
         return True
@@ -816,12 +1008,7 @@ class AstrBotSender:
     async def _react(self, action: ReactEmoji) -> bool:
         if not action.msg_id:
             return False
-        bot = None
-        if callable(self._bot_provider):
-            try:
-                bot = self._bot_provider(action.group_id)
-            except TypeError:
-                bot = self._bot_provider()
+        bot = self._get_bot(action.group_id)
         if not bot or not hasattr(bot, "call_action"):
             return False
         try:

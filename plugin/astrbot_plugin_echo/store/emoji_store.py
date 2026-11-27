@@ -1,4 +1,4 @@
-"""表情包存储：按群收录真表情、VLM 非表情拦截、情绪标签与防连发挑选。"""
+"""表情包存储：内容寻址全局共享高质量表情池、VLM 门禁、情绪标签与防连发挑选。"""
 
 from __future__ import annotations
 
@@ -13,17 +13,19 @@ import uuid
 from pathlib import Path
 from typing import Any, Optional
 
-from ..domain import FACE_LABELS, LLMClient, detect_image_dimensions, detect_image_format
+from ..domain import FACE_LABELS, LLMClient, PickedEmoji, detect_image_dimensions, detect_image_format
 
 STICKER_MAX_DIM = 1280
 STICKER_MAX_ASPECT = 1.85
+GLOBAL_POOL_KEY = "_global"
+DEFAULT_GLOBAL_LIMIT = 160
 
 ANALYZE_PROMPT = (
     "先严格分类这张图是不是适合日常群聊的真正表情包或搞笑梗图，仅输出一行 JSON，不要任何解释或 Markdown。\n"
     '输出格式：{"kind":"sticker|chat|screenshot|news|photo|chart|nsfw|other","usable":true,"tag":"2到4字情绪词","desc":"一句话画面描述"}\n'
     "严格标准：\n"
     "1. 只有熊猫头、萌宠/动漫/卡通配文梗图、搞笑动图，才允许填 kind=\"sticker\" 且 usable=true；\n"
-    "2. 只要是手机或电脑截屏、微信/QQ聊天记录截图、新闻报道页面、网页、表格/PPT/图表、代码/终端日志、普通生活照/自拍、二维码，或低俗/竖中指/露骨图片，"
+    "2. 只要是手机或电脑截屏、微信/QQ聊天记录截图、带真人头像/群聊昵称/私人隐私文字的截图、新闻报道页面、网页、表格/PPT/图表、代码/终端日志、普通生活照/自拍、二维码，或低俗/竖中指/露骨图片，"
     '一律填对应的非 sticker 类别，usable 必须为 false，tag 填 "非表情"。'
 )
 FILTER_WORDS = ("二维码", "付款码", "身份证", "验证码", "密码", "银行卡号")
@@ -139,15 +141,22 @@ def analyze_emoji(llm: LLMClient, image_bytes: bytes) -> tuple[str, str]:
 
 
 class EmojiStore:
-    """按群隔离的表情库：兼容已有 index.json / digest_cache.json 落盘格式。"""
+    """跨群全局共享高质量表情池（兼容按群经典 QQ 小黄脸与已有目录无损迁移）。"""
 
-    def __init__(self, root: str | Path, limit: int = 64, max_age_days: int = 30):
+    def __init__(
+        self,
+        root: str | Path,
+        limit: int = 64,
+        max_age_days: int = 30,
+        global_limit: Optional[int] = None,
+    ):
         self._root = Path(root)
         self._root.mkdir(parents=True, exist_ok=True)
         self.index_path = self._root / "index.json"
         self.cache_path = self._root / "digest_cache.json"
         self.limit = limit
         self.max_age_days = max_age_days
+        self.global_limit = max(int(global_limit or DEFAULT_GLOBAL_LIMIT), self.limit * 2)
         self._lock = threading.RLock()
         self._inflight: set[str] = set()
         self._last_picked: dict[str, str] = {}
@@ -202,10 +211,93 @@ class EmojiStore:
         with self._lock:
             self._atomic_write(self.cache_path, json.dumps(self._digest_cache, ensure_ascii=False, indent=2))
 
+    def _shared_dir(self) -> Path:
+        folder = self._root / "shared"
+        folder.mkdir(parents=True, exist_ok=True)
+        return folder
+
+    def _canonical_shared_path(self, digest: str, image_bytes: bytes) -> Path:
+        _, ext = detect_image_format(image_bytes)
+        canonical = self._shared_dir() / "{}{}".format(digest[:16], ext)
+        if not canonical.is_file():
+            canonical.write_bytes(image_bytes)
+        return canonical
+
+    def _unlink_if_unreferenced(self, path_str: Any) -> None:
+        safe = self._safe_path(path_str)
+        if safe is None:
+            return
+        try:
+            target_res = safe.resolve(strict=False)
+        except OSError:
+            return
+        with self._lock:
+            for entries in self._index.values():
+                if not isinstance(entries, list):
+                    continue
+                for item in entries:
+                    if not isinstance(item, dict):
+                        continue
+                    other = str(item.get("path") or "")
+                    if not other:
+                        continue
+                    if other == str(path_str):
+                        return
+                    try:
+                        if Path(other).resolve(strict=False) == target_res:
+                            return
+                    except OSError:
+                        continue
+        try:
+            safe.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def _upsert_global_entry(
+        self,
+        canonical_path: Path,
+        digest: str,
+        label: str,
+        description: str,
+        now: float,
+    ) -> list[str]:
+        g_entries = self._index.setdefault(GLOBAL_POOL_KEY, [])
+        evicted: list[str] = []
+        matched = False
+        for item in g_entries:
+            if not isinstance(item, dict):
+                continue
+            if item.get("sha256") == digest:
+                item["path"] = str(canonical_path)
+                item["ts"] = max(float(item.get("ts") or 0.0), now)
+                if label and _is_valid_tag(label):
+                    item["tag"] = label
+                if description:
+                    item["description"] = description[:80]
+                matched = True
+                break
+        if not matched:
+            g_entries.append({
+                "path": str(canonical_path),
+                "sha256": digest,
+                "tag": label,
+                "description": description[:80],
+                "ts": now,
+            })
+        if len(g_entries) > self.global_limit:
+            g_entries.sort(key=lambda x: float(x.get("ts") or 0.0) if isinstance(x, dict) else 0.0)
+            while len(g_entries) > self.global_limit:
+                old = g_entries.pop(0)
+                if isinstance(old, dict) and old.get("path"):
+                    evicted.append(str(old["path"]))
+        return evicted
+
     def _migrate_and_dedup(self) -> None:
-        """按 sha256 去重、过滤非法 face_id 与脏标签、清理缺失/不合格文件。"""
+        """按 sha256 去重、统一迁移真表情至 shared/ 并同步构建 _global 共享池，清理脏图与失效 face_id。"""
         changed_index = False
         changed_cache = False
+        stale_paths: list[str] = []
+        global_merged: dict[str, dict[str, Any]] = {}
         with self._lock:
             for digest, cached in list(self._digest_cache.items()):
                 if isinstance(cached, dict) and cached.get("ok"):
@@ -217,7 +309,10 @@ class EmojiStore:
 
             for gid, entries in list(self._index.items()):
                 if not isinstance(entries, list):
+                    self._index.pop(gid, None)
+                    changed_index = True
                     continue
+                is_global = gid == GLOBAL_POOL_KEY
                 by_digest: dict[str, tuple[int, dict[str, Any]]] = {}
                 drop_indices: set[int] = set()
                 for idx, item in enumerate(entries):
@@ -227,7 +322,7 @@ class EmojiStore:
                         continue
                     if item.get("face_id") and not item.get("path"):
                         fid = str(item.get("face_id") or "").strip()
-                        if fid not in FACE_LABELS:
+                        if is_global or fid not in FACE_LABELS:
                             drop_indices.add(idx)
                             changed_index = True
                             continue
@@ -256,10 +351,7 @@ class EmojiStore:
                     if not _is_valid_tag(item.get("tag")) or not acceptable(item.get("description", ""), img_bytes):
                         drop_indices.add(idx)
                         changed_index = True
-                        try:
-                            safe.unlink(missing_ok=True)
-                        except OSError:
-                            pass
+                        stale_paths.append(str(safe))
                         self._digest_cache[digest] = {
                             "ok": False,
                             "tag": "",
@@ -268,6 +360,13 @@ class EmojiStore:
                         }
                         changed_cache = True
                         continue
+
+                    canonical = self._canonical_shared_path(digest, img_bytes)
+                    if str(safe) != str(canonical):
+                        stale_paths.append(str(safe))
+                        item["path"] = str(canonical)
+                        changed_index = True
+
                     prev = by_digest.get(digest)
                     if prev is None:
                         by_digest[digest] = (idx, item)
@@ -283,15 +382,13 @@ class EmojiStore:
                         old_path = item.get("path")
                     kept_path = by_digest[digest][1].get("path")
                     if old_path and old_path != kept_path:
-                        try:
-                            Path(old_path).unlink(missing_ok=True)
-                        except OSError:
-                            pass
+                        stale_paths.append(str(old_path))
+
                 if drop_indices:
                     self._index[gid] = [it for i, it in enumerate(entries) if i not in drop_indices]
-                for _, item in by_digest.values():
-                    digest = item.get("sha256")
-                    if digest and digest not in self._digest_cache:
+
+                for digest, (_, item) in by_digest.items():
+                    if digest not in self._digest_cache:
                         self._digest_cache[digest] = {
                             "ok": True,
                             "tag": str(item.get("tag") or "随手"),
@@ -299,15 +396,35 @@ class EmojiStore:
                             "ts": float(item.get("ts") or time.time()),
                         }
                         changed_cache = True
+                    cand = {
+                        "path": str(item.get("path") or ""),
+                        "sha256": digest,
+                        "tag": str(item.get("tag") or "随手"),
+                        "description": str(item.get("description") or "")[:80],
+                        "ts": float(item.get("ts") or time.time()),
+                    }
+                    prev_g = global_merged.get(digest)
+                    if prev_g is None or float(cand["ts"]) >= float(prev_g.get("ts") or 0.0):
+                        global_merged[digest] = cand
+
+            if global_merged or GLOBAL_POOL_KEY in self._index:
+                merged_list = sorted(global_merged.values(), key=lambda x: float(x.get("ts") or 0.0))
+                while len(merged_list) > self.global_limit:
+                    old = merged_list.pop(0)
+                    if old.get("path"):
+                        stale_paths.append(str(old["path"]))
+                old_global = self._index.get(GLOBAL_POOL_KEY)
+                if old_global != merged_list:
+                    self._index[GLOBAL_POOL_KEY] = merged_list
+                    changed_index = True
+
             if changed_index:
                 self._save()
             if changed_cache:
                 self._save_cache()
 
-    def _folder(self, group_id: str) -> Path:
-        folder = self._root / re.sub(r"[^\w-]", "_", group_id)[:60]
-        folder.mkdir(parents=True, exist_ok=True)
-        return folder
+        for old_path in stale_paths:
+            self._unlink_if_unreferenced(old_path)
 
     def _store_entry(
         self,
@@ -319,12 +436,11 @@ class EmojiStore:
         cap: int,
         now: float,
     ) -> None:
-        _, ext = detect_image_format(image_bytes)
-        path = self._folder(group_id) / "{}_{}{}".format(int(now * 1000), digest[:8], ext)
-        path.write_bytes(image_bytes)
+        canonical = self._canonical_shared_path(digest, image_bytes)
         entries = self._index.setdefault(group_id, [])
+        evicted: list[str] = []
         entries.append({
-            "path": str(path),
+            "path": str(canonical),
             "sha256": digest,
             "tag": label,
             "description": description[:80],
@@ -332,9 +448,12 @@ class EmojiStore:
         })
         while len(entries) > cap:
             old = entries.pop(0)
-            if old.get("path"):
-                Path(old["path"]).unlink(missing_ok=True)
+            if isinstance(old, dict) and old.get("path"):
+                evicted.append(str(old["path"]))
+        evicted.extend(self._upsert_global_entry(canonical, digest, label, description, now))
         self._save()
+        for old_path in evicted:
+            self._unlink_if_unreferenced(old_path)
 
     def collect(self, group_id: str, image_bytes: bytes, llm: LLMClient, limit: Optional[int] = None) -> str:
         if not image_bytes or len(image_bytes) > 2 * 1024 * 1024:
@@ -348,7 +467,18 @@ class EmojiStore:
             for item in entries:
                 if item.get("sha256") == digest and self._safe_path(item.get("path")) is not None:
                     item["ts"] = now
+                    canonical = self._canonical_shared_path(digest, image_bytes)
+                    item["path"] = str(canonical)
+                    evicted = self._upsert_global_entry(
+                        canonical,
+                        digest,
+                        str(item.get("tag") or "随手"),
+                        str(item.get("description") or ""),
+                        now,
+                    )
                     self._save()
+                    for old_path in evicted:
+                        self._unlink_if_unreferenced(old_path)
                     return str(item.get("tag") or "随手")
             cached = self._digest_cache.get(digest)
             if cached is not None:
@@ -420,11 +550,14 @@ class EmojiStore:
                     self._save()
                     return str(item.get("tag") or canonical)
             entries.append({"face_id": fid, "tag": label, "description": label, "ts": time.time()})
+            evicted: list[str] = []
             while len(entries) > self.limit:
                 old = entries.pop(0)
-                if old.get("path"):
-                    Path(old["path"]).unlink(missing_ok=True)
+                if isinstance(old, dict) and old.get("path"):
+                    evicted.append(str(old["path"]))
             self._save()
+            for old_path in evicted:
+                self._unlink_if_unreferenced(old_path)
             return label
 
     def remove_face(self, group_id: str, face_id: str) -> bool:
@@ -444,21 +577,38 @@ class EmojiStore:
     def has_entries(self, group_id: str) -> bool:
         with self._lock:
             entries = list(self._index.get(group_id) or [])
-        return any(
-            item.get("face_id") or self._safe_path(item.get("path")) is not None
+            global_entries = list(self._index.get(GLOBAL_POOL_KEY) or [])
+        if any(
+            isinstance(item, dict) and (item.get("face_id") or self._safe_path(item.get("path")) is not None)
             for item in entries
-            if isinstance(item, dict)
+        ):
+            return True
+        return any(
+            isinstance(item, dict) and not item.get("face_id") and self._safe_path(item.get("path")) is not None
+            for item in global_entries
         )
 
     def tags(self, group_id: str, limit: int = 12) -> list[str]:
         with self._lock:
             entries = list(self._index.get(group_id) or [])
+            global_entries = list(self._index.get(GLOBAL_POOL_KEY) or [])
         out: list[str] = []
         seen: set[str] = set()
         for item in reversed(entries):
             if not isinstance(item, dict):
                 continue
             if not (item.get("face_id") or self._safe_path(item.get("path")) is not None):
+                continue
+            tag = str(item.get("tag") or "").strip()
+            if tag and tag not in seen:
+                seen.add(tag)
+                out.append(tag)
+                if len(out) >= limit:
+                    return out
+        for item in reversed(global_entries):
+            if not isinstance(item, dict) or item.get("face_id"):
+                continue
+            if self._safe_path(item.get("path")) is None:
                 continue
             tag = str(item.get("tag") or "").strip()
             if tag and tag not in seen:
@@ -489,38 +639,59 @@ class EmojiStore:
                             terms.append(ch)
         return terms
 
-    def pick(self, group_id: str, keyword: str = "") -> Optional[str | Path]:
+    def pick_entry(self, group_id: str, keyword: str = "") -> Optional[PickedEmoji]:
         with self._lock:
-            raw_entries = list(self._index.get(group_id) or [])
-        entries = [
+            raw_local = list(self._index.get(group_id) or [])
+            raw_global = list(self._index.get(GLOBAL_POOL_KEY) or [])
+
+        local_entries = [
             item
-            for item in raw_entries
+            for item in raw_local
             if isinstance(item, dict) and (item.get("face_id") or self._safe_path(item.get("path")) is not None)
         ]
-        if not entries:
+        local_digests = {str(it.get("sha256") or "") for it in local_entries if it.get("sha256")}
+        local_paths = {str(it.get("path") or "") for it in local_entries if it.get("path")}
+
+        candidates: list[tuple[dict[str, Any], bool]] = [(it, True) for it in local_entries]
+        for item in raw_global:
+            if not isinstance(item, dict) or item.get("face_id"):
+                continue
+            if self._safe_path(item.get("path")) is None:
+                continue
+            digest = str(item.get("sha256") or "")
+            p_str = str(item.get("path") or "")
+            if (digest and digest in local_digests) or (p_str and p_str in local_paths):
+                continue
+            candidates.append((item, False))
+
+        if not candidates:
             return None
+
         terms = self._keyword_terms(keyword)
         scored_matched = False
+        pool: list[dict[str, Any]] = []
         if terms:
             scored: list[tuple[float, float, dict[str, Any]]] = []
-            for item in entries:
+            for item, is_local in candidates:
                 hay = "{} {}".format(item.get("tag", ""), item.get("description", "")).lower()
-                score = sum(1.0 if len(w) >= 2 else 0.3 for w in terms if w in hay)
-                if score > 0:
-                    scored.append((score, float(item.get("ts") or 0.0), item))
+                base_score = sum(1.0 if len(w) >= 2 else 0.3 for w in terms if w in hay)
+                if base_score > 0:
+                    affinity = base_score + (0.25 if is_local else 0.0)
+                    scored.append((affinity, float(item.get("ts") or 0.0), item))
             if scored:
                 scored_matched = True
                 max_score = max(r[0] for r in scored)
                 threshold = max_score * 0.6
-                entries = [
+                pool = [
                     r[2]
                     for r in sorted(
                         (row for row in scored if row[0] >= threshold),
                         key=lambda row: (row[0], row[1]),
                         reverse=True,
                     )
-                ]
-        pool = entries[:8] if scored_matched else sorted(entries, key=lambda x: float(x.get("ts") or 0.0))[-8:]
+                ][:8]
+        if not scored_matched:
+            pool = sorted((item for item, _ in candidates), key=lambda x: float(x.get("ts") or 0.0))[-8:]
         if not pool:
             return None
         # 同池存在真实图片表情包时优先发真实图片，而非 QQ 原生小黄脸
@@ -539,27 +710,42 @@ class EmojiStore:
         picked = random.choice(pool)
         picked_key = ("face:" + str(picked["face_id"])) if picked.get("face_id") else str(picked["path"])
         self._last_picked[group_id] = picked_key
+        tag = str(picked.get("tag") or "").strip()
+        desc = str(picked.get("description") or "").strip()
         if picked.get("face_id"):
-            return "face:" + str(picked["face_id"])
-        return Path(picked["path"])
+            fid = str(picked["face_id"])
+            return PickedEmoji(kind="face", face_id=fid, tag=tag, description=desc)
+        return PickedEmoji(kind="image", path=str(picked["path"]), tag=tag, description=desc)
+
+    def pick(self, group_id: str, keyword: str = "") -> Optional[str | Path]:
+        picked = self.pick_entry(group_id, keyword)
+        if picked is None:
+            return None
+        if picked.kind == "face":
+            return "face:" + picked.face_id
+        return Path(picked.path)
 
     def cleanup(self, max_age_days: Optional[int] = None) -> None:
         days = self.max_age_days if max_age_days is None else max_age_days
         cutoff = time.time() - days * 86400
+        stale_paths: list[str] = []
         with self._lock:
             for gid, entries in list(self._index.items()):
+                if not isinstance(entries, list):
+                    continue
                 kept = []
                 for item in entries:
+                    if not isinstance(item, dict):
+                        continue
                     if float(item.get("ts") or 0) < cutoff:
                         if item.get("path"):
-                            try:
-                                Path(item["path"]).unlink(missing_ok=True)
-                            except OSError:
-                                pass
+                            stale_paths.append(str(item["path"]))
                     else:
                         kept.append(item)
                 self._index[gid] = kept
             self._save()
+        for old_path in stale_paths:
+            self._unlink_if_unreferenced(old_path)
 
     def stats(self, group_id: Optional[str] = None) -> dict[str, int]:
         with self._lock:

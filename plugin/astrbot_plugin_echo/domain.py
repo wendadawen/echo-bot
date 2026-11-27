@@ -3,7 +3,7 @@
 本模块仅依赖 Python 标准库，定义系统内部不可变数据结构与 5 个稳定抽象边界：
 - LLMClient：大模型调用与多模态理解（可随时切换供应商或推理模型）
 - SearchProvider：可选联网直搜接口（Tavily/Exa 等，未配置自动隐藏）
-- MemoryRepository：统一持久化（消息、群记忆、QQ 号归一人物档案、图缓存、待投递队列、监控）
+- MemoryRepository：统一持久化（消息、群记忆、QQ 号归一人物档案、待投递队列、监控）
 - EmojiStorePort：表情包收藏与按情绪抽取
 - TaskRunner / HarnessBackend：可插拔后台沙箱执行器（Codex 等）
 - MessageSender：平台消息发送与互动（文本、智能引用、表情、群文件、贴表情）
@@ -46,6 +46,69 @@ FACE_LABELS: dict[str, str] = {
     "319": "比心", "320": "庆祝", "324": "吃糖", "326": "生气", "332": "举牌牌",
     "337": "花朵脸", "338": "我想开了", "339": "舔屏", "344": "大怨种",
 }
+
+# QQ 缺失经典与新版超级表情 / 扩展 sysface 只读理解表（仅用于看懂群友消息，不进入可发送经典 face 白名单）
+EXTENDED_FACE_LABELS: dict[str, str] = {
+    "41": "发抖", "42": "爱情", "43": "跳跳", "55": "炸弹", "86": "怄火",
+    "112": "菜刀", "114": "篮球", "116": "示爱", "119": "勾引", "122": "爱你",
+    "125": "转圈", "129": "挥手", "137": "鞭炮", "146": "爆筋", "147": "棒棒糖",
+    "148": "喝奶", "169": "手枪", "180": "惊喜", "185": "羊驼", "187": "幽灵",
+    "193": "大笑", "194": "不开心", "198": "呃", "200": "求求", "201": "点赞",
+    "202": "无聊", "203": "托脸", "204": "吃", "206": "害怕", "210": "飙泪",
+    "211": "我不看", "214": "啵啵", "215": "糊脸", "216": "拍头", "217": "扯一扯",
+    "218": "舔一舔", "219": "蹭一蹭", "221": "顶呱呱", "222": "抱抱", "223": "暴击",
+    "224": "开枪", "225": "撩一撩", "226": "拍桌", "227": "拍手", "229": "干杯",
+    "230": "嘲讽", "231": "哼", "232": "佛系", "233": "掐一掐", "235": "颤抖",
+    "237": "偷看", "238": "扇脸", "239": "原谅", "240": "喷脸", "241": "生日快乐",
+    "243": "甩头", "244": "扔狗", "278": "汗", "286": "魔鬼笑", "288": "请",
+    "290": "敲开心", "292": "让我康康", "295": "拿到红包", "300": "胖三斤",
+    "301": "好闪", "302": "左拜年", "303": "右拜年", "317": "菜汪", "322": "拒绝",
+    "323": "嫌弃", "325": "惊吓", "333": "烟花", "334": "虎虎生威", "336": "豹富",
+    "341": "打招呼", "342": "酸Q", "343": "我方了",
+    "345": "红包多多", "346": "你真棒棒", "347": "大展宏兔", "348": "福萝卜",
+    "349": "坚强", "350": "贴贴", "351": "敲敲", "352": "咦", "353": "拜托",
+    "354": "尊嘟假嘟", "355": "耶", "356": "666", "357": "裂开", "358": "骰子",
+    "359": "包剪锤", "360": "亲亲", "361": "狗狗笑哭", "362": "好兄弟",
+    "363": "狗狗可怜", "364": "超级赞", "365": "狗狗生气", "366": "芒狗",
+    "367": "狗狗疑问", "368": "奥特笑哭", "369": "彩虹", "370": "祝贺",
+    "371": "冒泡", "372": "气呼呼", "373": "忙", "374": "波波流泪",
+    "375": "超级鼓掌", "376": "跺脚", "377": "嗨", "378": "企鹅笑哭",
+    "379": "企鹅流泪", "380": "真棒", "381": "路过", "382": "emo",
+    "383": "企鹅爱心", "384": "晚安", "385": "太气了", "386": "呜呜呜",
+    "387": "太好笑", "388": "太头疼", "389": "太赞了", "390": "太头秃",
+    "391": "太沧桑", "392": "龙年快乐", "393": "新年中龙", "394": "新年大龙",
+    "395": "略略略", "396": "狼狗", "397": "抛媚眼", "398": "超级ok",
+    "399": "tui", "400": "快乐", "401": "超级转圈", "402": "别说话",
+    "403": "出去玩", "404": "闪亮登场", "405": "好运来", "406": "姐是女王",
+    "407": "我听听", "408": "臭美", "409": "送你花花", "410": "么么哒",
+    "411": "一起嗨", "412": "开心", "413": "摇起来", "415": "划龙舟",
+    "416": "中龙舟", "417": "大龙舟", "419": "火车", "420": "中火车",
+    "421": "大火车", "422": "粽于等到你", "423": "复兴号", "424": "续标识",
+    "425": "求放过", "426": "玩火", "427": "偷感", "428": "收到",
+    "429": "蛇年快乐", "430": "蛇身", "431": "蛇尾", "432": "灵蛇献瑞",
+    "450": "撇嘴", "451": "色", "452": "微笑", "453": "发呆", "454": "得意",
+    "455": "害羞", "456": "闭嘴", "457": "睡", "458": "我吗", "459": "优雅",
+    "460": "硬撑", "461": "宕机", "462": "无语", "463": "新年快乐",
+    "464": "马上到", "465": "拆红包", "466": "羞羞哒", "467": "摇花手",
+    "468": "失眠", "469": "坚毅", "470": "马到成功", "472": "心动",
+    "474": "给你一拳", "475": "干饭", "476": "不是吧", "477": "你懂的",
+    "478": "对的对的", "479": "不对不对", "480": "散味儿", "481": "学习",
+    "482": "热化了", "483": "略", "484": "比爱心", "489": "知识增加",
+}
+
+
+def resolve_face_label(face_id: Any, raw_text: Any = "") -> str:
+    """优先清洗协议自带 faceText/name，缺失时依次查经典小黄脸与扩展超级表情表。"""
+    raw = str(raw_text or "").strip()
+    while len(raw) >= 2 and raw[0] == "[" and raw[-1] == "]":
+        raw = raw[1:-1].strip()
+    raw = raw.lstrip("/").strip()
+    if raw and raw not in ("QQ表情", "表情"):
+        return raw
+    fid = str(face_id or "").strip()
+    if not fid:
+        return ""
+    return FACE_LABELS.get(fid) or EXTENDED_FACE_LABELS.get(fid) or ""
 
 _MARK_PATTERN = re.compile(r"^#+\s*", re.M)
 _LIST_PATTERN = re.compile(r"^\s*[-*+]\s+", re.M)
@@ -240,6 +303,15 @@ class FaceRef:
 
 
 @dataclass(frozen=True)
+class PickedEmoji:
+    kind: str  # "image" | "face"
+    path: str = ""
+    face_id: str = ""
+    tag: str = ""
+    description: str = ""
+
+
+@dataclass(frozen=True)
 class ChatEvent:
     group_id: str
     user_id: str
@@ -248,7 +320,6 @@ class ChatEvent:
     raw_text: str = ""
     msg_id: str = ""
     ts: float = 0.0
-    scene: str = "group"
     umo: str = ""
     at_self: bool = False
     at_others: bool = False
@@ -266,6 +337,7 @@ class ChatEvent:
     has_sticker: bool = False
     bare_face: bool = False
     passthrough: bool = False
+    is_poke: bool = False
 
 
 @dataclass
@@ -274,11 +346,14 @@ class Batch:
     items: list[ChatEvent] = field(default_factory=list)
     started: float = 0.0
     deadline: float = 0.0
-    scene: str = "group"
     images: list[MediaRef] = field(default_factory=list)
     approved: bool = False
     turn_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     persisted: bool = False
+
+    @property
+    def is_poke(self) -> bool:
+        return bool(self.items) and all(i.is_poke for i in self.items)
 
     @property
     def mentioned(self) -> bool:
@@ -406,6 +481,7 @@ class SendText(OutboundAction):
 @dataclass(frozen=True)
 class SendEmoji(OutboundAction):
     path: str = ""
+    summary: str = "[动画表情]"
 
 
 @dataclass(frozen=True)
@@ -518,6 +594,8 @@ class EmojiStorePort(Protocol):
 
     def pick(self, group_id: str, keyword: str = "") -> Optional[str | Path]: ...
 
+    def pick_entry(self, group_id: str, keyword: str = "") -> Optional[PickedEmoji]: ...
+
     def has_entries(self, group_id: str) -> bool: ...
 
     def cleanup(self, max_age_days: Optional[int] = None) -> None: ...
@@ -591,9 +669,7 @@ class MemoryRepository(Protocol):
 
     def person_summary(self, group_id: str, user_id: str) -> str: ...
 
-    def get_image_cache(self, sha256: str) -> str: ...
-
-    def put_image_cache(self, sha256: str, description: str, group_id: str = "") -> None: ...
+    def person_aliases(self, group_id: str, user_id: str) -> list[str]: ...
 
     def get_conv_state(
         self,

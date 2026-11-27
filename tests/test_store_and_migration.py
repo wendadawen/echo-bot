@@ -13,9 +13,10 @@ PLUGIN_ROOT = ROOT / "plugin"
 if str(PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(PLUGIN_ROOT))
 
-from astrbot_plugin_echo.domain import PendingDelivery, detect_image_dimensions  # noqa: E402
+from astrbot_plugin_echo.domain import PendingDelivery, PickedEmoji, detect_image_dimensions  # noqa: E402
 from astrbot_plugin_echo.store.emoji_store import (  # noqa: E402
     EmojiStore,
+    GLOBAL_POOL_KEY,
     acceptable,
     analyze_emoji,
     is_sticker_geometry,
@@ -107,10 +108,13 @@ class RepositoryTests(unittest.TestCase):
         self.assertNotIn("：", summary2.replace("印象：", "").replace("偏好：", "").replace("关系：", ""))
         self.assertEqual(summary2.count("调侃大肥鱼"), 1)
 
-    def test_image_cache_and_conv_state(self):
-        self.assertEqual(self.repo.get_image_cache("abc"), "")
-        self.repo.put_image_cache("abc", "一只戴墨镜的柴犬", group_id="g1")
-        self.assertEqual(self.repo.get_image_cache("abc"), "一只戴墨镜的柴犬")
+    def test_conv_state_ttl_and_clean_person_aliases(self):
+        # 纯 QQ 号和通用称谓“群友”绝不写入 person_aliases（防止戳一戳等通知污染）
+        self.repo.observe_person("g1", "10002", "10002", now=100.0)
+        self.repo.observe_person("g1", "10002", "群友", now=101.0)
+        self.assertEqual(self.repo.person_aliases("g1", "10002"), [])
+        self.repo.observe_person("g1", "10002", "小张", now=102.0)
+        self.assertEqual(self.repo.person_aliases("g1", "10002"), ["小张"])
 
         self.repo.save_conv_state(
             "g1",
@@ -237,7 +241,7 @@ class EmojiStoreTests(unittest.TestCase):
             self.assertEqual(store.collect("g1", TINY_PNG, llm), "")
             self.assertEqual(llm.describe_image.call_count, 1)
 
-            # 真表情被收录并按关键词命中，带防连发轮换；非法 QQ face_id (489) 拒绝收录
+            # 真表情被收录至 shared/ 并同步进入 _global 共享池，新群 g2 立即可查可用且含描述
             b1 = TINY_GIF + b"1"
             b2 = TINY_GIF + b"2"
             self.assertEqual(store.collect("g1", b1, llm), "开心")
@@ -246,18 +250,37 @@ class EmojiStoreTests(unittest.TestCase):
             store.collect_face("g1", "178", "滑稽")
 
             self.assertTrue(store.has_entries("g1"))
+            self.assertTrue(store.has_entries("g2"))
             self.assertIn("开心", store.tags("g1"))
-            picked_happy = store.pick("g1", "开心")
-            self.assertIsInstance(picked_happy, Path)
+            self.assertIn("开心", store.tags("g2"))
+            picked_g2 = store.pick_entry("g2", "开心")
+            self.assertIsInstance(picked_g2, PickedEmoji)
+            self.assertEqual(picked_g2.kind, "image")
+            self.assertEqual(picked_g2.tag, "开心")
+            self.assertEqual(picked_g2.description, "熊猫头鼓掌")
+            self.assertIn(str(Path(tmp) / "shared"), picked_g2.path)
+            self.assertTrue(Path(picked_g2.path).is_file())
 
-            # 同关键词连挑多轮；兜底抽签优先真实图片表情包；remove_face 可踢除失效 face_id
+            # 经典 QQ 小黄脸仅本群可用，不跨群进 _global；g1 同关键词命中，remove_face 可踢除失效 face_id
             self.assertEqual(store.pick("g1", "滑稽"), "face:178")
+            self.assertNotEqual(store.pick("g2", "滑稽"), "face:178")
             self.assertIsInstance(store.pick("g1", "未知心情"), Path)
             self.assertTrue(store.remove_face("g1", "178"))
             self.assertFalse(any(e.get("face_id") == "178" for e in store._index["g1"]))
             self.assertNotEqual(store.pick("g1", "滑稽"), "face:178")
 
-            # 重载 _migrate_and_dedup 自动清洗历史坏 face_id、截断脏标签与 1179x2556 截屏图
+            # 引用计数安全删除：从 g1 弹出条目时若 _global 仍引用，绝不误删 shared/ 下底层图片
+            b1_path = Path(picked_g2.path)
+            store._index["g1"] = [e for e in store._index["g1"] if e.get("path") != str(b1_path)]
+            store._save()
+            store._unlink_if_unreferenced(str(b1_path))
+            self.assertTrue(b1_path.is_file())
+
+            # 重载 _migrate_and_dedup 自动清洗历史坏 face_id、截断脏标签与 1179x2556 截屏图，并把旧群目录合法图迁移进 shared/
+            (Path(tmp) / "g1").mkdir(exist_ok=True)
+            legacy_good = Path(tmp) / "g1" / "legacy_ok.gif"
+            legacy_bytes = TINY_GIF + b"legacy_meme"
+            legacy_good.write_bytes(legacy_bytes)
             dirty_file = Path(tmp) / "g1" / "dirty.png"
             dirty_file.write_bytes(TINY_PNG)
             long_shot = Path(tmp) / "g1" / "news_shot.png"
@@ -267,18 +290,24 @@ class EmojiStoreTests(unittest.TestCase):
                 {"face_id": "489", "tag": "QQ表情", "description": "QQ表情", "ts": time.time()},
                 {"path": str(dirty_file), "sha256": "deadbeef", "tag": "这是一张卡通猫的", "description": "猫", "ts": time.time()},
                 {"path": str(long_shot), "sha256": "news1179", "tag": "震惊", "description": "新闻报道正接受审查", "ts": time.time()},
+                {"path": str(legacy_good), "sha256": "", "tag": "呆萌", "description": "老群收藏小猫", "ts": time.time()},
             ])
             (Path(tmp) / "index.json").write_text(_json.dumps(raw_idx, ensure_ascii=False), encoding="utf-8")
             reloaded = EmojiStore(tmp, limit=10, max_age_days=30)
             self.assertFalse(dirty_file.exists())
             self.assertFalse(long_shot.exists())
+            self.assertFalse(legacy_good.exists())  # 旧位置重复副本已迁移到 shared/ 后安全清理
+            self.assertIn("呆萌", reloaded.tags("g2"))
             self.assertEqual([e for e in reloaded._index["g1"] if e.get("face_id") == "489"], [])
 
-            # 超期文件清理
-            for entry in reloaded._index["g1"]:
-                entry["ts"] = time.time() - 40 * 86400
+            # 超期文件清理（全桶包括 _global 过期后彻底清空并删除共享文件）
+            for bucket in (reloaded._index.get("g1", []), reloaded._index.get(GLOBAL_POOL_KEY, [])):
+                for entry in bucket:
+                    entry["ts"] = time.time() - 40 * 86400
             reloaded.cleanup(max_age_days=30)
             self.assertFalse(reloaded.has_entries("g1"))
+            self.assertFalse(reloaded.has_entries("g2"))
+            self.assertFalse(b1_path.exists())
 
 
 class LegacyMigrationTests(unittest.TestCase):

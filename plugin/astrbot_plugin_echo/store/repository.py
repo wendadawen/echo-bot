@@ -1,5 +1,5 @@
 """统一存储层：将消息历史、群记忆（FTS5+双字）、QQ号归一人物档案、
-图片哈希缓存、滚动对话状态、重载待投递队列与监控指标统一在单个 echo.sqlite3 中。
+滚动对话状态、重载待投递队列与监控指标统一在单个 echo.sqlite3 中。
 
 同时提供对旧版分离数据库（memory.sqlite3 / persons.sqlite3 / monitor.sqlite3）的
 幂等无损自动迁移，以及符号链接安全的 AstrBot/NapCat 缓存清理。
@@ -250,14 +250,6 @@ class Repository:
                     last_seen REAL NOT NULL DEFAULT 0,
                     updated_at REAL NOT NULL DEFAULT 0,
                     PRIMARY KEY (group_id, user_id)
-                );
-
-                CREATE TABLE IF NOT EXISTS image_cache (
-                    sha256 TEXT PRIMARY KEY,
-                    description TEXT NOT NULL,
-                    group_id TEXT NOT NULL DEFAULT '',
-                    hit_count INTEGER NOT NULL DEFAULT 1,
-                    updated_at REAL NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS conv_state (
@@ -645,7 +637,7 @@ class Repository:
             if self._closed:
                 return
             with self._db:
-                if raw_name:
+                if raw_name and raw_name != uid and raw_name != "群友":
                     self._db.execute(
                         "INSERT INTO person_aliases(group_id, user_id, name, kind, hits, updated_at) "
                         "VALUES (?, ?, ?, 'nick', 1, ?) "
@@ -801,52 +793,6 @@ class Repository:
                 (str(group_id), str(user_id)),
             ).fetchall()
         return [str(r["name"]) for r in rows]
-
-    # ---- 图片哈希记忆缓存（MaiBot image_injector 精简版） ----
-    def get_image_cache(self, sha256: str) -> str:
-        digest = str(sha256 or "").strip()
-        if not digest:
-            return ""
-        with self._lock:
-            if self._closed:
-                return ""
-            row = self._db.execute(
-                "SELECT description FROM image_cache WHERE sha256 = ?", (digest,)
-            ).fetchone()
-            if row:
-                with self._db:
-                    self._db.execute(
-                        "UPDATE image_cache SET hit_count = hit_count + 1 WHERE sha256 = ?",
-                        (digest,),
-                    )
-                return str(row["description"] or "")
-        return ""
-
-    def put_image_cache(self, sha256: str, description: str, group_id: str = "") -> None:
-        digest = str(sha256 or "").strip()
-        desc = str(description or "").strip()[:240]
-        if not digest or not desc:
-            return
-        stamp = time.time()
-        with self._lock:
-            if self._closed:
-                return
-            with self._db:
-                self._db.execute(
-                    "INSERT INTO image_cache(sha256, description, group_id, hit_count, updated_at) "
-                    "VALUES (?, ?, ?, 1, ?) "
-                    "ON CONFLICT(sha256) DO UPDATE SET description = excluded.description, "
-                    "group_id = excluded.group_id, updated_at = excluded.updated_at",
-                    (digest, desc, str(group_id or ""), stamp),
-                )
-                cnt = self._db.execute("SELECT COUNT(*) FROM image_cache").fetchone()[0]
-                if cnt > 600:
-                    self._db.execute(
-                        "DELETE FROM image_cache WHERE sha256 IN ("
-                        "SELECT sha256 FROM image_cache ORDER BY updated_at ASC LIMIT ?"
-                        ")",
-                        (cnt - 600,),
-                    )
 
     # ---- 滚动会话状态压缩（MaiBot ConversationState 精简版） ----
     def get_conv_state(

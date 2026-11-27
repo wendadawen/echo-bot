@@ -151,6 +151,11 @@ class SchedulerTests(unittest.TestCase):
         b_mentioned = Batch("g1", [ev_at])
         self.assertTrue(sch.should_view(b_mentioned, now=300.0, group_busy=True, recent_errors=3))
 
+        # 戳一戳群级防刷冷却（35 秒）
+        self.assertTrue(sch.allow_poke("g_poke", now=100.0))
+        self.assertFalse(sch.allow_poke("g_poke", now=110.0))
+        self.assertTrue(sch.allow_poke("g_poke", now=136.0))
+
         # 非破坏性媒体窗口：未被模型消费的图片不会被无关跳过销毁
         m = MediaRef(data=TINY_PNG, sha256="hash1")
         sch.attach_images("g1", [m], now=500.0, sender_id="u1")
@@ -190,8 +195,7 @@ class ContextTests(unittest.TestCase):
         repo.upsert_person("g1", "102", now=100.0, events="在苏州做超导")
         repo.add_memory("g1", "event", "周末去苏州实验室团建", now=100.0)
         repo.add_memory("g1", "jargon", "dd=顶顶", now=100.0)
-        repo.save_conv_state("g1", {"topics": ["团建安排"], "progress": [], "pending": ["订票"]}, now=100.0)
-        repo.put_image_cache("img_sha", "实验仪器照片", group_id="g1")
+        repo.save_conv_state("g1", {"topics": ["讨论重构", "调试Docker"], "progress": [], "pending": ["订票"]}, now=100.0)
 
         ctx = ContextAssembler(repo, history_limit=10)
         history = [
@@ -223,7 +227,6 @@ class ContextTests(unittest.TestCase):
         self.assertIn("dd=顶顶", system)
         self.assertIn("冰美式", system)
         self.assertIn("小和", system)
-        self.assertIn("实验仪器照片", system)
         self.assertIn("orig_cur", real_to_alias)
         self.assertEqual(alias_to_real[real_to_alias["orig_cur"]], "orig_cur")
         self.assertGreater(len(kept), 0)
@@ -240,13 +243,23 @@ class ContextTests(unittest.TestCase):
         ]
         self.assertEqual(should_quote_reply("m_a", "101", intervened), "m_a")
 
-        # format_provenance_note 与严格通道分离：assistant 历史纯净无时间戳/系统注，动作账本统一放进 <background_data>
+        # format_provenance_note 与严格通道分离：assistant 历史纯净无时间戳/系统注，动作账本含具体表情描述
         self.assertEqual(format_provenance_note("seen_image"), "已实际查看当轮原图")
         self.assertEqual(format_provenance_note("tools=web_search"), "调用 web_search 实查")
-        self.assertIn(
-            "已实际查看当轮原图，调用 web_search 实查",
-            format_provenance_note("seen_image;tools=web_search"),
+        self.assertEqual(
+            format_provenance_note("tools=send_emoji;emoji=开心（熊猫头鼓掌）"),
+            "发出表情包「开心（熊猫头鼓掌）」",
         )
+        self.assertIn(
+            "已实际查看当轮原图，发出表情包「无语」",
+            format_provenance_note("seen_image;tools=send_emoji;emoji=无语"),
+        )
+        poke_batch = Batch(
+            "g1",
+            [ChatEvent("g1", "101", "小明", "（戳了戳你）", msg_id="", ts=205.0, mentioned=True, is_poke=True)],
+        )
+        poke_sys, _, _, _ = ctx.build(poke_batch, history, now=205.0)
+        self.assertIn("刚刚戳了戳你", poke_sys)
         bot_role, bot_line = ContextAssembler.format_history_row(
             {"role": "bot", "text": "截图里是娄文启", "meta": "seen_image", "ts": 190.0},
             {},
@@ -513,11 +526,14 @@ class EchoAgentTests(unittest.TestCase):
             self.assertEqual(r_vague["reason"], "reply")
             task_mgr.submit.assert_not_called()
 
-            # 3) send_emoji 纯发与配字均写 tools=send_emoji 溯源
+            # 3) send_emoji 纯发与配字均写 tools=send_emoji 与具体表情描述（emoji=...）溯源，并在下轮渲染进 <context>
+            meme_llm = _SeqLLM([])
+            emoji.collect("g1", TINY_GIF + b"_meme_ctx", meme_llm)
             llm_em = _SeqLLM(
                 [
                     ModelTurn(tool_calls=(ToolCall("e1", "send_emoji", {"mood": "滑稽"}),)),
-                    ModelTurn(tool_calls=(ToolCall("e2", "send_emoji", {"mood": "滑稽", "reply_text": "给你配一张"}),)),
+                    ModelTurn(tool_calls=(ToolCall("e2", "send_emoji", {"mood": "开心", "reply_text": "给你配一张"}),)),
+                    ModelTurn(text="刚才发了个猫猫点赞的表情"),
                 ],
                 ignore_summary=True,
             )
@@ -526,13 +542,35 @@ class EchoAgentTests(unittest.TestCase):
                 Batch("g1", [ChatEvent("g1", "u1", "和", "@大肥鱼 发表情", msg_id="m_em1", ts=110.0, mentioned=True)])
             )
             self.assertEqual(r_em1["reason"], "face")
-            self.assertEqual(repo.recent_messages("g1", limit=1)[-1]["meta"], "tools=send_emoji")
+            self.assertEqual(repo.recent_messages("g1", limit=1)[-1]["meta"], "tools=send_emoji;emoji=QQ表情:滑稽")
 
             r_em2 = agent.handle_batch(
                 Batch("g1", [ChatEvent("g1", "u1", "和", "@大肥鱼 再说一句配个图", msg_id="m_em2", ts=120.0, mentioned=True)])
             )
             self.assertEqual(len(r_em2["actions"]), 2)
-            self.assertEqual(repo.recent_messages("g1", limit=1)[-1]["meta"], "tools=send_emoji")
+            self.assertEqual(
+                repo.recent_messages("g1", limit=1)[-1]["meta"],
+                "tools=send_emoji;emoji=开心（猫猫点赞）",
+            )
+
+            # 下一轮群友追问时，system prompt 中的「已执行记录」必须带上发出表情的具体画面描述
+            agent.handle_batch(
+                Batch("g1", [ChatEvent("g1", "u1", "和", "@大肥鱼 你发的图啥意思", msg_id="m_em3", ts=130.0, mentioned=True)])
+            )
+            self.assertIn("发出表情包「开心（猫猫点赞）」", str(llm_em.recorded_calls[-1]["messages"][0].content))
+
+            # 3b) Poke 戳一戳：禁用 run_task / stay_silent / react_message，且注入戳一戳语境
+            llm_poke = _SeqLLM([ModelTurn(text="干嘛戳我呀")], ignore_summary=True)
+            agent._llm = llm_poke
+            r_poke = agent.handle_batch(
+                Batch("g1", [ChatEvent("g1", "u1", "和", "（戳了戳你）", msg_id="", ts=135.0, mentioned=True, is_poke=True)])
+            )
+            self.assertEqual(r_poke["reason"], "reply")
+            poke_tools = llm_poke.recorded_calls[0]["tool_names"]
+            self.assertNotIn("run_task", poke_tools)
+            self.assertNotIn("stay_silent", poke_tools)
+            self.assertNotIn("react_message", poke_tools)
+            self.assertIn("刚刚戳了戳你", str(llm_poke.recorded_calls[0]["messages"][0].content))
 
             # 4) 记忆整理过滤通用词典词（软连接=符号链接）、机器人自述建议、占位词“-”与超时噪音
             repo.observe_person("g1", "u1", "和", now=100.0)
@@ -625,15 +663,14 @@ class EchoAgentTests(unittest.TestCase):
 
         llm_misc = _SeqLLM([RuntimeError("unexpected upstream boom")], ignore_summary=True)
         agent_misc = EchoAgent(repo, llm_misc, sch)
-        r_priv = agent_misc.handle_batch(
+        r_misc = agent_misc.handle_batch(
             Batch(
-                "private:u1",
-                [ChatEvent("private:u1", "u1", "神之殒", "在吗", msg_id="m_p1", ts=210.0, scene="private", mentioned=True)],
-                scene="private",
+                "g1",
+                [ChatEvent("g1", "u1", "神之殒", "@大肥鱼 在吗", msg_id="m_p1", ts=210.0, mentioned=True)],
             )
         )
-        self.assertTrue(r_priv["replied"])
-        self.assertEqual(r_priv["actions"][0].text, "刚才我这边卡壳了一下，稍后再喊我试试。")
+        self.assertTrue(r_misc["replied"])
+        self.assertEqual(r_misc["actions"][0].text, "刚才我这边卡壳了一下，稍后再喊我试试。")
 
         # 3) 未 @ 闲聊与转述 mention(retold=True) 触发 model_error 仍保持静默
         llm_silent = _SeqLLM([overload_err, overload_err], ignore_summary=True)

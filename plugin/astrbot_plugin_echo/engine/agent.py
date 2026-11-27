@@ -17,6 +17,7 @@ from ..domain import (
     LLMMessage,
     MemoryRepository,
     OutboundAction,
+    PickedEmoji,
     ReactEmoji,
     SearchProvider,
     SendEmoji,
@@ -126,7 +127,6 @@ class EchoAgent:
         self._search = search_provider
         self.context = ContextAssembler(
             repo,
-            emoji_store=emoji_store,
             history_limit=history_limit,
             **({"persona": persona} if persona else {}),
         )
@@ -330,9 +330,37 @@ class EchoAgent:
         )
         return [SendText(gid, umo, notice)]
 
-    def _resolve_quote_mid(self, gid: str, scene: str, anchor: Any) -> str:
+    def _pick_emoji(self, gid: str, mood: str) -> Optional[PickedEmoji]:
+        if self._emoji is None:
+            return None
+        pick_entry = getattr(self._emoji, "pick_entry", None)
+        if callable(pick_entry):
+            picked = pick_entry(gid, mood)
+            if isinstance(picked, PickedEmoji):
+                return picked
+        raw = self._emoji.pick(gid, mood)
+        if raw is None:
+            return None
+        s = str(raw)
+        if s.startswith("face:"):
+            return PickedEmoji(kind="face", face_id=s.split(":", 1)[1], tag=mood)
+        return PickedEmoji(kind="image", path=s, tag=mood)
+
+    @staticmethod
+    def _format_emoji_meta(picked: PickedEmoji) -> str:
+        tag = re.sub(r"[;\r\n]+", " ", str(picked.tag or "")).strip()[:20]
+        desc = re.sub(r"[;\r\n]+", " ", str(picked.description or "")).strip()[:40]
+        if picked.kind == "face":
+            label = tag or picked.face_id
+            return "emoji=QQ表情:{}".format(label) if label else ""
+        if desc and desc != tag:
+            head = "{}（{}）".format(tag, desc) if tag else desc
+            return "emoji={}".format(head)
+        return "emoji={}".format(tag or "表情")
+
+    def _resolve_quote_mid(self, gid: str, anchor: Any) -> str:
         """群聊思考或报错期间若已有插话，自动引用触发该轮的原始消息 ID。"""
-        if scene == "group" and anchor and anchor.msg_id:
+        if anchor and anchor.msg_id:
             latest = self._repo.recent_messages(gid, limit=12)
             return should_quote_reply(anchor.msg_id, anchor.user_id, latest)
         return ""
@@ -391,16 +419,14 @@ class EchoAgent:
         allow_task = bool(
             self._tasks is not None
             and self._tasks.available()
-            and ((batch.mentioned and not batch.retold) or batch.scene == "private")
+            and batch.mentioned
+            and not batch.retold
+            and not batch.is_poke
         )
         allow_silent = not (batch.mentioned and not batch.retold)
-        has_emoji = bool(
-            batch.scene == "group"
-            and self._emoji is not None
-            and self._emoji.has_entries(gid)
-        )
+        has_emoji = bool(self._emoji is not None and self._emoji.has_entries(gid))
         has_search = bool(self._search is not None and self._search.available())
-        can_react = bool(batch.scene == "group" and batch.target_msg_id)
+        can_react = bool(batch.target_msg_id)
 
         tool_specs, _ = self._build_tools(
             batch,
@@ -416,7 +442,6 @@ class EchoAgent:
             batch,
             prev_history,
             running_task=running_task,
-            tools_summary="",
             now=now,
         )
 
@@ -436,6 +461,7 @@ class EchoAgent:
         marked_viewed = False
         reply_text = ""
         attach_mood = ""
+        emoji_meta = ""
         terminal_actions: Optional[list[OutboundAction]] = None
         terminal_reason = "reply"
 
@@ -455,8 +481,8 @@ class EchoAgent:
                 self._repo.record_event(gid, "model_error", ok=False, latency=elapsed, detail=str(exc))
                 for k in repeat_keys:
                     self._repeat_seen.pop(k, None)
-                if (batch.mentioned and not batch.retold) or batch.scene == "private":
-                    quote_mid = self._resolve_quote_mid(gid, batch.scene, anchor)
+                if batch.mentioned and not batch.retold:
+                    quote_mid = self._resolve_quote_mid(gid, anchor)
                     notice = _format_model_error_notice(exc)
                     return {
                         "replied": True,
@@ -518,24 +544,29 @@ class EchoAgent:
                         attach_mood = mood
                         should_stop_loop = True
                         break
-                    picked = self._emoji.pick(gid, mood)
+                    picked = self._pick_emoji(gid, mood)
                     if picked is None:
                         elapsed = time.monotonic() - started
                         self._repo.record_event(gid, "silent", ok=True, latency=elapsed)
                         return {"replied": False, "actions": [], "reason": "silent"}
                     elapsed = time.monotonic() - started
                     self._repo.record_event(gid, "send_face", ok=True, latency=elapsed, tokens=total_tokens, detail=mood)
-                    self._repo.add_message(gid, "bot", "大肥鱼", "bot", "[发了一张表情包]", meta="tools=send_emoji")
+                    _record_tool("send_emoji")
+                    emoji_meta = self._format_emoji_meta(picked)
+                    prov_meta = ["tools=" + ",".join(tools_used)]
+                    if emoji_meta:
+                        prov_meta.append(emoji_meta)
+                    self._repo.add_message(gid, "bot", "大肥鱼", "bot", "[发了一张表情包]", meta=";".join(prov_meta))
                     self._scheduler.record_bot_reply(
                         gid,
                         user_id=anchor.user_id if anchor else "",
                         from_mentioned=bool(batch.mentioned and not batch.retold),
                         now=time.time(),
                     )
-                    if str(picked).startswith("face:"):
-                        terminal_actions = [SendFace(gid, umo, str(picked).split(":", 1)[1])]
+                    if picked.kind == "face":
+                        terminal_actions = [SendFace(gid, umo, picked.face_id)]
                     else:
-                        terminal_actions = [SendEmoji(gid, umo, str(picked))]
+                        terminal_actions = [SendEmoji(gid, umo, picked.path)]
                     terminal_reason = "face"
                     should_stop_loop = True
                     break
@@ -666,28 +697,31 @@ class EchoAgent:
             self._last_bot_reply.clear()
 
         # 智能 QQ 引用判断（处理模型思考期间是否有人插话）
-        quote_mid = self._resolve_quote_mid(gid, batch.scene, anchor)
+        quote_mid = self._resolve_quote_mid(gid, anchor)
 
         now_done = time.time()
         extra_actions: list[OutboundAction] = []
         explicit_emoji_req = any(h in (batch.body_text or "") for h in _EXPLICIT_EMOJI_HINTS)
         emoji_cooldown_ok = explicit_emoji_req or (now_done - self._last_emoji_at.get(gid, 0.0) >= ATTACH_EMOJI_COOLDOWN)
         if attach_mood and has_emoji and self._emoji is not None and emoji_cooldown_ok:
-            picked = self._emoji.pick(gid, attach_mood)
+            picked = self._pick_emoji(gid, attach_mood)
             if picked is not None:
                 self._last_emoji_at[gid] = now_done
                 _record_tool("send_emoji")
+                emoji_meta = self._format_emoji_meta(picked)
                 self._repo.record_event(gid, "send_face", ok=True, latency=0.0, detail="attach:" + attach_mood)
-                if str(picked).startswith("face:"):
-                    extra_actions.append(SendFace(gid, umo, str(picked).split(":", 1)[1]))
+                if picked.kind == "face":
+                    extra_actions.append(SendFace(gid, umo, picked.face_id))
                 else:
-                    extra_actions.append(SendEmoji(gid, umo, str(picked)))
+                    extra_actions.append(SendEmoji(gid, umo, picked.path))
 
         prov: list[str] = []
         if saw_images:
             prov.append("seen_image")
         if tools_used:
             prov.append("tools=" + ",".join(tools_used))
+        if emoji_meta:
+            prov.append(emoji_meta)
         meta_str = ";".join(prov)
 
         self._repo.add_message(gid, "bot", "大肥鱼", "bot", cleaned, meta=meta_str)

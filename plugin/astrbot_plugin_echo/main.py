@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+from dataclasses import replace
 import os
 import sys
 import time
@@ -143,7 +144,7 @@ class Echo(Star):
             "File": File,
         }
         self.inbound = AstrBotInboundParser(self._comp_types)
-        self.limiter = MessageLimiter(per_minute=8, per_burst=3)
+        self.limiter = MessageLimiter(per_minute=8)
         self._bots: dict[str, object] = {}
         self.sender = AstrBotSender(
             context,
@@ -239,6 +240,15 @@ class Echo(Star):
         parsed = await self.inbound.parse(event, last_bot_reply_at=last_bot_at)
         if parsed is None or parsed.passthrough:
             return
+
+        if parsed.is_poke:
+            if not self.scheduler.allow_poke(parsed.group_id, now=parsed.ts):
+                event.stop_event()
+                return
+            if not parsed.user_name or parsed.user_name == parsed.user_id:
+                aliases = await asyncio.to_thread(self.repo.person_aliases, parsed.group_id, parsed.user_id)
+                resolved_name = next((a for a in aliases if a and a != parsed.user_id), "") or "群友"
+                parsed = replace(parsed, user_name=resolved_name)
 
         if parsed.raw_text in ("/帮助", "／帮助", "/help"):
             await asyncio.to_thread(

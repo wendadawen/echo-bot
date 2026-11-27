@@ -7,6 +7,7 @@ import os
 import socket
 import sys
 import tempfile
+import time
 import types
 import unittest
 import urllib.error
@@ -96,6 +97,13 @@ class _Forward:
 
 class _Json:
     type = "json"
+
+
+class _Poke:
+    def __init__(self, id="0", qq="0"):
+        self.id = id
+        self.qq = qq
+        self.type = "poke"
 
 
 COMP_TYPES = {
@@ -523,6 +531,72 @@ class InboundAndSenderTests(unittest.TestCase):
         self.assertIn("内层详情", parsed_fwd.text)
         self.assertNotIn("{'", parsed_fwd.text)
 
+    def test_super_face_dice_rps_poke_and_quoted_mface(self):
+        parser = AstrBotInboundParser(COMP_TYPES, downloader=lambda url: TINY_PNG)
+
+        # 1) QQ 新版超级表情（475=干饭，489+faceText=/知识增加）与骰子/猜拳解析
+        ev_super = self._make_event(
+            parts=[_Face(id="475", name=""), _Face(id="489", name="QQ表情")],
+            raw_msg={
+                "message_id": 2001,
+                "message": [
+                    {"type": "face", "data": {"id": "475"}},
+                    {"type": "face", "data": {"id": "489", "raw": {"faceText": "/知识增加"}}},
+                    {"type": "dice", "data": {"result": "6"}},
+                    {"type": "rps", "data": {"result": "3"}},
+                ],
+            },
+        )
+        parsed_super = asyncio.run(parser.parse(ev_super, last_bot_reply_at=time.time()))
+        self.assertIn("[QQ表情:干饭]", parsed_super.text)
+        self.assertIn("[QQ表情:知识增加]", parsed_super.text)
+        self.assertIn("[骰子:6点]", parsed_super.text)
+        self.assertIn("[猜拳:石头]", parsed_super.text)
+        self.assertTrue(parsed_super.bare_face)
+
+        # 2) Poke 戳一戳：戳机器人触发，群友互戳直接 passthrough
+        ev_poke_bot = self._make_event(
+            parts=[_Poke(id="8888")],
+            raw_msg={"post_type": "notice", "notice_type": "notify", "sub_type": "poke", "target_id": 8888, "user_id": 2001},
+        )
+        parsed_poke = asyncio.run(parser.parse(ev_poke_bot))
+        self.assertFalse(parsed_poke.passthrough)
+        self.assertTrue(parsed_poke.mentioned)
+        self.assertTrue(parsed_poke.is_poke)
+        self.assertEqual(parsed_poke.msg_id, "")
+        self.assertEqual(parsed_poke.text, "（戳了戳你）")
+
+        ev_poke_other = self._make_event(
+            parts=[_Poke(id="9999")],
+            raw_msg={"post_type": "notice", "notice_type": "notify", "sub_type": "poke", "target_id": 9999, "user_id": 2001},
+        )
+        parsed_poke_other = asyncio.run(parser.parse(ev_poke_other))
+        self.assertTrue(parsed_poke_other.passthrough)
+
+        # 3) 引用商城大表情 mface 且 @大肥鱼：通过 get_msg 回查下载图片看图，且 is_sticker=False 不收入库
+        bot = MagicMock()
+        bot.call_action = AsyncMock(return_value={
+            "message": [
+                {"type": "mface", "data": {"summary": "[猫猫比心]", "url": "https://cdn.example.com/mface.png"}}
+            ]
+        })
+        ev_qm = self._make_event(
+            parts=[
+                _Reply(id="777", sender_id="2002", sender_nickname="小和", text="", chain=[]),
+                _At(qq="8888"),
+                _Plain("这表情啥意思"),
+            ],
+            raw_msg={"message_id": 2002, "message": []},
+            text="这表情啥意思",
+        )
+        ev_qm.bot = bot
+        parsed_qm = asyncio.run(parser.parse(ev_qm))
+        bot.call_action.assert_awaited_once_with("get_msg", message_id=777)
+        self.assertEqual(len(parsed_qm.images), 1)
+        self.assertFalse(parsed_qm.images[0].is_sticker)
+        self.assertIn("[商城表情:猫猫比心]", parsed_qm.quote_text)
+        self.assertNotIn("回复 小和", parsed_qm.quote_text)
+
     def test_sender_reply_fallback_jailed_emoji_and_file_cleanup(self):
         class Chain(list):
             pass
@@ -549,7 +623,7 @@ class InboundAndSenderTests(unittest.TestCase):
             invalid_faces = []
             ctx = MagicMock()
             ctx.send_message = AsyncMock(
-                side_effect=[RuntimeError("reply target expired"), None, None, RuntimeError("unsupported face id"), None]
+                side_effect=[RuntimeError("reply target expired"), None, None, RuntimeError("unsupported face id"), None, None]
             )
 
             from astrbot_plugin_echo.domain import SendFace  # noqa: E402
@@ -601,6 +675,27 @@ class InboundAndSenderTests(unittest.TestCase):
             )
             bot_g1.call_action.assert_not_called()
             bot_g2.call_action.assert_awaited_once_with("set_msg_emoji_like", message_id=555, emoji_id="124")
+
+            # 5) 数字群号发送 SendEmoji 走 NapCat send_group_msg(sub_type=1)；失败自动回退普通 Image
+            bot_num = MagicMock()
+            bot_num.call_action = AsyncMock(side_effect=[None, RuntimeError("sub_type unsupported")])
+            bots["aiocqhttp:10086"] = bot_num
+            self.assertTrue(
+                asyncio.run(sender.send(SendEmoji(group_id="aiocqhttp:10086", umo="u3", path=str(good_emoji))))
+            )
+            first_call = bot_num.call_action.call_args_list[0]
+            self.assertEqual(first_call.args[0], "send_group_msg")
+            self.assertEqual(first_call.kwargs["group_id"], 10086)
+            seg_data = first_call.kwargs["message"][0]["data"]
+            self.assertEqual(seg_data["sub_type"], 1)
+            self.assertEqual(seg_data["summary"], "[动画表情]")
+            self.assertTrue(seg_data["file"].startswith("base64://"))
+
+            send_before = ctx.send_message.call_count
+            self.assertTrue(
+                asyncio.run(sender.send(SendEmoji(group_id="aiocqhttp:10086", umo="u3", path=str(good_emoji))))
+            )
+            self.assertEqual(ctx.send_message.call_count, send_before + 1)
             repo.close()
 
 

@@ -8,7 +8,6 @@ from typing import Any, Optional, Sequence
 
 from ..domain import (
     Batch,
-    EmojiStorePort,
     LLMMessage,
     MemoryRepository,
     TaskStatusInfo,
@@ -57,16 +56,19 @@ _TOOL_PROVENANCE_LABELS = {
 
 
 def format_provenance_note(meta: Any) -> str:
-    """将 messages.meta 中的看图与工具执行标记渲染为 <background_data> 可读动作描述。"""
+    """将 messages.meta 中的看图与工具执行标记渲染为 <context> 可读动作描述。"""
     raw = str(meta or "").strip()
     if not raw:
         return ""
     saw_image = False
     tools: list[str] = []
+    emoji_desc = ""
     for part in raw.split(";"):
         item = part.strip()
         if item == "seen_image":
             saw_image = True
+        elif item.startswith("emoji="):
+            emoji_desc = item[6:].strip()
         elif item.startswith("tools="):
             for t in item[6:].split(","):
                 tn = t.strip()
@@ -75,9 +77,16 @@ def format_provenance_note(meta: Any) -> str:
     bits: list[str] = []
     if saw_image:
         bits.append("已实际查看当轮原图")
-    if tools:
-        desc = "、".join(_TOOL_PROVENANCE_LABELS.get(t, "调用 " + t) for t in tools)
-        bits.append(desc)
+    tool_descs: list[str] = []
+    for t in tools:
+        if t == "send_emoji" and emoji_desc:
+            tool_descs.append("发出表情包「{}」".format(emoji_desc))
+        else:
+            tool_descs.append(_TOOL_PROVENANCE_LABELS.get(t, "调用 " + t))
+    if not tools and emoji_desc:
+        tool_descs.append("发出表情包「{}」".format(emoji_desc))
+    if tool_descs:
+        bits.append("、".join(tool_descs))
     return "，".join(bits)
 
 _WEEKDAYS = ("一", "二", "三", "四", "五", "六", "日")
@@ -187,17 +196,15 @@ def should_quote_reply(
 
 
 class ContextAssembler:
-    """负责组装 system prompt、<background_data> 与历史消息列表。"""
+    """负责组装 system prompt、<context> 与历史消息列表。"""
 
     def __init__(
         self,
         repo: MemoryRepository,
-        emoji_store: Optional[EmojiStorePort] = None,
         history_limit: int = 30,
         persona: str = PERSONA,
     ):
         self._repo = repo
-        self._emoji = emoji_store
         self.history_limit = max(1, min(200, int(history_limit or 30)))
         self.persona = persona
 
@@ -207,7 +214,6 @@ class ContextAssembler:
         history_rows: list[dict[str, Any]],
         *,
         running_task: Optional[TaskStatusInfo] = None,
-        tools_summary: str = "",
         now: Optional[float] = None,
     ) -> tuple[str, list[dict[str, Any]], dict[str, str], dict[str, str]]:
         """返回 (system_prompt, compacted_history, real_to_alias, alias_to_real)。"""
@@ -232,7 +238,9 @@ class ContextAssembler:
 
         # ---- 1. 强信号与行为指引（处于 <context> 之外） ----
         signals: list[str] = [now_line]
-        if batch.mentioned:
+        if batch.is_poke:
+            signals.append("对方刚刚戳了戳你，用轻快俏皮的一句短话回应即可（也可顺手调 send_emoji 配张表情包）。")
+        elif batch.mentioned:
             if batch.retold:
                 signals.append("有人在转述别人对你的评价，直接面向说话人接一句即可，不纠结评价本身。")
             else:
@@ -246,8 +254,6 @@ class ContextAssembler:
                     running_task.prompt, running_task.elapsed, running_task.progress or "执行中"
                 )
             )
-        if tools_summary:
-            signals.append(tools_summary)
 
         # ---- 2. 不可信背景参考区（隔离在 <context> 内） ----
         bg_lines: list[str] = []
@@ -322,16 +328,6 @@ class ContextAssembler:
                     bg_lines.append("提及成员「{}」档案：{}".format(cand_word, p_sum))
                 if len(seen_uids) >= 3:
                     break
-
-        # 图片哈希历史缓存命中提示
-        img_notes = []
-        for idx, media in enumerate(batch.images[:2], 1):
-            if media.sha256:
-                cached_desc = self._repo.get_image_cache(media.sha256)
-                if cached_desc:
-                    img_notes.append("图{}此前见过：{}".format(idx, cached_desc))
-        if img_notes:
-            bg_lines.append("历史图片参考：" + "；".join(img_notes))
 
         sections = [self.persona, BEHAVIOR_RULES, "\n".join(signals)]
         if bg_lines:

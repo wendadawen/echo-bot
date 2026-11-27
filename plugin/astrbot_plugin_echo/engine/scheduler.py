@@ -17,6 +17,7 @@ ACTIVE_WINDOW = 60.0
 OFFER_WINDOW = 180.0
 WINDOW_COOLDOWN = 15.0
 IDLE_COOLDOWN = 25.0
+POKE_COOLDOWN = 35.0
 
 _IMAGE_REF_HINTS = (
     "图", "截图", "照片", "画面", "上图", "这张", "那张", "人物",
@@ -65,6 +66,17 @@ class Scheduler:
         self._intervened_since_reply: dict[str, bool] = {}
         self._unmentioned_streak: dict[str, int] = {}
         self._recent_humans: dict[str, collections.deque[tuple[float, str]]] = {}
+        self._last_poke_at: dict[str, float] = {}
+
+    def allow_poke(self, group_id: str, now: Optional[float] = None) -> bool:
+        """同一群短时间内连戳冷却，防止戳一戳刷屏。"""
+        cur = time.time() if now is None else float(now)
+        gid = str(group_id)
+        last = self._last_poke_at.get(gid, 0.0)
+        if cur - last < POKE_COOLDOWN:
+            return False
+        self._last_poke_at[gid] = cur
+        return True
 
     def observe_human(
         self,
@@ -196,7 +208,7 @@ class Scheduler:
 
         batch = self._pending.get(gid)
         if batch is None:
-            batch = Batch(group_id=gid, started=cur, deadline=cur, scene=event.scene)
+            batch = Batch(group_id=gid, started=cur, deadline=cur)
             self._pending[gid] = batch
 
         same_user = bool(batch.items and batch.items[-1].user_id == event.user_id)
