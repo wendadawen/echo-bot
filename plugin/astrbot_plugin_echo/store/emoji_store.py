@@ -30,9 +30,10 @@ FILTER_WORDS = ("二维码", "付款码", "身份证", "验证码", "密码", "�
 NON_EMOJI_WORDS = ("非表情", "不是表情")
 _BAD_EMOJI_WORDS = ("低俗", "色情", "黄图", "露骨", "性暗示", "nsfw", "porn", "竖起中指", "竖中指")
 _NON_STICKER_DESC_WORDS = (
-    "新闻报道", "审查调查", "违纪", "聊天记录", "录屏", "截图", "网页",
-    "图表", "对阵表", "终端", "thinking process", "thought process",
-    "思考过程", "token每秒", "need chinese", "en?", "must describe",
+    "新闻报道", "审查调查", "违纪", "聊天记录", "聊天截图", "录屏", "截图", "网页",
+    "柱状图", "折线图", "统计图", "表格", "数据图表", "一张图表", "对阵表", "终端",
+    "thinking process", "thought process", "思考过程", "token每秒",
+    "need chinese", "en?", "must describe",
 )
 _BAD_TAG_PREFIXES = ("这是", "这张", "那个", "一个", "口语化", "截图", "聊天", "网页", "图片", "画面")
 

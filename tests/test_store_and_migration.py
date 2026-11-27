@@ -178,6 +178,8 @@ class EmojiStoreTests(unittest.TestCase):
         self.assertFalse(acceptable(""))
         self.assertFalse(acceptable("非表情"))
         self.assertFalse(acceptable("这是一张二维码截图"))
+        self.assertFalse(acceptable("数据图表展示各模型耗时"))
+        self.assertTrue(acceptable("这张图表达了累到有些无奈的状态"))
         self.assertFalse(acceptable("猫猫笑", b"x" * (2 * 1024 * 1024 + 1)))
         self.assertTrue(acceptable("一只猫翻白眼", TINY_PNG))
 
