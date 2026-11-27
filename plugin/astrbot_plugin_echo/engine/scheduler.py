@@ -1,21 +1,27 @@
-"""群聊节奏与调度器：防抖合批、@ 高优快车道、极克制偶尔接茬、忙时与错峰主动退避。"""
+"""群聊节奏与注意力调度器：防抖合批、非破坏性媒体窗口、多人群聊轮次模型。"""
 
 from __future__ import annotations
 
+import collections
 import random
 import re
 import time
-from typing import Optional
+from dataclasses import dataclass
+from typing import Optional, Sequence
 
 from ..domain import Batch, ChatEvent, MediaRef
 
-IMAGE_TTL = 120.0
-VIEWED_IMAGE_TTL = 60.0
-ACTIVE_WINDOW = 120.0
-WINDOW_COOLDOWN = 3.0
-IDLE_COOLDOWN = 20.0
+IMAGE_TTL = 180.0
+VIEWED_IMAGE_TTL = 150.0
+ACTIVE_WINDOW = 60.0
+OFFER_WINDOW = 180.0
+WINDOW_COOLDOWN = 15.0
+IDLE_COOLDOWN = 25.0
 
-_IMAGE_REF_HINTS = ("图", "截图", "照片", "画面", "上图", "这张", "那张", "人物")
+_IMAGE_REF_HINTS = (
+    "图", "截图", "照片", "画面", "上图", "这张", "那张", "人物",
+    "识图", "看图", "刚才那", "上面那",
+)
 
 _FOLLOWUP_CONFIRMS = frozenset({
     "查找吧", "查吧", "来吧", "好呀", "好啊", "行吧", "继续", "快查",
@@ -23,12 +29,20 @@ _FOLLOWUP_CONFIRMS = frozenset({
 })
 
 
+@dataclass
+class _MediaSlot:
+    media: MediaRef
+    ts: float
+    sender_id: str = ""
+    viewed_at: float = 0.0
+
+
 class Scheduler:
-    """统一管理群聊防抖合批、图片上下文附着、@ 优先出队与极克制接茬抽签。"""
+    """统一管理群聊防抖合批、非破坏性媒体窗口、@ 快车道与多人群聊轮次注意力。"""
 
     def __init__(
         self,
-        ambient_rate: float = 0.08,
+        ambient_rate: float = 0.05,
         mention_cap: float = 1.2,
         quiet_delay: float = 2.5,
         active_delay: float = 5.5,
@@ -42,25 +56,51 @@ class Scheduler:
         self.batch_cap = float(batch_cap)
         self.image_wait = float(image_wait)
         self._pending: dict[str, Batch] = {}
-        self._recent_images: dict[str, list[tuple[float, MediaRef]]] = {}
-        self._last_viewed_images: dict[str, tuple[float, list[MediaRef]]] = {}
+        self._media_window: dict[str, list[_MediaSlot]] = {}
         self._last_input: dict[str, float] = {}
         self._last_reply_at: dict[str, float] = {}
         self._last_reply_user: dict[str, str] = {}
         self._last_offered_at: dict[str, float] = {}
         self._last_face_banter_at: dict[str, float] = {}
+        self._intervened_since_reply: dict[str, bool] = {}
+        self._unmentioned_streak: dict[str, int] = {}
+        self._recent_humans: dict[str, collections.deque[tuple[float, str]]] = {}
+
+    def observe_human(
+        self,
+        group_id: str,
+        user_id: str = "",
+        now: Optional[float] = None,
+    ) -> None:
+        """记录群友说话轨迹（含不入队的纯图/跳过消息），用于判断是否已被他人打岔。"""
+        cur = time.time() if now is None else float(now)
+        gid = str(group_id)
+        uid = str(user_id or "")
+        if not uid:
+            return
+        hist = self._recent_humans.setdefault(gid, collections.deque(maxlen=8))
+        hist.append((cur, uid))
+        last_uid = self._last_reply_user.get(gid, "")
+        if last_uid and uid != last_uid:
+            self._intervened_since_reply[gid] = True
 
     def record_bot_reply(
         self,
         group_id: str,
         user_id: str = "",
         offered: bool = False,
+        from_mentioned: bool = True,
         now: Optional[float] = None,
     ) -> None:
         cur = time.time() if now is None else float(now)
         gid = str(group_id)
         self._last_reply_at[gid] = cur
         self._last_reply_user[gid] = str(user_id or "")
+        self._intervened_since_reply[gid] = False
+        if from_mentioned:
+            self._unmentioned_streak[gid] = 0
+        else:
+            self._unmentioned_streak[gid] = self._unmentioned_streak.get(gid, 0) + 1
         if offered:
             self._last_offered_at[gid] = cur
         else:
@@ -69,31 +109,88 @@ class Scheduler:
     def last_reply_at(self, group_id: str) -> float:
         return self._last_reply_at.get(str(group_id), 0.0)
 
-    def attach_images(self, group_id: str, media_list: list[MediaRef], now: Optional[float] = None) -> None:
+    def attach_images(
+        self,
+        group_id: str,
+        media_list: Sequence[MediaRef],
+        now: Optional[float] = None,
+        sender_id: str = "",
+    ) -> None:
+        """把近期群图存入非破坏性短时窗口；重复发同一张图时重置其未读状态。"""
         if not media_list:
             return
         cur = time.time() if now is None else float(now)
         gid = str(group_id)
-        buf = [pair for pair in self._recent_images.get(gid, []) if cur - pair[0] <= IMAGE_TTL]
-        seen = {m.sha256 for _, m in buf if m.sha256}
+        buf = [s for s in self._media_window.get(gid, []) if cur - s.ts <= IMAGE_TTL]
+        by_sha = {s.media.sha256: idx for idx, s in enumerate(buf) if s.media.sha256}
         for m in media_list:
-            if m.sha256 and m.sha256 in seen:
-                continue
-            buf.append((cur, m))
-            if m.sha256:
-                seen.add(m.sha256)
-        self._recent_images[gid] = buf[-4:]
+            slot = _MediaSlot(media=m, ts=cur, sender_id=str(sender_id or ""), viewed_at=0.0)
+            if m.sha256 and m.sha256 in by_sha:
+                buf[by_sha[m.sha256]] = slot
+            else:
+                if m.sha256:
+                    by_sha[m.sha256] = len(buf)
+                buf.append(slot)
+        self._media_window[gid] = buf[-4:]
 
-    def pop_recent_images(self, group_id: str, now: Optional[float] = None) -> list[MediaRef]:
+    def merge_recent_images(self, batch: Batch, now: Optional[float] = None) -> None:
+        """非破坏性地把近期未看/同话题群图附着到当前批；绝不在投喂前弹出或标记已看。"""
         cur = time.time() if now is None else float(now)
-        items = self._recent_images.pop(str(group_id), [])
-        return [m for stamp, m in items if cur - stamp <= IMAGE_TTL]
+        gid = str(batch.group_id)
+        buf = [s for s in self._media_window.get(gid, []) if cur - s.ts <= IMAGE_TTL]
+        self._media_window[gid] = buf
+
+        if batch.images:
+            known = {s.media.sha256 for s in buf if s.media.sha256}
+            anchor_uid = batch.anchor.user_id if batch.anchor else ""
+            missing = [m for m in batch.images if not (m.sha256 and m.sha256 in known)]
+            if missing:
+                self.attach_images(gid, missing, now=cur, sender_id=anchor_uid)
+            return
+
+        if not buf:
+            return
+
+        unread = [s for s in buf if s.viewed_at == 0.0]
+        if unread:
+            batch.images = [s.media for s in unread[-2:]]
+            return
+
+        viewed = [s for s in buf if s.viewed_at > 0.0 and cur - s.viewed_at <= VIEWED_IMAGE_TTL]
+        if not viewed:
+            return
+
+        body = (batch.body_text or "").strip()
+        if body and any(h in body for h in _IMAGE_REF_HINTS):
+            batch.images = [s.media for s in viewed[-2:]]
+
+    def mark_images_viewed(
+        self,
+        group_id: str,
+        media_list: Sequence[MediaRef],
+        now: Optional[float] = None,
+    ) -> None:
+        """仅在主引擎真正完成 LLM 调用后才标记图片已看；跳过批与报错批绝不消费图片。"""
+        if not media_list:
+            return
+        cur = time.time() if now is None else float(now)
+        gid = str(group_id)
+        buf = self._media_window.get(gid)
+        if not buf:
+            return
+        digests = {m.sha256 for m in media_list if m.sha256}
+        refs = set(id(m) for m in media_list)
+        for slot in buf:
+            if (slot.media.sha256 and slot.media.sha256 in digests) or id(slot.media) in refs:
+                if slot.viewed_at == 0.0:
+                    slot.viewed_at = cur
 
     def enqueue(self, event: ChatEvent) -> None:
         gid = str(event.group_id)
         cur = float(event.ts or time.time())
         prev_input = self._last_input.get(gid, 0.0)
         self._last_input[gid] = max(prev_input, cur)
+        self.observe_human(gid, event.user_id, now=cur)
         if event.faces or event.has_sticker:
             self._last_face_banter_at[gid] = cur
 
@@ -117,7 +214,6 @@ class Scheduler:
             return
 
         if event.bare_face and not event.has_image:
-            # 纯 QQ 表情不延长防抖等待
             return
 
         base_wait = self.quiet_delay if (not prev_input or cur - prev_input > 30.0) else self.active_delay
@@ -137,37 +233,8 @@ class Scheduler:
         ready.sort(key=lambda b: (0 if b.mentioned else 1, b.started))
         return ready
 
-    def merge_recent_images(self, batch: Batch, now: Optional[float] = None) -> None:
-        cur = time.time() if now is None else float(now)
-        gid = str(batch.group_id)
-        fresh = self.pop_recent_images(gid, now=cur)
-        if fresh:
-            seen = {m.sha256 for m in batch.images if m.sha256}
-            for m in fresh:
-                if m.sha256 and m.sha256 in seen:
-                    continue
-                batch.images.append(m)
-                if m.sha256:
-                    seen.add(m.sha256)
-            batch.images = batch.images[-4:]
-
-        if batch.images:
-            self._last_viewed_images[gid] = (cur, list(batch.images[-2:]))
-            return
-
-        prev = self._last_viewed_images.get(gid)
-        if not prev:
-            return
-        viewed_at, viewed_imgs = prev
-        if cur - viewed_at > VIEWED_IMAGE_TTL:
-            self._last_viewed_images.pop(gid, None)
-            return
-        body = (batch.body_text or "").strip()
-        if body and any(h in body for h in _IMAGE_REF_HINTS):
-            batch.images = list(viewed_imgs)
-
     def chime_probability(self, batch: Batch, now: Optional[float] = None) -> float:
-        """计算未 @ 群聊的主动接茬概率：政策 3A「极克制地偶尔接茬」。"""
+        """计算未 @ 群聊的主动接茬概率：尊重群友多轮接力、禁止未 @ 连环插话。"""
         if batch.mentioned:
             return 1.0
         if batch.at_others:
@@ -187,22 +254,34 @@ class Scheduler:
         since_face = (cur - last_face) if last_face else 1e12
         is_face = bool(anchor and anchor.bare_face and "[QQ表情:" in body)
 
-        if since_offer < 300.0 and (
+        if self._unmentioned_streak.get(gid, 0) >= 1 and since_reply < 90.0:
+            return 0.0
+
+        intervened = self._intervened_since_reply.get(gid, False)
+
+        if since_offer < OFFER_WINDOW and (
             clean in _FOLLOWUP_CONFIRMS
             or any(k in clean for k in ("查找", "查吧", "查一下", "帮我", "来吧", "继续"))
-            or len(clean) > 4
-            or is_face
+            or (not intervened and (len(clean) > 4 or is_face))
         ):
-            return 0.85
+            return 0.75
 
-        if user_id and user_id == self._last_reply_user.get(gid) and since_reply < ACTIVE_WINDOW:
-            if len(clean) > 4 or "你" in clean or is_face:
-                return 0.65
+        if (
+            user_id
+            and user_id == self._last_reply_user.get(gid)
+            and not intervened
+            and since_reply < ACTIVE_WINDOW
+            and (len(clean) > 4 or "你" in clean or is_face)
+        ):
+            return 0.45
 
-        if since_reply < 90.0 and (is_face or since_face < 90.0):
-            return 0.25
+        if since_reply < 60.0 and not intervened and (is_face or since_face < 45.0):
+            return 0.2
 
-        # 群友之间普通聊天（哪怕带问号）：极克制抽签，不打断别人也不堵上游
+        recent = [pair for pair in self._recent_humans.get(gid, ()) if cur - pair[0] <= 45.0]
+        if len(recent) >= 3 and len({uid for _, uid in recent}) >= 2:
+            return min(self.ambient_rate, 0.02)
+
         return self.ambient_rate
 
     def should_view(
@@ -217,7 +296,6 @@ class Scheduler:
         if batch.approved or batch.mentioned:
             return True
         if group_busy or recent_errors > 0:
-            # 群锁正忙或近期上游报错/超时时，未 @ 闲聊直接跳过只记历史，绝不挤占 @ 的通道。
             return False
         if batch.at_others:
             return False
@@ -228,7 +306,7 @@ class Scheduler:
         since_reply = (cur - last_reply) if last_reply else 1e12
         since_offer = (cur - last_offer) if last_offer else 1e12
         cooldown = WINDOW_COOLDOWN if since_reply < ACTIVE_WINDOW else IDLE_COOLDOWN
-        if since_reply < cooldown and since_offer >= 300.0:
+        if since_reply < cooldown and since_offer >= OFFER_WINDOW:
             return False
         prob = self.chime_probability(batch, cur)
         if prob <= 0.0:

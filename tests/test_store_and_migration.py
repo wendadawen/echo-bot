@@ -94,6 +94,14 @@ class RepositoryTests(unittest.TestCase):
         self.assertIn("冰美式", summary)
         self.assertIn("实验室同学", summary)
 
+        # 过滤 "-" 占位词与近义重复句去重
+        self.repo.upsert_person("g1", "10001", now=220.0, traits="-", events="暂无")
+        self.repo.upsert_person("g1", "10001", now=221.0, relation="常拿猪调侃大肥鱼")
+        self.repo.upsert_person("g1", "10001", now=222.0, relation="常拿“猪”调侃大肥鱼")
+        summary2 = self.repo.person_summary("g1", "10001")
+        self.assertNotIn("：", summary2.replace("印象：", "").replace("偏好：", "").replace("关系：", ""))
+        self.assertEqual(summary2.count("调侃大肥鱼"), 1)
+
     def test_image_cache_and_conv_state(self):
         self.assertEqual(self.repo.get_image_cache("abc"), "")
         self.repo.put_image_cache("abc", "一只戴墨镜的柴犬", group_id="g1")
@@ -106,11 +114,15 @@ class RepositoryTests(unittest.TestCase):
                 "progress": ["已迁移存储"],
                 "pending": ["跑测试"],
             },
+            now=1000.0,
         )
-        state = self.repo.get_conv_state("g1")
+        state = self.repo.get_conv_state("g1", now=1100.0)
         self.assertEqual(len(state["topics"]), 5)
         self.assertEqual(state["progress"], ["已迁移存储"])
         self.assertEqual(state["pending"], ["跑测试"])
+        # 超过默认 2 小时 TTL 自动过期为空
+        expired_state = self.repo.get_conv_state("g1", now=9000.0)
+        self.assertEqual(expired_state, {"topics": [], "progress": [], "pending": []})
 
     def test_reload_safe_pending_delivery_after_close(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -174,7 +186,19 @@ class EmojiStoreTests(unittest.TestCase):
         desc, label = analyze_emoji(llm, TINY_PNG)
         self.assertEqual((desc, label), ("非表情", "非表情"))
 
+        # 缺失 "|"、句子截断前缀、低俗内容均 fail-closed 拒收
+        llm.describe_image.return_value = "这是一张卡通猫在哭的图片"
+        self.assertEqual(analyze_emoji(llm, TINY_PNG), ("非表情", "非表情"))
+
+        llm.describe_image.return_value = "这是一张表情包：|企鹅吐槽"
+        self.assertEqual(analyze_emoji(llm, TINY_PNG), ("非表情", "非表情"))
+
+        llm.describe_image.return_value = "低俗|露骨谐音图片"
+        self.assertEqual(analyze_emoji(llm, TINY_PNG), ("非表情", "非表情"))
+
     def test_collect_negative_cache_pick_and_cleanup(self):
+        import json as _json
+
         with tempfile.TemporaryDirectory() as tmp:
             store = EmojiStore(tmp, limit=10, max_age_days=30)
             llm = MagicMock()
@@ -185,11 +209,12 @@ class EmojiStoreTests(unittest.TestCase):
             self.assertEqual(store.collect("g1", TINY_PNG, llm), "")
             self.assertEqual(llm.describe_image.call_count, 1)
 
-            # 真表情被收录并按关键词命中，带防连发轮换
+            # 真表情被收录并按关键词命中，带防连发轮换；非法 QQ face_id (489) 拒绝收录
             b1 = TINY_GIF + b"1"
             b2 = TINY_GIF + b"2"
             self.assertEqual(store.collect("g1", b1, llm), "开心")
             self.assertEqual(store.collect("g1", b2, llm), "无语")
+            self.assertEqual(store.collect_face("g1", "489", "QQ表情"), "")
             store.collect_face("g1", "178", "滑稽")
 
             self.assertTrue(store.has_entries("g1"))
@@ -197,14 +222,30 @@ class EmojiStoreTests(unittest.TestCase):
             picked_happy = store.pick("g1", "开心")
             self.assertIsInstance(picked_happy, Path)
 
-            # 同关键词连挑多轮（仅一条开心时也能返回）
+            # 同关键词连挑多轮（仅一条开心时也能返回）；remove_face 可踢除失效 face_id
             self.assertEqual(store.pick("g1", "滑稽"), "face:178")
+            self.assertTrue(store.remove_face("g1", "178"))
+            self.assertFalse(any(e.get("face_id") == "178" for e in store._index["g1"]))
+            self.assertNotEqual(store.pick("g1", "滑稽"), "face:178")
+
+            # 重载 _migrate_and_dedup 自动清洗历史坏 face_id 与截断脏标签
+            dirty_file = Path(tmp) / "g1" / "dirty.png"
+            dirty_file.write_bytes(TINY_PNG)
+            raw_idx = _json.loads((Path(tmp) / "index.json").read_text(encoding="utf-8"))
+            raw_idx["g1"].extend([
+                {"face_id": "489", "tag": "QQ表情", "description": "QQ表情", "ts": time.time()},
+                {"path": str(dirty_file), "sha256": "deadbeef", "tag": "这是一张卡通猫的", "description": "猫", "ts": time.time()},
+            ])
+            (Path(tmp) / "index.json").write_text(_json.dumps(raw_idx, ensure_ascii=False), encoding="utf-8")
+            reloaded = EmojiStore(tmp, limit=10, max_age_days=30)
+            self.assertFalse(dirty_file.exists())
+            self.assertEqual([e for e in reloaded._index["g1"] if e.get("face_id") == "489"], [])
 
             # 超期文件清理
-            for entry in store._index["g1"]:
+            for entry in reloaded._index["g1"]:
                 entry["ts"] = time.time() - 40 * 86400
-            store.cleanup(max_age_days=30)
-            self.assertFalse(store.has_entries("g1"))
+            reloaded.cleanup(max_age_days=30)
+            self.assertFalse(reloaded.has_entries("g1"))
 
 
 class LegacyMigrationTests(unittest.TestCase):

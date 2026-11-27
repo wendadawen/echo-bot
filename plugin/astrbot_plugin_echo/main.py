@@ -145,7 +145,6 @@ class Echo(Star):
         self.inbound = AstrBotInboundParser(self._comp_types)
         self.limiter = MessageLimiter(per_minute=8, per_burst=3)
         self._bots: dict[str, object] = {}
-        self._last_bot_group = ""
         self.sender = AstrBotSender(
             context,
             self._comp_types,
@@ -153,9 +152,10 @@ class Echo(Star):
             emoji_root=self.emoji_store.root,
             outbox_root=outbox_dir,
             limiter=self.limiter,
-            bot_provider=lambda: self._bots.get(self._last_bot_group),
+            bot_provider=lambda gid="": self._bots.get(gid),
             repo=self.repo,
             logger=logger,
+            on_invalid_face=self.emoji_store.remove_face,
         )
 
         self._group_locks: dict[str, asyncio.Lock] = collections.defaultdict(asyncio.Lock)
@@ -255,15 +255,20 @@ class Echo(Star):
         if parsed.has_sticker:
             self._spawn_bg(self._collect_stickers(parsed.group_id, parsed.images))
 
-        # 保留新近群图供几秒内追问「这是什么」使用
-        if parsed.images:
-            self.scheduler.attach_images(parsed.group_id, list(parsed.images), now=parsed.ts)
+        # 保留新近非表情截图供后续追问使用（表情包不混入识图上下文）
+        non_stickers = [m for m in parsed.images if not m.is_sticker]
+        if non_stickers:
+            self.scheduler.attach_images(
+                parsed.group_id, non_stickers, now=parsed.ts, sender_id=parsed.user_id
+            )
 
-        # 未被 @ 的纯图片/表情只落历史，不吵群；若包含正文或被 @ 则进调度队列
+        # 未被 @ 的纯图片/表情只落历史与人类轮次轨迹，不吵群；若包含正文或被 @ 则进调度队列
         if not parsed.text and not parsed.mentioned:
+            self.scheduler.observe_human(parsed.group_id, parsed.user_id, now=parsed.ts)
             event.stop_event()
             return
         if parsed.bare_face and not parsed.mentioned and parsed.has_image:
+            self.scheduler.observe_human(parsed.group_id, parsed.user_id, now=parsed.ts)
             await asyncio.to_thread(
                 self.repo.add_message,
                 parsed.group_id,
@@ -302,7 +307,6 @@ class Echo(Star):
         async with lock:
             if batch.turn_id and batch.turn_id in self._handled_turns:
                 return
-            self.scheduler.merge_recent_images(batch, now=time.time())
             recent_errs = await asyncio.to_thread(self.repo.recent_error_count, gid, 120.0)
             if not self.scheduler.should_view(batch, time.time(), group_busy=False, recent_errors=recent_errs):
                 await asyncio.to_thread(self.agent.observe_skipped, batch)
@@ -316,7 +320,6 @@ class Echo(Star):
             actions = result.get("actions") or ()
             if not actions:
                 return
-            self._last_bot_group = gid
             for act in actions:
                 try:
                     await self.sender.send(act)
@@ -336,7 +339,6 @@ class Echo(Star):
             try:
                 if not umo:
                     continue
-                self._last_bot_group = gid
                 if row.get("text"):
                     await self.sender.send(SendText(gid, umo, row["text"]))
                 for f in files:

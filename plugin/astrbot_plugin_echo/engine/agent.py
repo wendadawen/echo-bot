@@ -5,11 +5,9 @@
 
 from __future__ import annotations
 
-import json
 import re
-import threading
 import time
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Optional
 
 from ..domain import (
     Batch,
@@ -28,10 +26,9 @@ from ..domain import (
     TaskRunner,
     ToolSpec,
     clean_display_text,
-    clip_text,
-    format_speaker_message,
 )
-from .context import BEHAVIOR_RULES, ContextAssembler, estimate_tokens, should_quote_reply
+from .context import ContextAssembler, estimate_tokens, should_quote_reply
+from .memory import MemoryConsolidator, SUMMARY_INTERVAL
 from .safety import (
     is_boilerplate,
     is_transient_memory_noise,
@@ -44,29 +41,16 @@ from .scheduler import Scheduler
 MAX_TOOL_ROUNDS = 4
 REPEAT_WINDOW = 30.0
 ATTACH_EMOJI_COOLDOWN = 90.0
-SUMMARY_INTERVAL = 600.0
 HELP_TEXT = "群聊里直接 @大肥鱼 即可对话、看图、写代码/生成文件；也可以随时问我后台任务进度或让我停掉它。"
 
-_PROMISE_LOOKUP_HINTS = (
-    "我查一下", "我去查", "我去搜", "我这就查", "我现在去查",
-    "马上核实", "我去核实", "我来查一下", "帮你查一下", "查一下近期",
-)
 _OFFER_HINTS = (
     "你要的话", "要不要", "需要的话", "发我", "告诉我",
     "帮你查", "帮你排", "想吃什么", "哪个", "哪种", "什么方向",
 )
-
-_MEMORY_SUMMARIZE_PROMPT = (
-    "把下面这段群聊提炼成值得长期记住的事实记忆与滚动话题状态，只输出一行 JSON，不要解释：\n"
-    '{"episode":"一句话概括这段在聊什么结论（无长期价值可留空）",'
-    '"persons":[{"name":"具体群友昵称","category":"traits|preferences|events|relation","content":"稳定特征/偏好/事件"}],'
-    '"points":[{"category":"event|preference|jargon|relation","content":"一条可复用事实；群内黑话用 jargon 且写成 词=解释"}],'
-    '"state":{"topics":["当前活跃话题(<=3个)"],"progress":["已确认或解决的事项"],"pending":["待办或未完事项"]}}\n'
-    "铁律：\n"
-    "1. `[昵称：...]` 只是群名片或昵称，绝不是发言内容；禁止从昵称里编造事实，不要用“用户/群友”当人物 name。\n"
-    "2. 禁止记录超时报错、没收到图、无法联网、连续道歉或临时问路天气等一次性噪音。\n"
-    '3. 若无值得记住的内容就输出 {"episode":"","points":[],"persons":[],"state":{"topics":[],"progress":[],"pending":[]}}。'
-)
+_VAGUE_TASK_PROMPTS = frozenset({
+    "查一下", "去查一下", "查一查", "帮我查", "帮我查一下",
+    "搜一下", "去搜一下", "搜一搜", "看看", "去看看", "查查看", "查",
+})
 
 
 def _is_open_offer(text: str) -> bool:
@@ -113,14 +97,9 @@ def _format_model_error_notice(exc: Exception) -> str:
     return "刚才我这边卡壳了一下，稍后再喊我试试。"
 
 
-def _parse_jargon(content: str) -> Optional[tuple[str, str]]:
-    raw = str(content or "").strip()
-    for sep in ("=", "：", ":"):
-        if sep in raw:
-            w, a = (p.strip() for p in raw.split(sep, 1))
-            if 1 <= len(w) <= 8 and a and w != a and len(a) <= 30 and "询问" not in w:
-                return w, a
-    return None
+def _is_vague_task_prompt(task_prompt: str) -> bool:
+    clean = re.sub(r"[\s，,。.！!？?～~、…]+", "", str(task_prompt or ""))
+    return not clean or clean in _VAGUE_TASK_PROMPTS or len(clean) < 6
 
 
 class EchoAgent:
@@ -150,13 +129,10 @@ class EchoAgent:
             history_limit=history_limit,
             **({"persona": persona} if persona else {}),
         )
+        self.memory = MemoryConsolidator(repo, llm)
         self._repeat_seen: dict[tuple[str, str, str], float] = {}
         self._last_bot_reply: dict[str, tuple[tuple[Any, ...], float]] = {}
         self._last_emoji_at: dict[str, float] = {}
-        self._summary_lock = threading.Lock()
-        self._summary_threads_lock = threading.Lock()
-        self._summary_threads: set[threading.Thread] = set()
-        self._last_summary_attempt: dict[str, float] = {}
 
     def _secrets(self) -> tuple[str, ...]:
         out = list(self._llm.extra_secrets() or ())
@@ -276,7 +252,10 @@ class EchoAgent:
                     parameters={
                         "type": "object",
                         "properties": {
-                            "task": {"type": "string", "description": "完整具体的任务描述"},
+                            "task": {
+                                "type": "string",
+                                "description": "必须结合上下文写成独立完整的任务目标（含具体对象/关键词，禁止仅写'去查一下'等模糊词）",
+                            },
                             "ack_text": {"type": "string", "description": "可选：启动前先对群友说的简短口语（<=40字）"},
                         },
                         "required": ["task"],
@@ -326,14 +305,21 @@ class EchoAgent:
             images=non_sticker_imgs,
             pre_history=tuple(pre_history[-6:]),
         )
-        res = self._tasks.submit(req, ack_text=ack_text)
+        clean_ack = clean_display_text(scrub_internal_leaks(ack_text, extra_secrets=self._secrets())) if ack_text else ""
+        res = self._tasks.submit(req, ack_text=clean_ack)
         if not res:
             return []
-        notice = str(res.get("notice") or "").strip()
+        notice = clean_display_text(str(res.get("notice") or "").strip())
         if not notice:
             return []
-        self._repo.add_message(gid, "bot", "大肥鱼", "bot", notice)
-        self._scheduler.record_bot_reply(gid, now=time.time())
+        anchor = batch.anchor
+        self._repo.add_message(gid, "bot", "大肥鱼", "bot", notice, meta="tools=run_task")
+        self._scheduler.record_bot_reply(
+            gid,
+            user_id=anchor.user_id if anchor else "",
+            from_mentioned=bool(batch.mentioned and not batch.retold),
+            now=time.time(),
+        )
         return [SendText(gid, umo, notice)]
 
     def _resolve_quote_mid(self, gid: str, scene: str, anchor: Any) -> str:
@@ -390,6 +376,9 @@ class EchoAgent:
                 cutoff = now - REPEAT_WINDOW
                 self._repeat_seen = {k: v for k, v in self._repeat_seen.items() if v >= cutoff}
 
+        # 4) 仅在正式进入模型决策时非破坏性绑定近期群图（绝不让被跳过的批消费未看图）
+        self._scheduler.merge_recent_images(batch, now=now)
+
         running_task = self._tasks.running_for_group(gid) if self._tasks is not None else None
         allow_task = bool(
             self._tasks is not None
@@ -436,6 +425,7 @@ class EchoAgent:
         total_tokens = 0
         tools_used: list[str] = []
         saw_images = bool(inline_imgs)
+        marked_viewed = False
         reply_text = ""
         attach_mood = ""
         terminal_actions: Optional[list[OutboundAction]] = None
@@ -449,6 +439,9 @@ class EchoAgent:
             try:
                 turn = self._llm.chat(llm_messages, tools=tool_specs)
                 total_tokens += int(turn.usage_tokens or 0)
+                if not marked_viewed and batch.images:
+                    self._scheduler.mark_images_viewed(gid, batch.images, now=now)
+                    marked_viewed = True
             except Exception as exc:
                 elapsed = time.monotonic() - started
                 self._repo.record_event(gid, "model_error", ok=False, latency=elapsed, detail=str(exc))
@@ -524,7 +517,13 @@ class EchoAgent:
                         return {"replied": False, "actions": [], "reason": "silent"}
                     elapsed = time.monotonic() - started
                     self._repo.record_event(gid, "send_face", ok=True, latency=elapsed, tokens=total_tokens, detail=mood)
-                    self._scheduler.record_bot_reply(gid, user_id=anchor.user_id if anchor else "", now=time.time())
+                    self._repo.add_message(gid, "bot", "大肥鱼", "bot", "[发了一张表情包]", meta="tools=send_emoji")
+                    self._scheduler.record_bot_reply(
+                        gid,
+                        user_id=anchor.user_id if anchor else "",
+                        from_mentioned=bool(batch.mentioned and not batch.retold),
+                        now=time.time(),
+                    )
                     if str(picked).startswith("face:"):
                         terminal_actions = [SendFace(gid, umo, str(picked).split(":", 1)[1])]
                     else:
@@ -540,7 +539,15 @@ class EchoAgent:
                             content="没有明确 @ 或点名你，禁止启动后台工具！请调用 stay_silent 或直接简要回复。",
                         ))
                         continue
-                    t_prompt = str(args.get("task") or "").strip() or batch.body_text
+                    t_prompt = str(args.get("task") or "").strip()
+                    if _is_vague_task_prompt(t_prompt):
+                        llm_messages.append(LLMMessage(
+                            role="tool",
+                            tool_call_id=tc.id,
+                            name=name,
+                            content="task 描述缺少具体对象。请结合上文把要查的具体主题/关键词写清楚，再调 web_search 或 run_task；若上文也没写明，直接问群友要查什么。",
+                        ))
+                        continue
                     ack = str(args.get("ack_text") or "").strip()
                     dispatched = self._dispatch_background(batch, t_prompt, prev_history, ack_text=ack)
                     if dispatched:
@@ -632,18 +639,6 @@ class EchoAgent:
             self._repo.record_event(gid, "silent", ok=True, latency=elapsed, tokens=total_tokens)
             return {"replied": False, "actions": [], "reason": "silent"}
 
-        # 若明确被 @ 且无进行中任务，但模型口头承诺“我去查”却忘了调 run_task，自动替它真正发起一次
-        if (
-            allow_task
-            and running_task is None
-            and not is_unsupported_capability(batch.body_text)
-            and any(h in reply_text for h in _PROMISE_LOOKUP_HINTS)
-        ):
-            dispatched = self._dispatch_background(batch, batch.body_text, prev_history, ack_text=reply_text[:40])
-            if dispatched:
-                self._repo.record_event(gid, "task", ok=True, latency=elapsed, tokens=total_tokens)
-                return {"replied": True, "actions": dispatched, "reason": "task"}
-
         if is_boilerplate(reply_text):
             self._repo.record_event(gid, "filtered", ok=False, latency=elapsed)
             return {"replied": False, "actions": [], "reason": "filtered"}
@@ -665,6 +660,20 @@ class EchoAgent:
         # 智能 QQ 引用判断（处理模型思考期间是否有人插话）
         quote_mid = self._resolve_quote_mid(gid, batch.scene, anchor)
 
+        now_done = time.time()
+        extra_actions: list[OutboundAction] = []
+        if attach_mood and has_emoji and self._emoji is not None:
+            if now_done - self._last_emoji_at.get(gid, 0.0) >= ATTACH_EMOJI_COOLDOWN:
+                picked = self._emoji.pick(gid, attach_mood)
+                if picked is not None:
+                    self._last_emoji_at[gid] = now_done
+                    _record_tool("send_emoji")
+                    self._repo.record_event(gid, "send_face", ok=True, latency=0.0, detail="attach:" + attach_mood)
+                    if str(picked).startswith("face:"):
+                        extra_actions.append(SendFace(gid, umo, str(picked).split(":", 1)[1]))
+                    else:
+                        extra_actions.append(SendEmoji(gid, umo, str(picked)))
+
         prov: list[str] = []
         if saw_images:
             prov.append("seen_image")
@@ -673,11 +682,11 @@ class EchoAgent:
         meta_str = ";".join(prov)
 
         self._repo.add_message(gid, "bot", "大肥鱼", "bot", cleaned, meta=meta_str)
-        now_done = time.time()
         self._scheduler.record_bot_reply(
             gid,
             user_id=anchor.user_id if anchor else "",
             offered=_is_open_offer(cleaned),
+            from_mentioned=bool(batch.mentioned and not batch.retold),
             now=now_done,
         )
         self._maybe_summarize(gid)
@@ -685,149 +694,15 @@ class EchoAgent:
         tokens = total_tokens or (estimate_tokens(system) + estimate_tokens(batch_prompt) + estimate_tokens(cleaned))
         self._repo.record_event(gid, "reply", ok=True, latency=elapsed, tokens=tokens, detail=meta_str)
 
-        actions: list[OutboundAction] = [SendText(gid, umo, cleaned, reply_to_msg_id=quote_mid)]
-        if attach_mood and has_emoji and self._emoji is not None:
-            if now_done - self._last_emoji_at.get(gid, 0.0) >= ATTACH_EMOJI_COOLDOWN:
-                picked = self._emoji.pick(gid, attach_mood)
-                if picked is not None:
-                    self._last_emoji_at[gid] = now_done
-                    self._repo.record_event(gid, "send_face", ok=True, latency=0.0, detail="attach:" + attach_mood)
-                    if str(picked).startswith("face:"):
-                        actions.append(SendFace(gid, umo, str(picked).split(":", 1)[1]))
-                    else:
-                        actions.append(SendEmoji(gid, umo, str(picked)))
-
+        actions: list[OutboundAction] = [SendText(gid, umo, cleaned, reply_to_msg_id=quote_mid), *extra_actions]
         return {"replied": True, "actions": actions, "reason": "reply", "text": cleaned}
 
-    # ---- 后台异步群记忆归纳 + 滚动状态更新 ----
+    # ---- 后台异步群记忆归纳 + 滚动状态更新（委托给 MemoryConsolidator） ----
     def wait_background(self, timeout: float = 2.0) -> None:
-        deadline = time.monotonic() + max(0.0, float(timeout or 0.0))
-        with self._summary_threads_lock:
-            threads = [t for t in self._summary_threads if t.is_alive()]
-        for th in threads:
-            rem = max(0.0, deadline - time.monotonic())
-            th.join(timeout=rem)
-
-    def _collect_summary_transcript(self, group_id: str) -> tuple[str, float]:
-        last_ep = self._repo.last_episode_at(group_id)
-        rows = self._repo.messages_since(group_id, ts=last_ep, limit=24)
-        if not rows or not any(r.get("role") == "user" for r in rows):
-            return "", 0.0
-        lines: list[str] = []
-        chars = 0
-        max_ts = 0.0
-        for r in rows:
-            body = clip_text(re.sub(r"\s+", " ", str(r.get("text") or "").strip()), 160)
-            if not body:
-                continue
-            rts = float(r.get("ts") or 0.0)
-            max_ts = max(max_ts, rts)
-            line = (
-                ("大肥鱼：" + body)
-                if r.get("role") in ("bot", "assistant")
-                else format_speaker_message(r.get("user_name") or "群友", body)
-            )
-            if chars + len(line) > 2400 and lines:
-                break
-            lines.append(line)
-            chars += len(line) + 1
-        return "\n".join(lines), max_ts
+        self.memory.wait_background(timeout=timeout)
 
     def _maybe_summarize(self, group_id: str) -> None:
-        now = time.time()
-        last = max(self._repo.last_episode_at(group_id), self._last_summary_attempt.get(group_id, 0.0))
-        if last and now - last < SUMMARY_INTERVAL:
-            return
-        transcript, max_ts = self._collect_summary_transcript(group_id)
-        if not transcript:
-            return
-        if not self._summary_lock.acquire(blocking=False):
-            return
-        self._last_summary_attempt[group_id] = now
-
-        def _work() -> None:
-            th = threading.current_thread()
-            try:
-                self._summarize_sync(group_id, transcript, episode_ts=max_ts or None)
-            finally:
-                with self._summary_threads_lock:
-                    self._summary_threads.discard(th)
-                self._summary_lock.release()
-
-        th = threading.Thread(target=_work, name="echo-summary", daemon=True)
-        with self._summary_threads_lock:
-            self._summary_threads = {t for t in self._summary_threads if t.is_alive()}
-            self._summary_threads.add(th)
-        try:
-            th.start()
-        except Exception:
-            with self._summary_threads_lock:
-                self._summary_threads.discard(th)
-            self._summary_lock.release()
+        self.memory.maybe_summarize(group_id, llm=self._llm)
 
     def _summarize_sync(self, group_id: str, transcript: str, episode_ts: Optional[float] = None) -> None:
-        try:
-            turn = self._llm.chat(
-                [
-                    LLMMessage(role="system", content="你是冷静精准的群聊记忆整理员。"),
-                    LLMMessage(role="user", content=_MEMORY_SUMMARIZE_PROMPT + "\n\n" + transcript),
-                ],
-                tools=(),
-            )
-        except Exception:
-            return
-        raw = re.sub(r"```(?:json)?", "", str(turn.text or "").strip()).strip()
-        m = re.search(r"\{.*\}", raw, re.S)
-        if not m:
-            return
-        try:
-            data = json.loads(m.group(0))
-        except (ValueError, TypeError):
-            return
-        if not isinstance(data, dict):
-            return
-
-        ep = str(data.get("episode") or "").strip()[:120]
-        if ep and not is_transient_memory_noise(ep) and not is_unsafe(ep):
-            self._repo.add_episode(group_id, ep, now=episode_ts, source="chat")
-
-        for item in (data.get("points") or [])[:4]:
-            if not isinstance(item, dict):
-                continue
-            cat = str(item.get("category") or "event").strip()[:20]
-            content = str(item.get("content") or "").strip()[:80]
-            if not content or is_transient_memory_noise(content) or is_unsafe(content):
-                continue
-            if cat == "jargon":
-                parsed_j = _parse_jargon(content)
-                if parsed_j:
-                    self._repo.add_memory(group_id, "jargon", "{}={}".format(*parsed_j))
-            else:
-                self._repo.add_memory(group_id, cat, content)
-
-        generic_names = {"用户", "群友", "发言者", "对方", "我", "你", "大肥鱼", "回声"}
-        for p in (data.get("persons") or [])[:3]:
-            if not isinstance(p, dict):
-                continue
-            pname = str(p.get("name") or "").strip()
-            pcontent = str(p.get("content") or "").strip()
-            if not pname or pname in generic_names or not pcontent or is_transient_memory_noise(pcontent):
-                continue
-            uid = self._repo.resolve_person(group_id, pname)
-            if not uid:
-                continue
-            field = {
-                "person": "traits",
-                "traits": "traits",
-                "preference": "preferences",
-                "preferences": "preferences",
-                "event": "events",
-                "events": "events",
-                "relation": "relation",
-                "relationship": "relation",
-            }.get(str(p.get("category") or "traits").lower(), "traits")
-            self._repo.upsert_person(group_id, uid, **{field: pcontent})
-
-        state = data.get("state")
-        if isinstance(state, dict):
-            self._repo.save_conv_state(group_id, state)
+        self.memory.summarize_sync(group_id, transcript, episode_ts=episode_ts, llm=self._llm)

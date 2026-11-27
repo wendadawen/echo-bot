@@ -260,7 +260,9 @@ def looks_like_forward(comp: Any) -> bool:
     return False
 
 
-def unpack_forward(comp: Any) -> str:
+def unpack_forward(comp: Any, _depth: int = 0) -> str:
+    if _depth > 2:
+        return ""
     name = type(comp).__name__.lower()
     dict_kind = str(comp.get("type") or "").lower() if isinstance(comp, dict) else ""
     if name == "node" or dict_kind == "node":
@@ -277,11 +279,31 @@ def unpack_forward(comp: Any) -> str:
     def seg_text(p: Any) -> str:
         if isinstance(p, str):
             return p
-        if isinstance(p, dict) and isinstance(p.get("data"), dict):
-            t = _get_attr_or_key(p["data"], "text", "content", default="")
-            if t:
-                return str(t)
-        return str(_get_attr_or_key(p, "text", "content", default="") or "")
+        if isinstance(p, (list, tuple)):
+            return "".join(seg_text(x) for x in p)
+        if isinstance(p, dict):
+            p_type = str(p.get("type") or "").lower()
+            pdata = p.get("data") if isinstance(p.get("data"), dict) else p
+            if p_type in ("forward", "node", "nodes"):
+                nested = unpack_forward(p, _depth=_depth + 1)
+                return (" " + nested + " ") if nested else ""
+            if p_type == "image":
+                return "[图片]"
+            if p_type == "face":
+                fid = str(pdata.get("id") or "").strip()
+                fn = FACE_LABELS.get(fid, "")
+                return "[QQ表情:{}]".format(fn or fid or "表情")
+            t = _get_attr_or_key(pdata, "text", "content", default="")
+            if isinstance(t, (list, tuple, dict)):
+                return seg_text(t)
+            return str(t or "")
+        if looks_like_forward(p):
+            nested = unpack_forward(p, _depth=_depth + 1)
+            return (" " + nested + " ") if nested else ""
+        t = _get_attr_or_key(p, "text", "content", default="")
+        if isinstance(t, (list, tuple, dict)):
+            return seg_text(t)
+        return str(t or "")
 
     lines = []
     for node in list(content)[:MAX_FORWARD_ITEMS]:
@@ -293,9 +315,9 @@ def unpack_forward(comp: Any) -> str:
         body = _get_attr_or_key(node, "content", "message", "text", default="")
         if isinstance(body, (list, tuple)):
             body = "".join(seg_text(x) for x in body)
-        elif isinstance(body, dict):
+        elif isinstance(body, dict) or looks_like_forward(body):
             body = seg_text(body)
-        txt = str(body or "").strip().replace("\n", " ")
+        txt = re.sub(r"\s+", " ", str(body or "")).strip()
         if txt:
             lines.append(format_speaker_message(sender or "群友", txt[:80]))
     if not lines:
@@ -303,7 +325,7 @@ def unpack_forward(comp: Any) -> str:
     joined = "；".join(lines)
     if len(joined) > MAX_FORWARD_CHARS:
         joined = joined[:MAX_FORWARD_CHARS] + "…"
-    return "（转发的聊天）" + joined
+    return joined if _depth > 0 else ("（转发的聊天）" + joined)
 
 
 class MessageLimiter:
@@ -651,9 +673,10 @@ class AstrBotSender:
         emoji_root: Path | str = "",
         outbox_root: Path | str = "",
         limiter: Optional[MessageLimiter] = None,
-        bot_provider: Optional[Callable[[], Any]] = None,
+        bot_provider: Optional[Callable[..., Any]] = None,
         repo: Any = None,
         logger: Any = None,
+        on_invalid_face: Optional[Callable[[str, str], Any]] = None,
     ):
         self._ctx = context
         self._comp = comp_types
@@ -664,6 +687,7 @@ class AstrBotSender:
         self._bot_provider = bot_provider
         self._repo = repo
         self._logger = logger
+        self._on_invalid_face = on_invalid_face
 
     async def send(self, action: OutboundAction) -> bool:
         if not action.umo:
@@ -704,11 +728,24 @@ class AstrBotSender:
     async def _send_face(self, action: SendFace) -> bool:
         if not action.face_id or not self._limiter.allow(action.group_id):
             return False
+        fid = str(action.face_id).strip()
         try:
-            face = self._comp["Face"](id=int(action.face_id))
+            face = self._comp["Face"](id=int(fid))
         except (TypeError, ValueError):
+            if callable(self._on_invalid_face):
+                self._on_invalid_face(action.group_id, fid)
             return False
-        await self._ctx.send_message(action.umo, self._Chain([face]))
+        try:
+            await self._ctx.send_message(action.umo, self._Chain([face]))
+        except Exception as exc:
+            if self._logger:
+                self._logger.warning("QQ表情发送失败（face_id=%s，将自动移除）：%s", fid, exc)
+            if callable(self._on_invalid_face):
+                try:
+                    self._on_invalid_face(action.group_id, fid)
+                except Exception:
+                    pass
+            return False
         self._limiter.record(action.group_id)
         return True
 
@@ -773,7 +810,12 @@ class AstrBotSender:
     async def _react(self, action: ReactEmoji) -> bool:
         if not action.msg_id:
             return False
-        bot = self._bot_provider() if callable(self._bot_provider) else None
+        bot = None
+        if callable(self._bot_provider):
+            try:
+                bot = self._bot_provider(action.group_id)
+            except TypeError:
+                bot = self._bot_provider()
         if not bot or not hasattr(bot, "call_action"):
             return False
         try:

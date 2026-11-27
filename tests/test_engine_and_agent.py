@@ -90,9 +90,12 @@ class SafetyTests(unittest.TestCase):
         self.assertTrue(is_unsupported_capability("帮我画一张大肥鱼自画像"))
 
         scrubbed = scrub_internal_leaks(
-            "看这里 /AstrBot/data/x 和 http://127.0.0.1:8787 及 ws://10.0.0.1:3001 @小明(123456) 密钥 sk-live-secret-9999",
+            "[10:42 · 刚刚] [#m3] [系统注：本条回复时已看图] 看这里 /AstrBot/data/x 和 http://127.0.0.1:8787 及 ws://10.0.0.1:3001 @小明(123456) 密钥 sk-live-secret-9999",
             extra_secrets=("sk-live-secret-9999",),
         )
+        self.assertFalse(scrubbed.startswith("[10:42"))
+        self.assertNotIn("[#m3]", scrubbed)
+        self.assertNotIn("[系统注", scrubbed)
         self.assertNotIn("/AstrBot", scrubbed)
         self.assertNotIn("127.0.0.1", scrubbed)
         self.assertNotIn("ws://", scrubbed)
@@ -105,7 +108,7 @@ class SafetyTests(unittest.TestCase):
 
 class SchedulerTests(unittest.TestCase):
     def test_mention_fast_lane_priority_and_policy_3a(self):
-        sch = Scheduler(ambient_rate=0.08, mention_cap=1.2)
+        sch = Scheduler(ambient_rate=0.05, mention_cap=1.2)
         ev_plain = ChatEvent(group_id="g_plain", user_id="u1", user_name="甲", text="午饭吃啥", ts=100.0)
         ev_at = ChatEvent(group_id="g_at", user_id="u2", user_name="乙", text="@大肥鱼 在吗", ts=101.0, mentioned=True)
         sch.enqueue(ev_plain)
@@ -114,20 +117,28 @@ class SchedulerTests(unittest.TestCase):
         due = sch.due(now=120.0)
         self.assertEqual([b.group_id for b in due], ["g_at", "g_plain"])
 
-        # 政策 3A 概率
+        # 政策 3A 概率 & 多人轮次抑制
         b_other = Batch("g1", [ChatEvent("g1", "u1", "甲", "问你呢", ts=200.0, at_others=True)])
         self.assertEqual(sch.chime_probability(b_other, now=200.0), 0.0)
 
         b_ambient = Batch("g1", [ChatEvent("g1", "u1", "甲", "今天好热啊", ts=200.0)])
-        self.assertEqual(sch.chime_probability(b_ambient, now=200.0), 0.08)
+        self.assertEqual(sch.chime_probability(b_ambient, now=200.0), 0.05)
 
-        sch.record_bot_reply("g1", user_id="u1", offered=False, now=180.0)
+        sch.record_bot_reply("g1", user_id="u1", offered=False, from_mentioned=True, now=180.0)
         b_follow = Batch("g1", [ChatEvent("g1", "u1", "甲", "那你觉得呢", ts=210.0)])
-        self.assertEqual(sch.chime_probability(b_follow, now=210.0), 0.65)
+        self.assertEqual(sch.chime_probability(b_follow, now=210.0), 0.45)
 
-        sch.record_bot_reply("g1", user_id="u1", offered=True, now=215.0)
+        # 中途被其他群友插话后，同人追问自动退避为低概率环境值，不再连续抢话
+        sch.observe_human("g1", "u2", now=211.0)
+        self.assertLessEqual(sch.chime_probability(b_follow, now=212.0), 0.05)
+
+        sch.record_bot_reply("g1", user_id="u1", offered=True, from_mentioned=True, now=215.0)
         b_offer = Batch("g1", [ChatEvent("g1", "u2", "乙", "查吧", ts=220.0)])
-        self.assertEqual(sch.chime_probability(b_offer, now=220.0), 0.85)
+        self.assertEqual(sch.chime_probability(b_offer, now=220.0), 0.75)
+
+        # 未 @ 主动插话一次后，90 秒内不再二次连续插嘴
+        sch.record_bot_reply("g1", user_id="u1", offered=False, from_mentioned=False, now=230.0)
+        self.assertEqual(sch.chime_probability(b_follow, now=250.0), 0.0)
 
         # 忙群 & 错误退避：拦截未 @，永不拦截 @
         self.assertFalse(sch.should_view(b_ambient, now=300.0, group_busy=True, recent_errors=0))
@@ -135,26 +146,33 @@ class SchedulerTests(unittest.TestCase):
         b_mentioned = Batch("g1", [ev_at])
         self.assertTrue(sch.should_view(b_mentioned, now=300.0, group_busy=True, recent_errors=3))
 
-        # 最近未 @ 图片自动合入追问 @ 批
+        # 非破坏性媒体窗口：未被模型消费的图片不会被无关跳过销毁
         m = MediaRef(data=TINY_PNG, sha256="hash1")
-        sch.attach_images("g1", [m], now=500.0)
-        followup = Batch("g1", [ChatEvent("g1", "u1", "甲", "这是啥", ts=510.0, mentioned=True)])
+        sch.attach_images("g1", [m], now=500.0, sender_id="u1")
+        followup = Batch("g1", [ChatEvent("g1", "u1", "甲", "ai感是不是太重了", ts=510.0, mentioned=True)])
         sch.merge_recent_images(followup, now=515.0)
         self.assertEqual(len(followup.images), 1)
         self.assertEqual(followup.images[0].sha256, "hash1")
 
-        # 60 秒内提到“人物/截图”的追问会复用上一轮看过的图；无关闲聊或超过 60 秒不会复用
+        # 若这一轮尚未标记 viewed（例如 model_error），下一轮仍能拿到这张未看原图
+        second_try = Batch("g1", [ChatEvent("g1", "u1", "甲", "你咋没法识图啊", ts=520.0, mentioned=True)])
+        sch.merge_recent_images(second_try, now=522.0)
+        self.assertEqual(len(second_try.images), 1)
+
+        # 若同发图人在未消费的情况下继续发问，依旧可见；但“晚饭吃啥”等无关消息不误命中识图关键词
+        self.assertEqual(len(second_try.images), 1)
+        sch.mark_images_viewed("g1", second_try.images, now=523.0)
         ref_follow = Batch("g1", [ChatEvent("g1", "u2", "乙", "夸夸这个人物", ts=530.0, mentioned=True)])
         sch.merge_recent_images(ref_follow, now=535.0)
         self.assertEqual(len(ref_follow.images), 1)
         self.assertEqual(ref_follow.images[0].sha256, "hash1")
 
-        unrelated = Batch("g1", [ChatEvent("g1", "u2", "乙", "晚饭吃啥", ts=540.0, mentioned=True)])
+        unrelated = Batch("g1", [ChatEvent("g1", "u1", "甲", "晚饭吃啥", ts=540.0, mentioned=True)])
         sch.merge_recent_images(unrelated, now=540.0)
         self.assertEqual(unrelated.images, [])
 
-        expired = Batch("g1", [ChatEvent("g1", "u2", "乙", "夸夸这个人物", ts=600.0, mentioned=True)])
-        sch.merge_recent_images(expired, now=600.0)
+        expired = Batch("g1", [ChatEvent("g1", "u2", "乙", "夸夸这个人物", ts=720.0, mentioned=True)])
+        sch.merge_recent_images(expired, now=720.0)
         self.assertEqual(expired.images, [])
 
 
@@ -167,7 +185,7 @@ class ContextTests(unittest.TestCase):
         repo.upsert_person("g1", "102", now=100.0, events="在苏州做超导")
         repo.add_memory("g1", "event", "周末去苏州实验室团建", now=100.0)
         repo.add_memory("g1", "jargon", "dd=顶顶", now=100.0)
-        repo.save_conv_state("g1", {"topics": ["团建安排"], "progress": [], "pending": ["订票"]})
+        repo.save_conv_state("g1", {"topics": ["团建安排"], "progress": [], "pending": ["订票"]}, now=100.0)
         repo.put_image_cache("img_sha", "实验仪器照片", group_id="g1")
 
         ctx = ContextAssembler(repo, history_limit=10)
@@ -215,25 +233,31 @@ class ContextTests(unittest.TestCase):
         ]
         self.assertEqual(should_quote_reply("m_a", "101", intervened), "m_a")
 
-        # format_provenance_note 与历史溯源标注只附在 bot 轮次上
-        self.assertEqual(format_provenance_note("seen_image"), "[系统注：本条回复时你已实际查看当轮原图]")
-        self.assertEqual(format_provenance_note("tools=web_search"), "[系统注：本条回复基于当时 web_search 实查结果]")
+        # format_provenance_note 与严格通道分离：assistant 历史纯净无时间戳/系统注，动作账本统一放进 <background_data>
+        self.assertEqual(format_provenance_note("seen_image"), "已实际查看当轮原图")
+        self.assertEqual(format_provenance_note("tools=web_search"), "调用 web_search 实查")
         self.assertIn(
-            "实际查看当轮原图并调用过 web_search 实查",
+            "已实际查看当轮原图，调用 web_search 实查",
             format_provenance_note("seen_image;tools=web_search"),
         )
-        _, bot_line = ContextAssembler.format_history_row(
+        bot_role, bot_line = ContextAssembler.format_history_row(
             {"role": "bot", "text": "截图里是娄文启", "meta": "seen_image", "ts": 190.0},
             {},
             200.0,
         )
-        self.assertIn("[系统注：本条回复时你已实际查看当轮原图]", bot_line)
+        self.assertEqual(bot_role, "assistant")
+        self.assertEqual(bot_line, "截图里是娄文启")
+        self.assertNotIn("[系统注：", bot_line)
         _, user_line = ContextAssembler.format_history_row(
             {"role": "user", "user_name": "小明", "text": "真的吗", "meta": "seen_image", "ts": 195.0},
             {},
             200.0,
         )
         self.assertNotIn("[系统注：", user_line)
+
+        # 超过 2 小时未更新的 conv_state 自动过期，不继续注入过期话题
+        stale_sys, _, _, _ = ctx.build(batch, history, now=10_000.0)
+        self.assertNotIn("滚动状态：", stale_sys)
         repo.close()
 
 
@@ -405,24 +429,121 @@ class EchoAgentTests(unittest.TestCase):
         stats_row = repo._db.execute("SELECT detail FROM monitor_events WHERE kind='reply' ORDER BY id DESC LIMIT 1").fetchone()
         self.assertEqual(stats_row["detail"], "seen_image")
 
-        # Turn 2: 无图追问并触发 web_search -> 历史里带入系统溯源注记，且二次持久化带 tools=web_search
+        # Turn 2: 无图追问并触发 web_search -> 动作账本进入 <background_data>，assistant 行本身干净
         b2 = Batch(
             "g1",
             [ChatEvent("g1", "u1", "神之殒", "@大肥鱼 查查娄文启并夸他", msg_id="m_q2", ts=110.0, mentioned=True)],
         )
         r2 = agent.handle_batch(b2)
         self.assertEqual(r2["reason"], "reply")
-        turn2_history_texts = [str(m.content) for m in llm.recorded_calls[1]["messages"]]
-        self.assertTrue(
-            any("[系统注：本条回复时你已实际查看当轮原图]" in txt for txt in turn2_history_texts),
-            turn2_history_texts,
-        )
+        turn2_msgs = llm.recorded_calls[1]["messages"]
+        self.assertIn("已实际查看当轮原图", str(turn2_msgs[0].content))
+        assistant_msgs = [m for m in turn2_msgs if m.role == "assistant"]
+        self.assertTrue(assistant_msgs)
+        self.assertEqual(assistant_msgs[-1].content, "截图写的是娄文启，中国科大软件学院相关负责人。")
         recent_after_2 = repo.recent_messages("g1", limit=5)
         self.assertEqual(recent_after_2[-1]["meta"], "tools=web_search")
         stats_row2 = repo._db.execute("SELECT detail FROM monitor_events WHERE kind='reply' ORDER BY id DESC LIMIT 1").fetchone()
         self.assertEqual(stats_row2["detail"], "tools=web_search")
         agent.wait_background(2.0)
         repo.close()
+
+    def test_no_promise_hijack_vague_run_task_rejected_emoji_provenance_and_memory_gates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repository(":memory:")
+            sch = Scheduler()
+            emoji = EmojiStore(tmp)
+            emoji.collect_face("g1", "178", "滑稽")
+            search = MagicMock()
+            search.available.return_value = True
+            search.search.return_value = [SearchHit("Opus 4.6", "发布于 2026-02-05", "https://example.com")]
+            task_mgr = MagicMock()
+            task_mgr.available.return_value = True
+            task_mgr.running_for_group.return_value = None
+            task_mgr.submit.return_value = {"accepted": True, "notice": "〔系统｜已启动后台工具〕"}
+
+            # 1) web_search 查完后文本含“帮你查一下”绝不误劫持成 run_task
+            llm = _SeqLLM(
+                [
+                    ModelTurn(tool_calls=(ToolCall("w1", "web_search", {"query": "Opus 4.6"}),)),
+                    ModelTurn(text="查到了：我来查一下细节，Opus 4.6 是 2026 年 2 月 5 日发布的。"),
+                ],
+                ignore_summary=True,
+            )
+            agent = EchoAgent(repo, llm, sch, emoji_store=emoji, task_runner=task_mgr, search_provider=search)
+            r_ws = agent.handle_batch(
+                Batch("g1", [ChatEvent("g1", "u1", "和", "@大肥鱼 去查一下", msg_id="m_ws", ts=100.0, mentioned=True)])
+            )
+            self.assertEqual(r_ws["reason"], "reply")
+            task_mgr.submit.assert_not_called()
+            self.assertEqual(repo.recent_messages("g1", limit=1)[-1]["meta"], "tools=web_search")
+
+            # 2) run_task 若传模糊词“去查一下”，由工具回路退回让模型纠正，绝不盲跑后台任务
+            llm_vague = _SeqLLM(
+                [
+                    ModelTurn(tool_calls=(ToolCall("t1", "run_task", {"task": "去查一下"}),)),
+                    ModelTurn(text="你要我查哪个模型或新闻呀？说个名字我去搜。"),
+                ],
+                ignore_summary=True,
+            )
+            agent._llm = llm_vague
+            r_vague = agent.handle_batch(
+                Batch("g1", [ChatEvent("g1", "u1", "和", "@大肥鱼 去查", msg_id="m_vg", ts=105.0, mentioned=True)])
+            )
+            self.assertEqual(r_vague["reason"], "reply")
+            task_mgr.submit.assert_not_called()
+
+            # 3) send_emoji 纯发与配字均写 tools=send_emoji 溯源
+            llm_em = _SeqLLM(
+                [
+                    ModelTurn(tool_calls=(ToolCall("e1", "send_emoji", {"mood": "滑稽"}),)),
+                    ModelTurn(tool_calls=(ToolCall("e2", "send_emoji", {"mood": "滑稽", "reply_text": "给你配一张"}),)),
+                ],
+                ignore_summary=True,
+            )
+            agent._llm = llm_em
+            r_em1 = agent.handle_batch(
+                Batch("g1", [ChatEvent("g1", "u1", "和", "@大肥鱼 发表情", msg_id="m_em1", ts=110.0, mentioned=True)])
+            )
+            self.assertEqual(r_em1["reason"], "face")
+            self.assertEqual(repo.recent_messages("g1", limit=1)[-1]["meta"], "tools=send_emoji")
+
+            r_em2 = agent.handle_batch(
+                Batch("g1", [ChatEvent("g1", "u1", "和", "@大肥鱼 再说一句配个图", msg_id="m_em2", ts=120.0, mentioned=True)])
+            )
+            self.assertEqual(len(r_em2["actions"]), 2)
+            self.assertEqual(repo.recent_messages("g1", limit=1)[-1]["meta"], "tools=send_emoji")
+
+            # 4) 记忆整理过滤通用词典词（软连接=符号链接）、机器人自述建议、占位词“-”与超时噪音
+            repo.observe_person("g1", "u1", "和", now=100.0)
+            llm_mem = _SeqLLM([
+                ModelTurn(
+                    text=json.dumps(
+                        {
+                            "episode": "大肥鱼曾承诺查视频但查询超时（300s）未完成",
+                            "persons": [{"name": "和", "category": "traits", "content": "-"}],
+                            "points": [
+                                {"category": "jargon", "content": "软连接=符号链接(symlink)"},
+                                {"category": "preference", "content": "大肥鱼对读研的建议：选有门槛的专业"},
+                                {"category": "event", "content": "和负责用 V80 配置反向代理"},
+                            ],
+                            "state": {"topics": ["查询超时"], "progress": [], "pending": ["未生成成稿"]},
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+            ])
+            agent._llm = llm_mem
+            agent._summarize_sync("g1", "和：帮我配一下", episode_ts=300.0)
+            self.assertEqual(repo.group_jargon("g1"), {})
+            self.assertEqual(repo.person_summary("g1", "u1"), "")
+            self.assertEqual(repo.recent_episodes("g1"), [])
+            self.assertEqual(repo.get_conv_state("g1")["topics"], [])
+            recalled = repo.recall_memories("g1", "V80 反向代理")
+            self.assertTrue(any("V80" in x for x in recalled))
+            self.assertFalse(any("大肥鱼对" in x for x in recalled))
+            agent.wait_background(2.0)
+            repo.close()
 
     def test_model_error_replies_natural_notice_only_when_addressed_and_clears_repeat_guard(self):
         repo = Repository(":memory:")

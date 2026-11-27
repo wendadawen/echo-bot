@@ -59,6 +59,8 @@ TRANSIENT_MEMORY_NOISE = (
     "没法可靠对上", "还没核实", "没有可用的绘图", "没能生成",
     "无法访问互联网", "当前无法联网", "临时文件", "根目录", "gx.txt", "权限不够",
     "mount 信息", "挂载点", "没能从官方",
+    "查询超时", "未生成成稿", "未核实", "无法确认", "没有依据", "别当真", "自证",
+    "未完成", "号池", "529", "429", "api关闭",
 )
 
 UNSUPPORTED_CAP_HINTS = ("绘图", "画一张", "画张", "自画像", "文生图", "生图", "画画")
@@ -82,6 +84,11 @@ _SK_TOKEN_PATTERN = re.compile(r"(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]{16,}(?![A-Za
 _EMPTY_MD_LINK_PATTERN = re.compile(r"\[[^\]]*\]\(\s*\)")
 _EMPTY_BACKTICK_PATTERN = re.compile(r"(?<!`)``(?!`)|(?<!`)`\s*`(?!`)")
 _RAW_MENTION_QQ_PATTERN = re.compile(r"@([^\s@()（）]{1,24})\(\d{5,12}\)")
+_INTERNAL_TIME_PREFIX = re.compile(
+    r"(?m)^\s*\[\d{2}(?:-\d{2}\s+\d{2})?:\d{2}\s*·\s*(?:刚刚|\d+\s*(?:分钟|小时|天)前)\]\s*"
+)
+_INTERNAL_ALIAS_PREFIX = re.compile(r"(?m)^\s*\[#m\d+\]\s*")
+_INTERNAL_SYSNOTE_PREFIX = re.compile(r"(?m)^\s*\[系统注：[^\]]*\]\s*")
 _META_REPLY_SPLIT = re.compile(
     r"(?:^|\n)\s*(?:(?:群里|群聊|直接)?(?:可以)?(?:这么|这样)回[复答]?|(?:建议|参考|可直接发送的?)(?:群聊)?回复|回复建议)\s*[：:]\s*",
     re.S,
@@ -148,6 +155,13 @@ def scrub_internal_leaks(text: Any, extra_secrets: Sequence[str] = ()) -> str:
     s = _EMPTY_MD_LINK_PATTERN.sub("", s)
     s = _EMPTY_BACKTICK_PATTERN.sub("", s)
     s = _RAW_MENTION_QQ_PATTERN.sub(r"@\1", s)
+    for _ in range(3):
+        prev = s
+        s = _INTERNAL_TIME_PREFIX.sub("", s)
+        s = _INTERNAL_ALIAS_PREFIX.sub("", s)
+        s = _INTERNAL_SYSNOTE_PREFIX.sub("", s)
+        if s == prev:
+            break
     s = re.sub(r"(?m)^\s*[-*•]\s*(?:文件|网页|链接|地址)?\s*[：:]?\s*$", "", s)
     s = re.sub(r"(?<=\S)[ \t]{2,}", " ", s)
     s = re.sub(r"\n{3,}", "\n\n", s)

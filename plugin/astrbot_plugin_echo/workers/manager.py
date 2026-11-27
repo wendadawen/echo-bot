@@ -365,7 +365,9 @@ class TaskManager:
                     cleanup_file_entry(item.get("path", ""), self.outbox_root)
 
         if self._repo is not None:
-            self._repo.add_message(delivery.group_id, "bot", "大肥鱼", "bot", text)
+            self._repo.add_message(
+                delivery.group_id, "bot", "大肥鱼", "bot", text, meta="tools=run_task" if ok else ""
+            )
             if ok and short_prompt and not is_failed_lookup(delivery.result) and is_memorable_takeaway(raw_prompt, text):
                 takeaway = clip_text(re.sub(r"\s+", " ", text), 80)
                 if takeaway:

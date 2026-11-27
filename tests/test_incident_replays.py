@@ -270,6 +270,36 @@ class IncidentReplayTests(unittest.TestCase):
                     await asyncio.gather(*list(echo._bg_tasks), return_exceptions=True)
                 self.assertTrue(echo.emoji_store.has_entries("aiocqhttp:10086"))
 
+                # Replay 2b: 未 @ 发图后出现被跳过的闲聊批，绝不能偷吃图片；后续追问仍能看到原图
+                echo.inbound._download = lambda url: TINY_GIF if "sticker" in url else (TINY_PNG + b"2" if "shot2" in url else TINY_PNG)
+                ev_shot2 = _make_event(
+                    [_Image(url="https://cdn.example.com/shot2.png", file="shot2.png")],
+                    raw_msg={"message_id": "205", "message": [{"type": "image", "data": {"file": "shot2.png", "sub_type": "0", "summary": "[图片]"}}]},
+                )
+                await _drive_event(echo, ev_shot2)
+                if echo._bg_tasks:
+                    await asyncio.gather(*list(echo._bg_tasks), return_exceptions=True)
+
+                echo.scheduler.ambient_rate = 0.0
+                ev_noise = _make_event(
+                    [_Plain("ai感是不是太重了")],
+                    text="ai感是不是太重了",
+                    raw_msg={"message_id": "206", "message": []},
+                )
+                await _drive_event(echo, ev_noise)
+                await echo._process_batch(echo.scheduler.due(now=9e9)[0])  # 未被 should_view 选中，只入历史不消费图
+
+                ev_ask_img = _make_event(
+                    [_At(qq="8888"), _Plain("你咋没法识图啊")],
+                    text="你咋没法识图啊",
+                    raw_msg={"message_id": "207", "message": []},
+                )
+                await _drive_event(echo, ev_ask_img)
+                calls_idx = len(spy.chat_calls)
+                spy.responses.append(ModelTurn(text="刚才看到了！"))
+                await echo._process_batch(echo.scheduler.due(now=9e9)[0])
+                self.assertEqual(len(spy.chat_calls[calls_idx]["messages"][-1].images), 1)
+
         asyncio.run(scenario())
 
     def test_5_to_9_safety_gate_retold_lock_skip_and_emoji_cooldown(self):

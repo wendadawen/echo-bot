@@ -16,16 +16,39 @@ from typing import Any, Optional
 from ..domain import FACE_LABELS, LLMClient, detect_image_format
 
 ANALYZE_PROMPT = (
-    "先判断这是不是聊天表情包/梗图/动图；如果是普通截图、聊天记录、网页、图表、表格、代码、文档、证件或普通生活实拍照片，"
-    "只输出：非表情。如果是表情包，再给出2到4字的情绪标签，用竖线|隔开一句话描述它在表达什么，"
-    "不要解释、不要多余标点。例：无语|一只猫翻白眼"
+    "先判断这是不是适合群聊日常使用的正向/中性表情包或梗图；如果是普通截图、聊天记录、网页、图表、表格、代码、文档、"
+    "证件、真人照片，或低俗、露骨、色情、恶心、攻击性图片，只输出：非表情。\n"
+    "如果是合适的表情包，必须严格仅输出一行：2到4字情绪词|一句话描述它在表达什么。\n"
+    "例：无语|一只猫翻白眼。禁止任何解释、序号、Markdown或“这是一张...”等前缀。"
 )
 FILTER_WORDS = ("二维码", "付款码", "身份证", "验证码", "密码", "银行卡号")
 NON_EMOJI_WORDS = ("非表情", "不是表情")
+_BAD_EMOJI_WORDS = ("低俗", "色情", "黄图", "露骨", "性暗示", "nsfw", "porn")
+_BAD_TAG_PREFIXES = ("这是", "这张", "那个", "一个", "口语化", "截图", "聊天", "网页", "图片", "画面")
+
+
+def _clean_tag(raw: Any) -> str:
+    return re.sub(r"[*`\[\]【】()（）「」\"'：:]+", "", str(raw or "")).strip()
+
+
+def _is_valid_tag(tag: Any) -> bool:
+    raw = str(tag or "").strip()
+    if not raw or not (1 <= len(raw) <= 6):
+        return False
+    if re.search(r"[\s:：()（）\[\]【】*`]", raw):
+        return False
+    if raw in NON_EMOJI_WORDS or raw.endswith(("的", "了", "着")):
+        return False
+    low = raw.lower()
+    if any(w in low for w in _BAD_EMOJI_WORDS):
+        return False
+    if any(raw.startswith(p) for p in _BAD_TAG_PREFIXES):
+        return False
+    return True
 
 
 def analyze_emoji(llm: LLMClient, image_bytes: bytes) -> tuple[str, str]:
-    """调用模型视觉能力判断是否为表情并打标签。"""
+    """调用模型视觉能力判断是否为表情并打标签（严格单行 格式|校验，fail-closed）。"""
     if not image_bytes:
         return "", "随手"
     try:
@@ -34,24 +57,29 @@ def analyze_emoji(llm: LLMClient, image_bytes: bytes) -> tuple[str, str]:
         return "", "随手"
     if not raw:
         return "", "随手"
-    if raw.startswith(NON_EMOJI_WORDS):
+    low = raw.lower()
+    if raw.startswith(NON_EMOJI_WORDS) or any(w in raw for w in NON_EMOJI_WORDS) or any(w in low for w in _BAD_EMOJI_WORDS):
         return "非表情", "非表情"
-    if "|" in raw or "｜" in raw:
-        parts = re.split(r"[|｜]", raw, maxsplit=1)
-        label = (parts[0] or "").strip()[:8] or "随手"
-        desc = (parts[1] or "").strip() or label
-        if label in NON_EMOJI_WORDS or desc.startswith(NON_EMOJI_WORDS):
-            return "非表情", "非表情"
-        return desc, label
-    return raw, raw[:8] or "随手"
+    first_line = next((ln.strip() for ln in raw.splitlines() if ln.strip()), "")
+    if "|" not in first_line and "｜" not in first_line:
+        return "非表情", "非表情"
+    left, right = re.split(r"[|｜]", first_line, maxsplit=1)
+    label = _clean_tag(left)
+    desc = str(right or "").strip()
+    if not _is_valid_tag(label) or not desc or any(w in desc for w in NON_EMOJI_WORDS) or any(w in desc.lower() for w in _BAD_EMOJI_WORDS):
+        return "非表情", "非表情"
+    return desc, label
 
 
 def acceptable(description: str, image_bytes: Optional[bytes] = None) -> bool:
-    """fail-closed 内容过滤：空描述、非表情或含敏感信息一律拒收。"""
+    """fail-closed 内容过滤：空描述、非表情、低俗或含敏感信息一律拒收。"""
     text = str(description or "").strip()
     if not text:
         return False
+    low = text.lower()
     if any(w in text for w in NON_EMOJI_WORDS):
+        return False
+    if any(w in low for w in _BAD_EMOJI_WORDS):
         return False
     if any(w in text for w in FILTER_WORDS):
         return False
@@ -125,10 +153,18 @@ class EmojiStore:
             self._atomic_write(self.cache_path, json.dumps(self._digest_cache, ensure_ascii=False, indent=2))
 
     def _migrate_and_dedup(self) -> None:
-        """按 sha256 去重，清理磁盘缺失文件，并预热全局指纹缓存。"""
+        """按 sha256 去重、过滤非法 face_id 与脏标签、清理缺失/不合格文件。"""
         changed_index = False
         changed_cache = False
         with self._lock:
+            for digest, cached in list(self._digest_cache.items()):
+                if isinstance(cached, dict) and cached.get("ok"):
+                    if not _is_valid_tag(cached.get("tag")) or not acceptable(cached.get("description", "")):
+                        cached["ok"] = False
+                        cached["tag"] = ""
+                        cached["description"] = ""
+                        changed_cache = True
+
             for gid, entries in list(self._index.items()):
                 if not isinstance(entries, list):
                     continue
@@ -140,6 +176,15 @@ class EmojiStore:
                         changed_index = True
                         continue
                     if item.get("face_id") and not item.get("path"):
+                        fid = str(item.get("face_id") or "").strip()
+                        if fid not in FACE_LABELS:
+                            drop_indices.add(idx)
+                            changed_index = True
+                            continue
+                        if not item.get("tag") or item.get("tag") == "QQ表情":
+                            item["tag"] = FACE_LABELS[fid]
+                            item["description"] = FACE_LABELS[fid]
+                            changed_index = True
                         continue
                     p_str = str(item.get("path") or "")
                     safe = self._safe_path(p_str)
@@ -157,6 +202,21 @@ class EmojiStore:
                             continue
                         item["sha256"] = digest
                         changed_index = True
+                    if not _is_valid_tag(item.get("tag")) or not acceptable(item.get("description", "")):
+                        drop_indices.add(idx)
+                        changed_index = True
+                        try:
+                            safe.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                        self._digest_cache[digest] = {
+                            "ok": False,
+                            "tag": "",
+                            "description": "",
+                            "ts": float(item.get("ts") or time.time()),
+                        }
+                        changed_cache = True
+                        continue
                     prev = by_digest.get(digest)
                     if prev is None:
                         by_digest[digest] = (idx, item)
@@ -291,16 +351,23 @@ class EmojiStore:
 
     def collect_face(self, group_id: str, face_id: str, name: str = "") -> str:
         fid = str(face_id or "").strip()
-        if not fid:
+        if not fid or fid not in FACE_LABELS:
             return ""
+        canonical = FACE_LABELS[fid]
+        label = str(name or canonical).strip()
+        if not label or label == "QQ表情":
+            label = canonical
+        label = label[:20]
         with self._lock:
             entries = self._index.setdefault(group_id, [])
             for item in entries:
                 if str(item.get("face_id") or "") == fid:
                     item["ts"] = time.time()
+                    if item.get("tag") in ("", "QQ表情"):
+                        item["tag"] = label
+                        item["description"] = label
                     self._save()
-                    return str(item.get("tag") or "表情")
-            label = str(name or FACE_LABELS.get(fid) or "QQ表情")[:20]
+                    return str(item.get("tag") or canonical)
             entries.append({"face_id": fid, "tag": label, "description": label, "ts": time.time()})
             while len(entries) > self.limit:
                 old = entries.pop(0)
@@ -308,6 +375,20 @@ class EmojiStore:
                     Path(old["path"]).unlink(missing_ok=True)
             self._save()
             return label
+
+    def remove_face(self, group_id: str, face_id: str) -> bool:
+        """发送 QQ 原生表情失败时踢出失效 face_id，防止后续重复报错 1200。"""
+        fid = str(face_id or "").strip()
+        if not fid:
+            return False
+        with self._lock:
+            entries = list(self._index.get(group_id) or [])
+            kept = [item for item in entries if str(item.get("face_id") or "") != fid]
+            if len(kept) == len(entries):
+                return False
+            self._index[group_id] = kept
+            self._save()
+            return True
 
     def has_entries(self, group_id: str) -> bool:
         with self._lock:

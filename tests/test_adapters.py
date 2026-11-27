@@ -489,10 +489,32 @@ class InboundAndSenderTests(unittest.TestCase):
         self.assertTrue(asyncio.run(parser.parse(ev_json)).passthrough)
 
         ev_fwd = self._make_event(
-            parts=[_At(qq="8888"), _Forward(content=[{"sender": {"nickname": "甲"}, "content": "明天开会"}])]
+            parts=[
+                _At(qq="8888"),
+                _Forward(
+                    content=[
+                        {"sender": {"nickname": "甲"}, "content": "明天开会"},
+                        {
+                            "sender": {"nickname": "乙"},
+                            "content": [
+                                {
+                                    "type": "forward",
+                                    "data": {
+                                        "content": [
+                                            {"sender": {"nickname": "丙"}, "content": [{"type": "text", "text": "内层详情"}]}
+                                        ]
+                                    },
+                                }
+                            ],
+                        },
+                    ]
+                ),
+            ]
         )
         parsed_fwd = asyncio.run(parser.parse(ev_fwd))
         self.assertIn("明天开会", parsed_fwd.text)
+        self.assertIn("内层详情", parsed_fwd.text)
+        self.assertNotIn("{'", parsed_fwd.text)
 
     def test_sender_reply_fallback_jailed_emoji_and_file_cleanup(self):
         class Chain(list):
@@ -512,10 +534,18 @@ class InboundAndSenderTests(unittest.TestCase):
             good_file.write_text("# 报告", encoding="utf-8")
 
             repo = Repository(":memory:")
-            bot = MagicMock()
-            bot.call_action = AsyncMock(return_value={})
+            bot_g1 = MagicMock()
+            bot_g1.call_action = AsyncMock(return_value={})
+            bot_g2 = MagicMock()
+            bot_g2.call_action = AsyncMock(return_value={})
+            bots = {"g1": bot_g1, "g2": bot_g2}
+            invalid_faces = []
             ctx = MagicMock()
-            ctx.send_message = AsyncMock(side_effect=[RuntimeError("reply target expired"), None, None, None])
+            ctx.send_message = AsyncMock(
+                side_effect=[RuntimeError("reply target expired"), None, None, RuntimeError("unsupported face id"), None]
+            )
+
+            from astrbot_plugin_echo.domain import SendFace  # noqa: E402
 
             sender = AstrBotSender(
                 context=ctx,
@@ -524,8 +554,9 @@ class InboundAndSenderTests(unittest.TestCase):
                 emoji_root=emoji_dir,
                 outbox_root=outbox_dir,
                 limiter=MessageLimiter(per_minute=10),
-                bot_provider=lambda: bot,
+                bot_provider=lambda gid="": bots.get(gid),
                 repo=repo,
+                on_invalid_face=lambda gid, fid: invalid_faces.append((gid, fid)),
             )
 
             # 1) SendText 首次带 Reply 失败时自动退回无 Reply 纯文本重试
@@ -535,13 +566,17 @@ class InboundAndSenderTests(unittest.TestCase):
             self.assertTrue(ok)
             self.assertEqual(ctx.send_message.call_count, 2)
 
-            # 2) SendEmoji 路径越界拒绝，牢笼内允许
+            # 2) SendEmoji 路径越界拒绝，牢笼内允许；SendFace 发送失败触发失效清理回调
             self.assertFalse(
                 asyncio.run(sender.send(SendEmoji(group_id="g1", umo="u1", path=str(outside))))
             )
             self.assertTrue(
                 asyncio.run(sender.send(SendEmoji(group_id="g1", umo="u1", path=str(good_emoji))))
             )
+            self.assertFalse(
+                asyncio.run(sender.send(SendFace(group_id="g1", umo="u1", face_id="489")))
+            )
+            self.assertEqual(invalid_faces, [("g1", "489")])
 
             # 3) SendFile 牢笼内发送 + 落库占位记录 + finally 自动删除源文件
             self.assertFalse(
@@ -553,11 +588,12 @@ class InboundAndSenderTests(unittest.TestCase):
             self.assertFalse(good_file.exists())
             self.assertIn("[已发送群文件：report.md]", repo.recent_messages("g1")[0]["text"])
 
-            # 4) ReactEmoji
+            # 4) ReactEmoji 按 group_id 精确路由 bot 实例，不跨群串台
             self.assertTrue(
-                asyncio.run(sender.send(ReactEmoji(group_id="g1", umo="u1", msg_id="555", emoji_id="124")))
+                asyncio.run(sender.send(ReactEmoji(group_id="g2", umo="u2", msg_id="555", emoji_id="124")))
             )
-            bot.call_action.assert_awaited_once_with("set_msg_emoji_like", message_id=555, emoji_id="124")
+            bot_g1.call_action.assert_not_called()
+            bot_g2.call_action.assert_awaited_once_with("set_msg_emoji_like", message_id=555, emoji_id="124")
             repo.close()
 
 

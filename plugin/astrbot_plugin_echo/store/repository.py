@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from ..domain import PendingDelivery, clean_speaker_name
+from .migration import migrate_legacy_v1_dbs
 
 DEFAULT_HISTORY_LIMIT = 30
 DEFAULT_MAX_MESSAGES_PER_GROUP = 500
@@ -25,6 +26,8 @@ HALF_LIFE = 14 * 86400
 FORGET_AFTER = 60 * 86400
 MAX_EPISODES = 200
 MAX_MEMORIES = 450
+CONV_STATE_MAX_AGE = 7200.0
+_PLACEHOLDER_VALUES = frozenset({"-", "—", "–", "无", "暂无", "未知", "none", "null", "n/a"})
 
 _STOP_BIGRAMS = frozenset({
     "什么", "怎么", "这个", "那个", "就是", "不是", "可以", "我们", "你们", "他们",
@@ -113,18 +116,33 @@ def _similarity(left: str, right: str) -> float:
 
 
 def _merge_field(existing: str, incoming: str, limit: int) -> str:
-    left = str(existing or "").strip()
-    right = str(incoming or "").strip()
-    if not right:
-        return left[:limit]
-    if not left:
-        return right[:limit]
-    parts = [p.strip() for p in left.split("；") if p.strip()]
-    for item in [p.strip() for p in right.split("；") if p.strip()]:
-        if any(item == p or item in p for p in parts):
+    """合并分号分隔的人物印象短句，过滤无意义占位词并对近义重复句去重。"""
+
+    def _valid_parts(raw: str) -> list[str]:
+        return [
+            p.strip()
+            for p in str(raw or "").split("；")
+            if p.strip() and p.strip().lower() not in _PLACEHOLDER_VALUES
+        ]
+
+    parts = _valid_parts(existing)
+    for item in _valid_parts(incoming):
+        dup_idx: Optional[int] = None
+        skip = False
+        for i, prev in enumerate(parts):
+            if item == prev or item in prev or (_similarity(item, prev) >= 0.65 and len(prev) >= len(item)):
+                skip = True
+                break
+            if prev in item or (_similarity(item, prev) >= 0.65 and len(item) > len(prev)):
+                dup_idx = i
+                break
+        if skip:
             continue
-        parts = [p for p in parts if p not in item]
-        parts.append(item)
+        if dup_idx is not None:
+            parts[dup_idx] = item
+        else:
+            parts = [p for p in parts if p not in item and _similarity(item, p) < 0.65]
+            parts.append(item)
     joined = "；".join(parts)
     while len(joined) > limit and len(parts) > 1:
         parts.pop(0)
@@ -310,257 +328,16 @@ class Repository:
     # ---- 无损自动迁移旧版分离库 ----
     def migrate_legacy_dbs(self, data_dir: Path | str) -> dict[str, int]:
         """从旧版 memory.sqlite3 / persons.sqlite3 / monitor.sqlite3 幂等无损迁移。"""
-        summary = {"episodes": 0, "memories": 0, "aliases": 0, "persons": 0, "events": 0}
         with self._lock:
             if self._closed:
-                return summary
-            done = self._db.execute(
-                "SELECT v FROM schema_meta WHERE k='migrated_legacy_v1'"
-            ).fetchone()
-            if done and done["v"] == "1":
-                return summary
-            root = Path(data_dir)
-            mem_db_path = root / "memory.sqlite3"
-            per_db_path = root / "persons.sqlite3"
-            mon_db_path = root / "monitor.sqlite3"
-
-            now = time.time()
-            with self._db:
-                # 1) persons.sqlite3 -> person_aliases + persons
-                if per_db_path.is_file():
-                    pconn = sqlite3.connect(str(per_db_path), timeout=10.0)
-                    pconn.row_factory = sqlite3.Row
-                    try:
-                        ind_map: dict[str, sqlite3.Row] = {}
-                        try:
-                            for row in pconn.execute("SELECT * FROM individuals"):
-                                ind_map[str(row["user_id"])] = row
-                        except sqlite3.Error:
-                            pass
-                        try:
-                            for row in pconn.execute("SELECT * FROM identities"):
-                                self._db.execute(
-                                    "INSERT OR IGNORE INTO person_aliases"
-                                    "(group_id, user_id, name, kind, hits, updated_at) "
-                                    "VALUES (?, ?, ?, ?, ?, ?)",
-                                    (
-                                        row["group_id"],
-                                        row["user_id"],
-                                        row["name"],
-                                        row["kind"],
-                                        row["hits"],
-                                        row["updated_at"],
-                                    ),
-                                )
-                                summary["aliases"] += 1
-                            for row in pconn.execute(
-                                "SELECT DISTINCT group_id, user_id FROM identities"
-                            ):
-                                uid = str(row["user_id"])
-                                ind = ind_map.get(uid)
-                                if ind:
-                                    self._db.execute(
-                                        "INSERT OR IGNORE INTO persons"
-                                        "(group_id, user_id, msg_count, first_seen, last_seen, updated_at) "
-                                        "VALUES (?, ?, ?, ?, ?, ?)",
-                                        (
-                                            row["group_id"],
-                                            uid,
-                                            int(ind["msg_count"]),
-                                            float(ind["first_seen"]),
-                                            float(ind["last_seen"]),
-                                            float(ind["last_seen"]),
-                                        ),
-                                    )
-                        except sqlite3.Error:
-                            pass
-                        try:
-                            for row in pconn.execute("SELECT * FROM profiles"):
-                                uid = str(row["user_id"])
-                                ind = ind_map.get(uid)
-                                first_seen = float(ind["first_seen"]) if ind else 0.0
-                                last_seen = float(ind["last_seen"]) if ind else 0.0
-                                msg_count = int(ind["msg_count"]) if ind else 0
-                                self._db.execute(
-                                    "INSERT INTO persons"
-                                    "(group_id, user_id, traits, preferences, events, relation, "
-                                    "intimacy, msg_count, first_seen, last_seen, updated_at) "
-                                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
-                                    "ON CONFLICT(group_id, user_id) DO UPDATE SET "
-                                    "traits = CASE WHEN excluded.traits <> '' THEN excluded.traits ELSE persons.traits END, "
-                                    "preferences = CASE WHEN excluded.preferences <> '' THEN excluded.preferences ELSE persons.preferences END, "
-                                    "events = CASE WHEN excluded.events <> '' THEN excluded.events ELSE persons.events END, "
-                                    "relation = CASE WHEN excluded.relation <> '' THEN excluded.relation ELSE persons.relation END, "
-                                    "intimacy = excluded.intimacy, "
-                                    "updated_at = MAX(persons.updated_at, excluded.updated_at)",
-                                    (
-                                        row["group_id"],
-                                        uid,
-                                        row["traits"],
-                                        row["preferences"],
-                                        row["events"],
-                                        row["relation"],
-                                        row["intimacy"],
-                                        msg_count,
-                                        first_seen,
-                                        last_seen,
-                                        row["updated_at"],
-                                    ),
-                                )
-                                summary["persons"] += 1
-                        except sqlite3.Error:
-                            pass
-                    finally:
-                        pconn.close()
-
-                # 2) memory.sqlite3 -> episodes + memories + persons merge
-                if mem_db_path.is_file():
-                    mconn = sqlite3.connect(str(mem_db_path), timeout=10.0)
-                    mconn.row_factory = sqlite3.Row
-                    try:
-                        try:
-                            for row in mconn.execute("SELECT * FROM episodes"):
-                                ext = str(row["external_id"] or "").strip() or (
-                                    "legacy_ep:{}".format(row["id"])
-                                )
-                                self._db.execute(
-                                    "INSERT OR IGNORE INTO episodes"
-                                    "(group_id, text, created_at, source, external_id, state) "
-                                    "VALUES (?, ?, ?, ?, ?, ?)",
-                                    (
-                                        row["group_id"],
-                                        row["text"],
-                                        row["created_at"],
-                                        row["source"],
-                                        ext,
-                                        row["state"],
-                                    ),
-                                )
-                                summary["episodes"] += 1
-                        except sqlite3.Error:
-                            pass
-                        try:
-                            for row in mconn.execute("SELECT * FROM memory_points"):
-                                exists = self._db.execute(
-                                    "SELECT 1 FROM memories WHERE group_id=? AND content=?",
-                                    (row["group_id"], row["content"]),
-                                ).fetchone()
-                                if not exists:
-                                    self._db.execute(
-                                        "INSERT INTO memories"
-                                        "(group_id, category, content, weight, last_hit, state, protected) "
-                                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                                        (
-                                            row["group_id"],
-                                            row["category"],
-                                            row["content"],
-                                            row["weight"],
-                                            row["last_hit"],
-                                            row["state"],
-                                            row["protected"],
-                                        ),
-                                    )
-                                    summary["memories"] += 1
-                        except sqlite3.Error:
-                            pass
-                        try:
-                            for row in mconn.execute("SELECT * FROM jargon"):
-                                content = "{}={}".format(row["word"], row["alias"])
-                                exists = self._db.execute(
-                                    "SELECT 1 FROM memories WHERE group_id=? AND category='jargon' AND content=?",
-                                    (row["group_id"], content),
-                                ).fetchone()
-                                if not exists:
-                                    self._db.execute(
-                                        "INSERT INTO memories"
-                                        "(group_id, category, content, weight, last_hit, state, protected) "
-                                        "VALUES (?, 'jargon', ?, 1.5, ?, 'active', 0)",
-                                        (row["group_id"], content, now),
-                                    )
-                                    summary["memories"] += 1
-                        except sqlite3.Error:
-                            pass
-                        try:
-                            for row in mconn.execute(
-                                "SELECT * FROM relations WHERE valid_to IS NULL"
-                            ):
-                                content = "{} 与 {}：{}".format(row["a"], row["b"], row["relation"])
-                                exists = self._db.execute(
-                                    "SELECT 1 FROM memories WHERE group_id=? AND category='relation' AND content=?",
-                                    (row["group_id"], content),
-                                ).fetchone()
-                                if not exists:
-                                    self._db.execute(
-                                        "INSERT INTO memories"
-                                        "(group_id, category, content, weight, last_hit, state, protected) "
-                                        "VALUES (?, 'relation', ?, ?, ?, 'active', 0)",
-                                        (row["group_id"], content, row["weight"], row["valid_from"]),
-                                    )
-                                    summary["memories"] += 1
-                        except sqlite3.Error:
-                            pass
-                        try:
-                            for row in mconn.execute("SELECT * FROM person_profiles"):
-                                gid = str(row["group_id"])
-                                uname = str(row["user_name"] or "").strip()
-                                content = str(row["content"] or "").strip()
-                                if not uname or not content:
-                                    continue
-                                uid = self.resolve_person(gid, uname) or ("legacy:" + uname)
-                                if uid.startswith("legacy:"):
-                                    self.observe_person(gid, uid, uname, now=float(row["last_hit"] or now))
-                                field = {
-                                    "person": "traits",
-                                    "traits": "traits",
-                                    "preference": "preferences",
-                                    "preferences": "preferences",
-                                    "event": "events",
-                                    "events": "events",
-                                    "relation": "relation",
-                                    "relationship": "relation",
-                                }.get(str(row["category"] or "person").lower(), "traits")
-                                self.upsert_person(gid, uid, now=float(row["last_hit"] or now), **{field: content})
-                        except sqlite3.Error:
-                            pass
-                    finally:
-                        mconn.close()
-
-                # 3) monitor.sqlite3 -> monitor_events
-                if mon_db_path.is_file():
-                    oconn = sqlite3.connect(str(mon_db_path), timeout=10.0)
-                    oconn.row_factory = sqlite3.Row
-                    try:
-                        existing_cnt = self._db.execute(
-                            "SELECT COUNT(*) FROM monitor_events"
-                        ).fetchone()[0]
-                        if existing_cnt == 0:
-                            for row in oconn.execute(
-                                "SELECT * FROM events ORDER BY id DESC LIMIT 1000"
-                            ):
-                                self._db.execute(
-                                    "INSERT INTO monitor_events"
-                                    "(group_id, kind, ok, latency, tokens, detail, ts) "
-                                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                                    (
-                                        row["group_id"],
-                                        row["kind"],
-                                        row["ok"],
-                                        row["latency"],
-                                        row["tokens"],
-                                        row["detail"],
-                                        row["ts"],
-                                    ),
-                                )
-                                summary["events"] += 1
-                    except sqlite3.Error:
-                        pass
-                    finally:
-                        oconn.close()
-
-                self._db.execute(
-                    "INSERT OR REPLACE INTO schema_meta(k, v) VALUES ('migrated_legacy_v1', '1')"
-                )
-        return summary
+                return {"episodes": 0, "memories": 0, "aliases": 0, "persons": 0, "events": 0}
+            return migrate_legacy_v1_dbs(
+                self._db,
+                data_dir,
+                resolve_person=self.resolve_person,
+                observe_person=self.observe_person,
+                upsert_person=self.upsert_person,
+            )
 
     # ---- 消息历史 ----
     def add_message(
@@ -963,10 +740,10 @@ class Repository:
                 for key, cap in limits:
                     prev_val = str(current.get(key) or "")
                     incoming = str(fields.get(key) or "").strip() if key in fields else ""
-                    if incoming:
+                    if incoming and incoming.lower() not in _PLACEHOLDER_VALUES:
                         merged[key] = _merge_field(prev_val, incoming, cap) if merge else incoming[:cap]
                     else:
-                        merged[key] = prev_val
+                        merged[key] = _merge_field(prev_val, "", cap) if merge else prev_val
                 if not current and "intimacy" not in fields and not any(merged[k] for k, _ in limits):
                     return {}
                 intimacy = float(fields.get("intimacy", current.get("intimacy", 0.5)))
@@ -1010,7 +787,7 @@ class Repository:
             return ""
         bits = []
         for key, label in (("traits", "印象"), ("preferences", "偏好"), ("events", "相关的事"), ("relation", "关系")):
-            val = str(row[key] or "").strip()
+            val = _merge_field(str(row[key] or ""), "", 600)
             if val:
                 bits.append("{}：{}".format(label, val))
         return "；".join(bits)
@@ -1072,16 +849,27 @@ class Repository:
                     )
 
     # ---- 滚动会话状态压缩（MaiBot ConversationState 精简版） ----
-    def get_conv_state(self, group_id: str) -> dict[str, list[str]]:
+    def get_conv_state(
+        self,
+        group_id: str,
+        max_age_seconds: float = CONV_STATE_MAX_AGE,
+        now: Optional[float] = None,
+    ) -> dict[str, list[str]]:
+        empty = {"topics": [], "progress": [], "pending": []}
         with self._lock:
             if self._closed:
-                return {"topics": [], "progress": [], "pending": []}
+                return empty
             row = self._db.execute(
-                "SELECT topics_json, progress_json, pending_json FROM conv_state WHERE group_id = ?",
+                "SELECT topics_json, progress_json, pending_json, updated_at FROM conv_state WHERE group_id = ?",
                 (str(group_id),),
             ).fetchone()
         if not row:
-            return {"topics": [], "progress": [], "pending": []}
+            return empty
+        if max_age_seconds > 0:
+            cur = time.time() if now is None else float(now)
+            updated_at = float(row["updated_at"] or 0.0)
+            if updated_at <= 0.0 or (cur - updated_at) > max_age_seconds:
+                return empty
         out: dict[str, list[str]] = {}
         for key, col in (("topics", "topics_json"), ("progress", "progress_json"), ("pending", "pending_json")):
             try:
@@ -1091,8 +879,13 @@ class Repository:
             out[key] = [str(v).strip() for v in vals if str(v or "").strip()][:5] if isinstance(vals, list) else []
         return out
 
-    def save_conv_state(self, group_id: str, state: dict[str, list[str]]) -> None:
-        now = time.time()
+    def save_conv_state(
+        self,
+        group_id: str,
+        state: dict[str, list[str]],
+        now: Optional[float] = None,
+    ) -> None:
+        stamp = time.time() if now is None else float(now)
         clean = {
             k: [str(v).strip()[:80] for v in (state.get(k) or []) if str(v or "").strip()][:5]
             for k in ("topics", "progress", "pending")
@@ -1112,7 +905,7 @@ class Repository:
                         json.dumps(clean["topics"], ensure_ascii=False),
                         json.dumps(clean["progress"], ensure_ascii=False),
                         json.dumps(clean["pending"], ensure_ascii=False),
-                        now,
+                        stamp,
                     ),
                 )
 

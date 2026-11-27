@@ -21,6 +21,7 @@ REQUIRED = [
     "adapters/llm.py",
     "adapters/search.py",
     "store/__init__.py",
+    "store/migration.py",
     "store/repository.py",
     "store/emoji_store.py",
     "workers/__init__.py",
@@ -33,6 +34,7 @@ REQUIRED = [
     "engine/safety.py",
     "engine/scheduler.py",
     "engine/context.py",
+    "engine/memory.py",
     "engine/agent.py",
 ]
 
