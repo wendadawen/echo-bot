@@ -13,16 +13,21 @@ PLUGIN_ROOT = ROOT / "plugin"
 if str(PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(PLUGIN_ROOT))
 
-from astrbot_plugin_echo.domain import PendingDelivery  # noqa: E402
+from astrbot_plugin_echo.domain import PendingDelivery, detect_image_dimensions  # noqa: E402
 from astrbot_plugin_echo.store.emoji_store import (  # noqa: E402
     EmojiStore,
     acceptable,
     analyze_emoji,
+    is_sticker_geometry,
 )
 from astrbot_plugin_echo.store.repository import Repository  # noqa: E402
 
 TINY_PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
 TINY_GIF = b"GIF89a\x01\x00\x01\x00\x00\x00\x00;"
+
+
+def _png_sized(w: int, h: int) -> bytes:
+    return b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + w.to_bytes(4, "big") + h.to_bytes(4, "big") + b"\x08\x06\x00\x00\x00" + b"\x00" * 16
 
 
 class RepositoryTests(unittest.TestCase):
@@ -196,6 +201,27 @@ class EmojiStoreTests(unittest.TestCase):
         llm.describe_image.return_value = "低俗|露骨谐音图片"
         self.assertEqual(analyze_emoji(llm, TINY_PNG), ("非表情", "非表情"))
 
+        # 物理尺寸门禁 + 结构化 JSON 分类门禁（拒绝 1179x2556 手机新闻长截图与 chat/news JSON）
+        shot_png = _png_sized(1179, 2556)
+        meme_png = _png_sized(240, 240)
+        self.assertEqual(detect_image_dimensions(shot_png), (1179, 2556))
+        self.assertEqual(detect_image_dimensions(TINY_GIF), (1, 1))
+        self.assertFalse(is_sticker_geometry(shot_png))
+        self.assertTrue(is_sticker_geometry(meme_png))
+
+        llm.describe_image.reset_mock()
+        self.assertEqual(analyze_emoji(llm, shot_png), ("非表情", "非表情"))
+        llm.describe_image.assert_not_called()
+
+        llm.describe_image.return_value = '{"kind":"news","usable":false,"tag":"非表情","desc":"新闻报道截屏"}'
+        self.assertEqual(analyze_emoji(llm, meme_png), ("非表情", "非表情"))
+
+        llm.describe_image.return_value = '{"kind":"sticker","usable":true,"tag":"委屈","desc":"新闻报道陈吉宁审查"}'
+        self.assertEqual(analyze_emoji(llm, meme_png), ("非表情", "非表情"))
+
+        llm.describe_image.return_value = '{"kind":"sticker","usable":true,"tag":"委屈巴巴","desc":"小猫捂脸委屈"}'
+        self.assertEqual(analyze_emoji(llm, meme_png), ("小猫捂脸委屈", "委屈巴巴"))
+
     def test_collect_negative_cache_pick_and_cleanup(self):
         import json as _json
 
@@ -222,23 +248,28 @@ class EmojiStoreTests(unittest.TestCase):
             picked_happy = store.pick("g1", "开心")
             self.assertIsInstance(picked_happy, Path)
 
-            # 同关键词连挑多轮（仅一条开心时也能返回）；remove_face 可踢除失效 face_id
+            # 同关键词连挑多轮；兜底抽签优先真实图片表情包；remove_face 可踢除失效 face_id
             self.assertEqual(store.pick("g1", "滑稽"), "face:178")
+            self.assertIsInstance(store.pick("g1", "未知心情"), Path)
             self.assertTrue(store.remove_face("g1", "178"))
             self.assertFalse(any(e.get("face_id") == "178" for e in store._index["g1"]))
             self.assertNotEqual(store.pick("g1", "滑稽"), "face:178")
 
-            # 重载 _migrate_and_dedup 自动清洗历史坏 face_id 与截断脏标签
+            # 重载 _migrate_and_dedup 自动清洗历史坏 face_id、截断脏标签与 1179x2556 截屏图
             dirty_file = Path(tmp) / "g1" / "dirty.png"
             dirty_file.write_bytes(TINY_PNG)
+            long_shot = Path(tmp) / "g1" / "news_shot.png"
+            long_shot.write_bytes(_png_sized(1179, 2556))
             raw_idx = _json.loads((Path(tmp) / "index.json").read_text(encoding="utf-8"))
             raw_idx["g1"].extend([
                 {"face_id": "489", "tag": "QQ表情", "description": "QQ表情", "ts": time.time()},
                 {"path": str(dirty_file), "sha256": "deadbeef", "tag": "这是一张卡通猫的", "description": "猫", "ts": time.time()},
+                {"path": str(long_shot), "sha256": "news1179", "tag": "震惊", "description": "新闻报道正接受审查", "ts": time.time()},
             ])
             (Path(tmp) / "index.json").write_text(_json.dumps(raw_idx, ensure_ascii=False), encoding="utf-8")
             reloaded = EmojiStore(tmp, limit=10, max_age_days=30)
             self.assertFalse(dirty_file.exists())
+            self.assertFalse(long_shot.exists())
             self.assertEqual([e for e in reloaded._index["g1"] if e.get("face_id") == "489"], [])
 
             # 超期文件清理

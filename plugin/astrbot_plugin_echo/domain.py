@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import re
+import struct
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -164,6 +165,64 @@ def detect_image_format(image_bytes: bytes) -> tuple[str, str]:
     if raw.startswith(b"BM"):
         return "image/bmp", ".bmp"
     return "image/jpeg", ".jpg"
+
+
+def detect_image_dimensions(image_bytes: bytes) -> tuple[int, int]:
+    """用纯标准库从 PNG/GIF/JPEG/WEBP/BMP 头读取图片宽高；未知或占位字节返回 (0, 0)。"""
+    raw = bytes(image_bytes or b"")
+    n = len(raw)
+    if n < 10:
+        return 0, 0
+    if raw.startswith(b"\x89PNG\r\n\x1a\n") and n >= 24:
+        w, h = struct.unpack(">II", raw[16:24])
+        return (w, h) if w > 0 and h > 0 else (0, 0)
+    if raw.startswith((b"GIF87a", b"GIF89a")):
+        w, h = struct.unpack("<HH", raw[6:10])
+        return (w, h) if w > 0 and h > 0 else (0, 0)
+    if raw.startswith(b"BM") and n >= 26:
+        w, h = struct.unpack("<Ii", raw[18:26])
+        return (w, abs(h)) if w > 0 and h != 0 else (0, 0)
+    if n >= 30 and raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        chunk = raw[12:16]
+        if chunk == b"VP8X":
+            w = int.from_bytes(raw[24:27], "little") + 1
+            h = int.from_bytes(raw[27:30], "little") + 1
+            return (w, h) if w > 0 and h > 0 else (0, 0)
+        if chunk == b"VP8L":
+            bits = int.from_bytes(raw[21:25], "little")
+            w = (bits & 0x3FFF) + 1
+            h = ((bits >> 14) & 0x3FFF) + 1
+            return (w, h) if w > 0 and h > 0 else (0, 0)
+        if chunk == b"VP8 " and raw[23:26] == b"\x9d\x01\x2a":
+            w, h = struct.unpack("<HH", raw[26:30])
+            w &= 0x3FFF
+            h &= 0x3FFF
+            return (w, h) if w > 0 and h > 0 else (0, 0)
+    if raw.startswith(b"\xff\xd8"):
+        i = 2
+        while i + 3 < n:
+            while i < n and raw[i] != 0xFF:
+                i += 1
+            while i < n and raw[i] == 0xFF:
+                i += 1
+            if i >= n:
+                break
+            marker = raw[i]
+            i += 1
+            if marker in (0xD8, 0xD9, 0x00, 0x01) or (0xD0 <= marker <= 0xD7):
+                continue
+            if i + 2 > n:
+                break
+            seg_len = struct.unpack(">H", raw[i:i + 2])[0]
+            if seg_len < 2 or i + seg_len > n:
+                break
+            if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB):
+                if i + 7 <= n:
+                    h, w = struct.unpack(">HH", raw[i + 3:i + 7])
+                    return (w, h) if w > 0 and h > 0 else (0, 0)
+                break
+            i += seg_len
+    return 0, 0
 
 
 @dataclass(frozen=True)

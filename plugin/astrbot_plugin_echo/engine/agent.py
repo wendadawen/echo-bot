@@ -40,13 +40,14 @@ from .scheduler import Scheduler
 
 MAX_TOOL_ROUNDS = 4
 REPEAT_WINDOW = 30.0
-ATTACH_EMOJI_COOLDOWN = 90.0
+ATTACH_EMOJI_COOLDOWN = 45.0
 HELP_TEXT = "群聊里直接 @大肥鱼 即可对话、看图、写代码/生成文件；也可以随时问我后台任务进度或让我停掉它。"
 
 _OFFER_HINTS = (
     "你要的话", "要不要", "需要的话", "发我", "告诉我",
     "帮你查", "帮你排", "想吃什么", "哪个", "哪种", "什么方向",
 )
+_EXPLICIT_EMOJI_HINTS = ("表情包", "斗图", "发个表情", "发表情", "再来一张", "换一张", "发张表情")
 _VAGUE_TASK_PROMPTS = frozenset({
     "查一下", "去查一下", "查一查", "帮我查", "帮我查一下",
     "搜一下", "去搜一下", "搜一搜", "看看", "去看看", "查查看", "查",
@@ -218,14 +219,21 @@ class EchoAgent:
             ))
 
         if has_emoji:
+            raw_moods = self._emoji.tags(batch.group_id, limit=10) if self._emoji is not None else ()
+            moods = [str(m).strip() for m in raw_moods if str(m).strip()] if isinstance(raw_moods, (list, tuple)) else []
+            mood_desc = (
+                "2到4字情绪词（本群可用：{}；也可填常见心情词）".format("、".join(moods))
+                if moods
+                else "2到4字情绪或梗图描述，例如 无语、开心、呆萌"
+            )
             specs.append(ToolSpec(
                 name="send_emoji",
-                description="在本群发送一张匹配当前心情的表情包；斗图时可只填 mood；日常闲聊顺手配图可同时传 reply_text（文字后自动附一张图）。",
+                description="在本群发送一张匹配当前心情的表情包；闲聊、吐槽、惊讶、无语、开心或斗图时顺手配图很有氛围。文字配图时传 reply_text，纯丢图只填 mood。",
                 parameters={
                     "type": "object",
                     "properties": {
-                        "mood": {"type": "string", "description": "2到4字情绪或梗图描述，例如 无语、开心、呆萌"},
-                        "reply_text": {"type": "string", "description": "可选：同时发送的群聊文字回复；留空则纯发表情"},
+                        "mood": {"type": "string", "description": mood_desc},
+                        "reply_text": {"type": "string", "description": "可选：同时发送的群聊文字回复；留空则纯发表情（若本轮已写正文会自动合并发送）"},
                     },
                     "required": ["mood"],
                 },
@@ -408,7 +416,7 @@ class EchoAgent:
             batch,
             prev_history,
             running_task=running_task,
-            tools_summary="请优先用天然群聊口语回应；需要查询或操作时直接调用合适的工具。",
+            tools_summary="",
             now=now,
         )
 
@@ -504,7 +512,7 @@ class EchoAgent:
                         llm_messages.append(LLMMessage(role="tool", tool_call_id=tc.id, name=name, content="本群表情库暂无可用表情，请直接用文字回复。"))
                         continue
                     mood = str(args.get("mood") or "").strip()[:30] or "随手"
-                    inline_text = str(args.get("reply_text") or "").strip()
+                    inline_text = str(args.get("reply_text") or "").strip() or str(turn.text or "").strip()
                     if inline_text:
                         reply_text = inline_text
                         attach_mood = mood
@@ -662,17 +670,18 @@ class EchoAgent:
 
         now_done = time.time()
         extra_actions: list[OutboundAction] = []
-        if attach_mood and has_emoji and self._emoji is not None:
-            if now_done - self._last_emoji_at.get(gid, 0.0) >= ATTACH_EMOJI_COOLDOWN:
-                picked = self._emoji.pick(gid, attach_mood)
-                if picked is not None:
-                    self._last_emoji_at[gid] = now_done
-                    _record_tool("send_emoji")
-                    self._repo.record_event(gid, "send_face", ok=True, latency=0.0, detail="attach:" + attach_mood)
-                    if str(picked).startswith("face:"):
-                        extra_actions.append(SendFace(gid, umo, str(picked).split(":", 1)[1]))
-                    else:
-                        extra_actions.append(SendEmoji(gid, umo, str(picked)))
+        explicit_emoji_req = any(h in (batch.body_text or "") for h in _EXPLICIT_EMOJI_HINTS)
+        emoji_cooldown_ok = explicit_emoji_req or (now_done - self._last_emoji_at.get(gid, 0.0) >= ATTACH_EMOJI_COOLDOWN)
+        if attach_mood and has_emoji and self._emoji is not None and emoji_cooldown_ok:
+            picked = self._emoji.pick(gid, attach_mood)
+            if picked is not None:
+                self._last_emoji_at[gid] = now_done
+                _record_tool("send_emoji")
+                self._repo.record_event(gid, "send_face", ok=True, latency=0.0, detail="attach:" + attach_mood)
+                if str(picked).startswith("face:"):
+                    extra_actions.append(SendFace(gid, umo, str(picked).split(":", 1)[1]))
+                else:
+                    extra_actions.append(SendEmoji(gid, umo, str(picked)))
 
         prov: list[str] = []
         if saw_images:

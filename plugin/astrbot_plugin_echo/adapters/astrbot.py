@@ -35,6 +35,7 @@ from ..domain import (
     SendFile,
     SendText,
     clean_display_text,
+    detect_image_dimensions,
     format_speaker_message,
 )
 from ..workers.sandbox import cleanup_file_entry
@@ -195,7 +196,12 @@ def match_raw_image_meta(part: Any, raw_metas: list[dict[str, Any]], index: int)
 
 
 def is_sticker_image(part: Any, data: bytes, raw_meta: Optional[dict[str, Any]] = None) -> bool:
-    """fail-closed 区分表情包与普通截图/照片：优先读 NapCat raw_message 元数据。"""
+    """fail-closed 区分表情包与普通截图/照片：先卡物理几何尺寸，再读 NapCat raw_message 元数据。"""
+    w, h = detect_image_dimensions(data)
+    if w > 0 and h > 0:
+        long_side = max(w, h)
+        if long_side > 1280 or (long_side / float(min(w, h))) > 1.85:
+            return False
     meta = raw_meta if isinstance(raw_meta, dict) else {}
     sub_type = meta.get("sub_type")
     if sub_type is None:

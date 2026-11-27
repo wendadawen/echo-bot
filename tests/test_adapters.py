@@ -453,7 +453,7 @@ class InboundAndSenderTests(unittest.TestCase):
         self.assertFalse(parsed_shot.images[0].is_sticker)
         self.assertTrue(parsed_shot.bare_face)
 
-        # 2) sub_type=1 或 summary 含表情 -> 识别为真表情包
+        # 2) sub_type=1 或 summary 含表情 -> 识别为真表情包；但手机长截图 (1179x2556) 即使标成 sub_type=1 也绝不收
         ev_sticker = self._make_event(
             parts=[_Image(url="https://example.com/meme.png", file="meme.png")],
             raw_msg={
@@ -464,6 +464,13 @@ class InboundAndSenderTests(unittest.TestCase):
         parsed_sticker = asyncio.run(parser.parse(ev_sticker))
         self.assertTrue(parsed_sticker.has_sticker)
         self.assertTrue(parsed_sticker.images[0].is_sticker)
+
+        tall_png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + (1179).to_bytes(4, "big") + (2556).to_bytes(4, "big") + b"\x08\x06\x00\x00\x00" + b"\x00" * 16
+        tall_parser = AstrBotInboundParser(COMP_TYPES, downloader=lambda url: tall_png)
+        parsed_tall = asyncio.run(tall_parser.parse(ev_sticker))
+        self.assertTrue(parsed_tall.has_image)
+        self.assertFalse(parsed_tall.has_sticker)
+        self.assertFalse(parsed_tall.images[0].is_sticker)
 
         # 3) 引用图片且 @bot：下载供看图，但不标记 is_sticker（永不收入表情库）
         ev_quote_img = self._make_event(

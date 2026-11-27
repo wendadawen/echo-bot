@@ -47,6 +47,7 @@ from astrbot_plugin_echo.store.emoji_store import EmojiStore  # noqa: E402
 from astrbot_plugin_echo.store.repository import Repository  # noqa: E402
 
 TINY_PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+TINY_GIF = b"GIF89a\x01\x00\x01\x00\x00\x00\x00;"
 
 
 class _SeqLLM:
@@ -59,7 +60,11 @@ class _SeqLLM:
         sys_msg = str(messages[0].content or "") if messages else ""
         if self.ignore_summary and "记忆整理员" in sys_msg:
             return ModelTurn(text='{"episode":"","points":[],"persons":[],"state":{"topics":[],"progress":[],"pending":[]}}')
-        self.recorded_calls.append({"messages": list(messages), "tool_names": [t.name for t in tools]})
+        self.recorded_calls.append({
+            "messages": list(messages),
+            "tool_names": [t.name for t in tools],
+            "tools": {t.name: t for t in tools},
+        })
         if self.turns:
             nxt = self.turns.pop(0)
             if isinstance(nxt, BaseException):
@@ -210,8 +215,10 @@ class ContextTests(unittest.TestCase):
             images=[MediaRef(data=TINY_PNG, sha256="img_sha")],
         )
         system, kept, real_to_alias, alias_to_real = ctx.build(batch, history, now=200.0)
-        self.assertIn("<background_data>", system)
-        self.assertIn("</background_data>", system)
+        self.assertIn("<identity>", system)
+        self.assertIn("<group_etiquette>", system)
+        self.assertIn("<context ", system)
+        self.assertIn("</context>", system)
         self.assertIn("苏州实验室", system)
         self.assertIn("dd=顶顶", system)
         self.assertIn("冰美式", system)
@@ -347,17 +354,23 @@ class EchoAgentTests(unittest.TestCase):
             self.assertEqual(res_react["reason"], "react")
             self.assertEqual(res_react["actions"][0], ReactEmoji("g1", "", "real_9001", "124"))
 
-            # B. web_search + send_emoji(reply_text) 合并发图，以及 90s 冷却内二次附带不再重复发图
+            # B. web_search + send_emoji(reply_text) 合并发图，以及 45s 冷却内二次附带不再重复发图，
+            #    且 send_emoji 动态携带本群情绪词；显式索要表情包可豁免冷却；turn.text + send_emoji(mood) 无 reply_text 时自动合并
+            emoji_img = TINY_GIF + b"_real_meme"
+            emoji.collect("g1", emoji_img, _SeqLLM([]))  # 写入 "开心" 图片表情
             llm_combo = _SeqLLM([
                 ModelTurn(tool_calls=(ToolCall("s1", "web_search", {"query": "Python 3.13"}),)),
-                ModelTurn(tool_calls=(ToolCall("e1", "send_emoji", {"mood": "滑稽", "reply_text": "刚查到 3.13 发了"}),)),
-                ModelTurn(tool_calls=(ToolCall("e2", "send_emoji", {"mood": "滑稽", "reply_text": "第二条不配重复图"}),)),
-            ])
+                ModelTurn(tool_calls=(ToolCall("e1", "send_emoji", {"mood": "开心", "reply_text": "刚查到 3.13 发了"}),)),
+                ModelTurn(tool_calls=(ToolCall("e2", "send_emoji", {"mood": "开心", "reply_text": "第二条不配重复图"}),)),
+                ModelTurn(text="给你挑一张", tool_calls=(ToolCall("e3", "send_emoji", {"mood": "开心"}),)),
+            ], ignore_summary=True)
             agent._llm = llm_combo
-            self.assertEqual(ATTACH_EMOJI_COOLDOWN, 90.0)
+            self.assertEqual(ATTACH_EMOJI_COOLDOWN, 45.0)
             r1 = agent.handle_batch(
                 Batch("g1", [ChatEvent("g1", "u1", "甲", "@大肥鱼 Python 3.13", msg_id="m_q1", ts=101.0, mentioned=True)])
             )
+            send_emoji_spec = llm_combo.recorded_calls[0]["tools"]["send_emoji"]
+            self.assertIn("开心", send_emoji_spec.parameters["properties"]["mood"]["description"])
             self.assertEqual(len(r1["actions"]), 2)
             self.assertIsInstance(r1["actions"][0], SendText)
             self.assertIsInstance(r1["actions"][1], (SendFace, SendEmoji))
@@ -366,6 +379,13 @@ class EchoAgentTests(unittest.TestCase):
                 Batch("g1", [ChatEvent("g1", "u1", "甲", "@大肥鱼 再问一句", msg_id="m_q2", ts=102.0, mentioned=True)])
             )
             self.assertEqual(len(r2["actions"]), 1)
+
+            r3 = agent.handle_batch(
+                Batch("g1", [ChatEvent("g1", "u1", "甲", "@大肥鱼 再发个表情包看看", msg_id="m_q3", ts=103.0, mentioned=True)])
+            )
+            self.assertEqual(len(r3["actions"]), 2)
+            self.assertEqual(r3["actions"][0].text, "给你挑一张")
+            self.assertIsInstance(r3["actions"][1], SendEmoji)
 
             # C. _summarize_sync 持久化群记忆与人物特征并过滤噪音
             repo.observe_person("g1", "101", "小明", now=100.0)
